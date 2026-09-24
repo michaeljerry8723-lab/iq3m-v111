@@ -1,8 +1,9 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.3.0-60s-hybrid-sniper";
-const DEFAULT_SYMBOLS = "EUR/USD";
+const VERSION = "11.3.1-60s-six-pair-scanner";
+const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
+const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 60;
 
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
@@ -366,6 +367,13 @@ export class TickHub extends DurableObject {
     const receiveAge=this.latestReceivedAge(symbol);
     const msgAge=this.lastWsMessageAt?Math.max(0,(Date.now()-this.lastWsMessageAt)/1000):Infinity;
 
+    // A never-seen symbol may simply be unsupported by the current Twelve Data plan.
+    // Do not tear down the healthy socket for the other five symbols just because this pair has no ticks yet.
+    if(!Number.isFinite(receiveAge)){
+      await this.ensureSocket();
+      return;
+    }
+
     if(receiveAge>15 || msgAge>25 || !(this.ws&&this.ws.readyState===1)){
       await this.forceReconnect(`stale ${symbol} feed`);
       await sleep(1800);
@@ -501,22 +509,55 @@ async function hub(env,path){
   const r=await stub.fetch(`https://tickhub${path}`); return await r.json();
 }
 
+
+async function scanSixPairUniverse(env){
+  const checked=[];
+  for(const symbol of FIXED_UNIVERSE){
+    try{
+      const r=await hub(env,`/signal?symbol=${encodeURIComponent(symbol)}`);
+      checked.push({...r,symbol});
+    }catch(e){
+      checked.push({ok:false,symbol,reason:String(e?.message||e)});
+    }
+  }
+
+  const qualified=checked.filter(x=>x?.ok&&x?.direction&&Number.isFinite(Number(x.quality)));
+  qualified.sort((a,b)=>
+    Number(b.quality||0)-Number(a.quality||0) ||
+    Number(b.edge||0)-Number(a.edge||0) ||
+    Number(b.microConfirmations||0)-Number(a.microConfirmations||0)
+  );
+
+  if(!qualified.length){
+    return {
+      ok:false,
+      checked,
+      reason:"No qualified 1-minute entry across the fixed six-pair universe."
+    };
+  }
+  return {ok:true,best:qualified[0],checked};
+}
+
 export default {
   async fetch(request,env,ctx){
     const u=new URL(request.url);
     if(u.pathname==="/health")return json({ok:true,version:VERSION,expirySeconds:EXPIRY_SECONDS});
     if(u.pathname==="/feed"){
-      const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/JPY")||"EUR/JPY";
+      const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.3 60s hybrid sniper",{status:200});
+    if(request.method!=="POST")return new Response("V11.3.1 60s six-pair scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
     const update=await request.json(); const msg=update.message||update.edited_message; if(!msg?.chat?.id)return new Response("ok");
     const chatId=msg.chat.id, text=String(msg.text||"").trim();
     if(/^\/version$/i.test(text)){await tgSend(env,chatId,VERSION);return new Response("ok");}
-    if(/^\/start$/i.test(text)){await tgSend(env,chatId,"V11.3 1-minute hybrid engine. Use /feed EUR/USD, /signal EUR/USD, or /reconnect. It returns WAIT unless 1m direction and live entry timing agree.");return new Response("ok");}
+    if(/^\/start$/i.test(text)){await tgSend(env,chatId,"V11.3.1 fixed six-pair 1-minute scanner. Use /signal to scan all six, /signal EUR/USD for one pair, /pairs to list the universe, or /reconnect.");return new Response("ok");}
+    if(/^\/pairs$/i.test(text)){
+      await tgSend(env,chatId,`FIXED 6-PAIR UNIVERSE\n${FIXED_UNIVERSE.join("\n")}\n\nEXPIRY: 1 minute`);
+      return new Response("ok");
+    }
     if(/^\/reconnect$/i.test(text)){
       const st=await hub(env,"/reconnect");
       await tgSend(env,chatId,`FEED RECONNECT REQUESTED\nSTATUS: ${st.status||"n/a"}\nRECONNECTS: ${st.reconnectCount||0}`);
@@ -541,8 +582,28 @@ export default {
       );
       return new Response("ok");
     }
+    const isUniverseScan=/^\/signal\s*$/i.test(text);
+    if(isUniverseScan){
+      const scan=await scanSixPairUniverse(env);
+      if(!scan.ok){
+        const summary=(scan.checked||[]).map(x=>`${x.symbol}: ${x.ok?"qualified":(x.reason||"not ready")}`).join("\n");
+        await tgSend(env,chatId,`⏳ SIX-PAIR SCAN: WAIT\n${scan.reason}\n\n${summary}`);
+        return new Response("ok");
+      }
+      const result=scan.best, symbol=result.symbol;
+      const arrow=result.direction==="CALL"?"⬆️":"⬇️";
+      const compact=String(env.BOT_COMPACT_MODE??"1")!=="0";
+      if(compact) await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 1 minute`);
+      else await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 1 minute\nSETUP QUALITY: ${(Number(result.quality)*100).toFixed(1)}%\nCALL SCORE: ${Number(result.callScore).toFixed(1)}\nPUT SCORE: ${Number(result.putScore).toFixed(1)}\nMICRO CONFIRMATIONS: ${result.microConfirmations}`);
+      return new Response("ok");
+    }
+
     const symbol=parseSignalText(text);
     if(!symbol)return new Response("ok");
+    if(!FIXED_UNIVERSE.includes(symbol)){
+      await tgSend(env,chatId,`PAIR NOT IN FIXED UNIVERSE\nAllowed: ${FIXED_UNIVERSE.join(", ")}`);
+      return new Response("ok");
+    }
     const result=await hub(env,`/signal?symbol=${encodeURIComponent(symbol)}`);
     if(!result.ok){
       await tgSend(env,chatId,
