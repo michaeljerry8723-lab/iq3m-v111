@@ -1,3 +1,4 @@
+// V11.1 Cloudflare Durable Object deployment
 // Trigger Cloudflare V11.1 deployment
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
