@@ -255,9 +255,7 @@ export class TickHub extends DurableObject {
       await this.ensureSocket();
 
       if(this.ws&&this.ws.readyState===1){
-        this.ws.send(JSON.stringify({action:"heartbeat"}));
-
-        // If we have had no inbound WebSocket traffic for 25 seconds, rebuild the socket.
+        // Tiingo sends server-side heartbeat frames; only watch inbound freshness here.
         const msgAge=this.lastWsMessageAt?((Date.now()-this.lastWsMessageAt)/1000):Infinity;
         if(msgAge>45) await this.forceReconnect("no websocket messages for >45s");
       } else {
@@ -648,7 +646,7 @@ export default {
         `RECONNECTS: ${st.reconnectCount||0}\n`+
         `EXPIRY: 60s\n`+
         `STATUS: ${st.status||"n/a"}\n`+
-        `SUBSCRIBE: ${st.subscribeStatus?.status||st.subscribeStatus||"n/a"}`
+        `SUBSCRIBE: ${st.subscribeStatus?.response?.message||st.subscribeStatus?.status||"n/a"}`
       );
       return new Response("ok");
     }
