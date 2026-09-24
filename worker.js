@@ -1,7 +1,7 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.4.1-tiingo-six-pair-health";
+const VERSION = "11.4.2-tiingo-six-pair-health";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 60;
@@ -594,13 +594,12 @@ async function scanSixPairUniverse(env){
 
 
 async function checkAllFeeds(env){
-  const results=[];
-  for(const symbol of FIXED_UNIVERSE){
+  const results=await Promise.all(FIXED_UNIVERSE.map(async symbol=>{
     try{
       const st=await hub(env,`/status?symbol=${encodeURIComponent(symbol)}`);
       const ticks=Number(st.ticks||0);
-      const received=Number(st.lastTickAgeSeconds);
-      const provider=Number(st.providerTickAgeSeconds);
+      const received=st.lastTickAgeSeconds==null?null:Number(st.lastTickAgeSeconds);
+      const provider=st.providerTickAgeSeconds==null?null:Number(st.providerTickAgeSeconds);
 
       let health="NO DATA";
       if(st.connected && ticks>0 && Number.isFinite(received) && Number.isFinite(provider)){
@@ -611,7 +610,7 @@ async function checkAllFeeds(env){
         health="WARMING";
       }
 
-      results.push({
+      return {
         symbol,
         health,
         connected:Boolean(st.connected),
@@ -619,9 +618,9 @@ async function checkAllFeeds(env){
         receivedAge:Number.isFinite(received)?received:null,
         providerAge:Number.isFinite(provider)?provider:null,
         status:st.status||"n/a"
-      });
+      };
     }catch(e){
-      results.push({
+      return {
         symbol,
         health:"ERROR",
         connected:false,
@@ -629,11 +628,12 @@ async function checkAllFeeds(env){
         receivedAge:null,
         providerAge:null,
         status:String(e?.message||e)
-      });
+      };
     }
-  }
+  }));
   return results;
 }
+
 
 export default {
   async fetch(request,env,ctx){
@@ -643,7 +643,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.4.1 Tiingo six-pair health engine",{status:200});
+    if(request.method!=="POST")return new Response("V11.4.2 Tiingo six-pair health engine",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -654,7 +654,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V11.4.1 — Tiingo live FX engine. Choose any pair below for a 1-minute signal. Use /signal to scan all six or /checkall to check feed health.",
+        "V11.4.2 — Tiingo live FX engine. Choose any pair below for a 1-minute signal. Use /signal to scan all six or /checkall to check feed health.",
         pairKeyboard()
       );
       return new Response("ok");
@@ -664,6 +664,23 @@ export default {
         env,
         chatId,
         `SELECT A PAIR FOR A 1-MINUTE SIGNAL\n\n${FIXED_UNIVERSE.join("\n")}\n\nTap a button below.`,
+        pairKeyboard()
+      );
+      return new Response("ok");
+    }
+    if(/^\/checkall$/i.test(text)){
+      const rows=await checkAllFeeds(env);
+      const icon=h=>h==="LIVE"?"🟢":h==="WARMING"?"🟡":h==="STALE"?"🔴":h==="ERROR"?"❌":"⚪";
+      const lines=rows.map(r=>{
+        const rx=r.receivedAge==null?"n/a":r.receivedAge.toFixed(1)+"s";
+        const px=r.providerAge==null?"n/a":r.providerAge.toFixed(1)+"s";
+        return `${icon(r.health)} ${r.symbol} — ${r.health}\nTicks: ${r.ticks} • Rx: ${rx} • Px: ${px}`;
+      });
+      const liveCount=rows.filter(r=>r.health==="LIVE").length;
+      await tgSend(
+        env,
+        chatId,
+        `SIX-PAIR FEED HEALTH\nLIVE: ${liveCount}/${FIXED_UNIVERSE.length}\n\n${lines.join("\n\n")}`,
         pairKeyboard()
       );
       return new Response("ok");
