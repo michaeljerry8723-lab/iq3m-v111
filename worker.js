@@ -877,6 +877,5 @@ export default {
     }
 
     return new Response("ok");
-    return new Response("ok");
   }
 };
