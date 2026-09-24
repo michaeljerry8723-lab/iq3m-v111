@@ -1,7 +1,7 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.3.2-60s-six-pair-menu";
+const VERSION = "11.4.0-tiingo-60s-six-pair";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 60;
@@ -14,6 +14,14 @@ function normalizeSymbol(input){
   s=s.replace(/[-_]/g,"/");
   if(/^[A-Z]{6}$/.test(s)) s=s.slice(0,3)+"/"+s.slice(3);
   return /^[A-Z0-9]{2,10}\/[A-Z0-9]{2,10}$/.test(s) ? s : null;
+}
+function toTiingoSymbol(symbol){
+  const s=normalizeSymbol(symbol);
+  return s ? s.replace("/","").toLowerCase() : null;
+}
+function fromTiingoSymbol(ticker){
+  const x=String(ticker||"").trim().toUpperCase().replace(/[^A-Z0-9]/g,"");
+  return /^[A-Z]{6}$/.test(x) ? x.slice(0,3)+"/"+x.slice(3) : normalizeSymbol(x);
 }
 function tsMs(t){ const n=Number(t); if(!Number.isFinite(n)) return Date.now(); return n<1e12?n*1000:n; }
 function json(data,status=200){ return new Response(JSON.stringify(data,null,2),{status,headers:{"content-type":"application/json;charset=UTF-8"}}); }
@@ -215,7 +223,7 @@ export class TickHub extends DurableObject {
   constructor(ctx,env){
     super(ctx,env);
     this.ctx=ctx; this.env=env; this.ws=null; this.ticks=new Map(); this.symbols=new Set();
-    this.lastStatus="starting"; this.lastSubscribeStatus=null; this.connecting=false;
+    this.lastStatus="starting"; this.lastSubscribeStatus=null; this.connecting=false; this.provider="tiingo";
     this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map();
 
     this.ctx.blockConcurrencyWhile(async()=>{
@@ -251,7 +259,7 @@ export class TickHub extends DurableObject {
 
         // If we have had no inbound WebSocket traffic for 25 seconds, rebuild the socket.
         const msgAge=this.lastWsMessageAt?((Date.now()-this.lastWsMessageAt)/1000):Infinity;
-        if(msgAge>25) await this.forceReconnect("no websocket messages for >25s");
+        if(msgAge>45) await this.forceReconnect("no websocket messages for >45s");
       } else {
         await this.forceReconnect("socket not open");
       }
@@ -279,12 +287,12 @@ export class TickHub extends DurableObject {
     if(!force && this.ws&&this.ws.readyState===1)return;
     if(this.connecting)return;
 
-    const key=String(this.env.TWELVE_DATA_WS_API_KEY||"").trim();
-    if(!key){this.lastStatus="missing TWELVE_DATA_WS_API_KEY";return;}
+    const key=String(this.env.TIINGO_API_TOKEN||"").trim();
+    if(!key){this.lastStatus="missing TIINGO_API_TOKEN";return;}
 
     this.connecting=true;
     try{
-      const ws=new WebSocket(`wss://ws.twelvedata.com/v1/quotes/price?apikey=${encodeURIComponent(key)}`);
+      const ws=new WebSocket("wss://api.tiingo.com/fx");
       this.ws=ws;
 
       ws.addEventListener("open",()=>{
@@ -292,24 +300,28 @@ export class TickHub extends DurableObject {
         this.lastConnectAt=Date.now();
         this.lastWsMessageAt=Date.now();
         this.lastStatus="connected";
-        if(this.symbols.size){
-          ws.send(JSON.stringify({
-            action:"subscribe",
-            params:{symbols:[...this.symbols].join(",")}
-          }));
-        }
+
+        const tickers=[...this.symbols].map(toTiingoSymbol).filter(Boolean);
+        ws.send(JSON.stringify({
+          eventName:"subscribe",
+          authorization:key,
+          eventData:{
+            thresholdLevel:5,
+            tickers
+          }
+        }));
       });
 
       ws.addEventListener("message",ev=>this.onMessage(ev));
 
       ws.addEventListener("close",()=>{
-        if(this.ws===ws) this.ws=null;
+        if(this.ws===ws)this.ws=null;
         this.connecting=false;
         this.lastStatus="closed";
       });
 
       ws.addEventListener("error",()=>{
-        this.lastStatus="websocket error";
+        this.lastStatus="tiingo websocket error";
       });
     }catch(e){
       this.connecting=false;
@@ -323,42 +335,60 @@ export class TickHub extends DurableObject {
     try{
       const x=JSON.parse(String(ev.data||"{}"));
 
-      if(x.event==="subscribe-status"){
+      if(x.messageType==="I"){
         this.lastSubscribeStatus=x;
-        this.lastStatus=x.status||"subscribe-status";
+        this.lastStatus=x?.response?.message||"subscribed";
         return;
       }
-
-      if(x.event==="heartbeat"){
-        if(this.lastStatus==="closed"||this.lastStatus==="reconnecting") this.lastStatus="connected";
+      if(x.messageType==="H"){
+        if(this.lastStatus==="closed"||this.lastStatus.startsWith("reconnecting"))this.lastStatus="connected";
         return;
       }
+      if(x.messageType==="E"){
+        this.lastSubscribeStatus=x;
+        this.lastStatus=`tiingo error: ${x?.response?.message||"subscription error"}`;
+        return;
+      }
+      if(x.messageType!=="A"||x.service!=="fx"||!Array.isArray(x.data))return;
 
-      if(x.event!=="price")return;
+      const d=x.data;
+      if(d[0]!=="Q")return;
 
-      const s=normalizeSymbol(x.symbol), p=Number(x.price), t=tsMs(x.timestamp), r=Date.now();
-      if(!s||!Number.isFinite(p))return;
+      const symbol=fromTiingoSymbol(d[1]);
+      const t=Date.parse(String(d[2]||""));
+      const bid=Number(d[4]), mid=Number(d[5]), ask=Number(d[7]);
+      const p=Number.isFinite(mid)?mid:(Number.isFinite(bid)&&Number.isFinite(ask)?(bid+ask)/2:NaN);
+      const r=Date.now();
+
+      if(!symbol||!Number.isFinite(p)||!Number.isFinite(t))return;
+      if(!this.symbols.has(symbol))return;
 
       this.lastPriceReceivedAt=r;
-      const arr=this.ticks.get(s)||[];
-      arr.push({t,p,r});
+      this.lastStatus="ok";
+      const arr=this.ticks.get(symbol)||[];
+      arr.push({t,p,r,bid:Number.isFinite(bid)?bid:null,ask:Number.isFinite(ask)?ask:null});
 
       const cutoff=Date.now()-45*60*1000;
       while(arr.length&&Number(arr[0].r||arr[0].t)<cutoff)arr.shift();
       if(arr.length>20000)arr.splice(0,arr.length-20000);
-      this.ticks.set(s,arr);
-    }catch(_){}
+      this.ticks.set(symbol,arr);
+    }catch(e){
+      this.lastStatus=`tiingo parse error: ${String(e?.message||e)}`;
+    }
   }
 
   async subscribe(symbol){
-    symbol=normalizeSymbol(symbol); if(!symbol)return false;
+    symbol=normalizeSymbol(symbol);
+    if(!symbol)return false;
+    if(!FIXED_UNIVERSE.includes(symbol))return false;
+
     if(!this.symbols.has(symbol)){
       this.symbols.add(symbol);
       await this.ctx.storage.put("symbols",[...this.symbols]);
+      // Tiingo subscriptions are established from the complete ticker set at connect time.
+      await this.forceReconnect("ticker universe changed");
+    }else{
       await this.ensureSocket();
-      if(this.ws&&this.ws.readyState===1){
-        this.ws.send(JSON.stringify({action:"subscribe",params:{symbols:symbol}}));
-      }
     }
     return true;
   }
@@ -367,14 +397,14 @@ export class TickHub extends DurableObject {
     const receiveAge=this.latestReceivedAge(symbol);
     const msgAge=this.lastWsMessageAt?Math.max(0,(Date.now()-this.lastWsMessageAt)/1000):Infinity;
 
-    // A never-seen symbol may simply be unsupported by the current Twelve Data plan.
+    // A never-seen symbol may simply be unsupported by the current Tiingo plan.
     // Do not tear down the healthy socket for the other five symbols just because this pair has no ticks yet.
     if(!Number.isFinite(receiveAge)){
       await this.ensureSocket();
       return;
     }
 
-    if(receiveAge>15 || msgAge>25 || !(this.ws&&this.ws.readyState===1)){
+    if(receiveAge>15 || msgAge>45 || !(this.ws&&this.ws.readyState===1)){
       await this.forceReconnect(`stale ${symbol} feed`);
       await sleep(1800);
     }
@@ -384,29 +414,38 @@ export class TickHub extends DurableObject {
     const cached=this.oneMinuteCache.get(symbol);
     if(cached&&Date.now()-cached.at<20000&&Array.isArray(cached.bars)&&cached.bars.length>=24)return cached.bars;
 
-    const key=String(this.env.TWELVE_DATA_WS_API_KEY||"").trim();
-    if(!key)throw new Error("missing TWELVE_DATA_WS_API_KEY");
+    const key=String(this.env.TIINGO_API_TOKEN||"").trim();
+    if(!key)throw new Error("missing TIINGO_API_TOKEN");
 
-    const u=new URL("https://api.twelvedata.com/time_series");
-    u.searchParams.set("symbol",symbol);
-    u.searchParams.set("interval","1min");
-    u.searchParams.set("outputsize","50");
-    u.searchParams.set("timezone","UTC");
-    u.searchParams.set("apikey",key);
+    const ticker=toTiingoSymbol(symbol);
+    if(!ticker)throw new Error("invalid Tiingo FX ticker");
 
-    const res=await fetch(u.toString(),{headers:{accept:"application/json"}});
+    // Ask for recent intraday history and retain only the latest completed bars.
+    const start=new Date(Date.now()-24*60*60*1000).toISOString().slice(0,10);
+    const u=new URL(`https://api.tiingo.com/tiingo/fx/${ticker}/prices`);
+    u.searchParams.set("startDate",start);
+    u.searchParams.set("resampleFreq","1min");
+
+    const res=await fetch(u.toString(),{
+      headers:{
+        accept:"application/json",
+        authorization:`Token ${key}`
+      }
+    });
     const data=await res.json();
-    if(!res.ok||data?.status==="error"||!Array.isArray(data?.values)){
-      throw new Error(data?.message||`1m context request failed (${res.status})`);
+    if(!res.ok||!Array.isArray(data)){
+      throw new Error(data?.detail||data?.message||`Tiingo 1m context request failed (${res.status})`);
     }
 
     const currentMinute=Math.floor(Date.now()/60000)*60000;
-    const bars=data.values.map(v=>({
-      t:parseUtcDateTime(v.datetime),o:Number(v.open),h:Number(v.high),l:Number(v.low),c:Number(v.close),n:1
+    const bars=data.map(v=>({
+      t:Date.parse(String(v.date||"")),
+      o:Number(v.open),h:Number(v.high),l:Number(v.low),c:Number(v.close),n:1
     })).filter(b=>Number.isFinite(b.t)&&[b.o,b.h,b.l,b.c].every(Number.isFinite)&&b.t<currentMinute)
-      .sort((a,b)=>a.t-b.t);
+      .sort((a,b)=>a.t-b.t)
+      .slice(-80);
 
-    if(bars.length<24)throw new Error(`only ${bars.length} closed 1m bars available`);
+    if(bars.length<24)throw new Error(`only ${bars.length} completed Tiingo 1m bars available`);
     this.oneMinuteCache.set(symbol,{at:Date.now(),bars});
     return bars;
   }
@@ -430,9 +469,9 @@ export class TickHub extends DurableObject {
       return {ok:false,symbol,ticks:arr.length,bars15,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
         status:this.lastStatus,reason:`live feed stale: no received tick for ${receiveAge.toFixed(1)}s`};
     }
-    if(marketAge>45){
+    if(marketAge>10){
       return {ok:false,symbol,ticks:arr.length,bars15,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
-        status:this.lastStatus,reason:`provider timestamp is ${marketAge.toFixed(1)}s behind live time`};
+        status:this.lastStatus,reason:`Tiingo quote timestamp is ${marketAge.toFixed(1)}s behind live time`};
     }
 
     let bars1m;
@@ -462,7 +501,7 @@ export class TickHub extends DurableObject {
       if(symbol) await this.subscribe(symbol);
 
       // Status calls also heal a stale socket, but do not wait long enough to hide the diagnosis.
-      if(symbol && this.latestReceivedAge(symbol)>20) {
+      if(symbol && Number.isFinite(this.latestReceivedAge(symbol)) && this.latestReceivedAge(symbol)>30) {
         try{ await this.forceReconnect(`status detected stale ${symbol}`); }catch(_){}
       } else {
         await this.ensureSocket();
@@ -473,6 +512,7 @@ export class TickHub extends DurableObject {
 
       return json({
         version:VERSION,
+        provider:this.provider,
         status:this.lastStatus,
         subscribeStatus:this.lastSubscribeStatus,
         connected:Boolean(this.ws&&this.ws.readyState===1),
@@ -562,7 +602,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.3.2 60s six-pair menu",{status:200});
+    if(request.method!=="POST")return new Response("V11.4 Tiingo 60s six-pair engine",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -573,7 +613,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V11.3.2 — choose any pair below for a 1-minute signal. The six buttons stay available in Telegram for quick selection. Use /signal for the best qualified setup across all six.",
+        "V11.4 — Tiingo live FX engine. Choose any pair below for a 1-minute signal. Use /signal to scan the fixed six-pair universe.",
         pairKeyboard()
       );
       return new Response("ok");
@@ -597,6 +637,7 @@ export default {
       const st=await hub(env,`/status?symbol=${encodeURIComponent(s)}`);
       await tgSend(env,chatId,
         `FEED ${s}\n`+
+        `PROVIDER: ${st.provider||"tiingo"}\n`+
         `CONNECTED: ${st.connected?"YES":"NO"}\n`+
         `TICKS: ${st.ticks||0}\n`+
         `5s BARS: ${st.bars5||0}\n`+
