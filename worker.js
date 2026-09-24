@@ -1,11 +1,8 @@
-// Fresh Cloudflare V11.1 deployment
-// V11.1 Cloudflare Durable Object deployment
-// Trigger Cloudflare V11.1 deployment
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.1.0-15s-tick-sniper-durable-object";
-const DEFAULT_SYMBOLS = "EUR/USD,GBP/USD,USD/JPY,EUR/JPY,GBP/JPY,AUD/USD,USD/CAD";
+const VERSION = "11.2.0-15s-tick-sniper-auto-reconnect";
+const DEFAULT_SYMBOLS = "EUR/USD";
 
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 function clamp(x,a,b){ return Math.max(a,Math.min(b,Number(x)||0)); }
@@ -122,85 +119,265 @@ function score15s(ticks){
 
 export class TickHub extends DurableObject {
   constructor(ctx,env){
-    super(ctx,env); this.ctx=ctx; this.env=env; this.ws=null; this.ticks=new Map(); this.symbols=new Set(); this.lastStatus=null; this.connecting=false;
+    super(ctx,env);
+    this.ctx=ctx; this.env=env; this.ws=null; this.ticks=new Map(); this.symbols=new Set();
+    this.lastStatus="starting"; this.lastSubscribeStatus=null; this.connecting=false;
+    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0;
+
     this.ctx.blockConcurrencyWhile(async()=>{
-      const saved=await this.ctx.storage.get("symbols");
-      const defaults=String(env.WS_SYMBOLS||DEFAULT_SYMBOLS).split(",").map(normalizeSymbol).filter(Boolean);
-      for(const s of (Array.isArray(saved)&&saved.length?saved:defaults)) this.symbols.add(s);
+      // V11.2: prefer the configured warm list over old persisted symbols so a Basic/trial
+      // account does not keep resubscribing to unsupported pairs from earlier builds.
+      const configured=String(env.WS_SYMBOLS||DEFAULT_SYMBOLS).split(",").map(normalizeSymbol).filter(Boolean);
+      for(const s of (configured.length?configured:[...DEFAULT_SYMBOLS.split(",")])) if(s) this.symbols.add(s);
+      await this.ctx.storage.put("symbols",[...this.symbols]);
       await this.ensureSocket();
       await this.ctx.storage.setAlarm(Date.now()+10000);
     });
   }
+
+  latestReceivedAge(symbol){
+    const arr=this.ticks.get(symbol)||[];
+    if(!arr.length) return Infinity;
+    const last=arr.at(-1);
+    return Math.max(0,(Date.now()-Number(last.r||last.t))/1000);
+  }
+
+  latestMarketAge(symbol){
+    const arr=this.ticks.get(symbol)||[];
+    if(!arr.length) return Infinity;
+    return Math.max(0,(Date.now()-Number(arr.at(-1).t))/1000);
+  }
+
   async alarm(){
     try{
       await this.ensureSocket();
-      if(this.ws&&this.ws.readyState===1) this.ws.send(JSON.stringify({action:"heartbeat"}));
-    }catch(_){}
+
+      if(this.ws&&this.ws.readyState===1){
+        this.ws.send(JSON.stringify({action:"heartbeat"}));
+
+        // If we have had no inbound WebSocket traffic for 25 seconds, rebuild the socket.
+        const msgAge=this.lastWsMessageAt?((Date.now()-this.lastWsMessageAt)/1000):Infinity;
+        if(msgAge>25) await this.forceReconnect("no websocket messages for >25s");
+      } else {
+        await this.forceReconnect("socket not open");
+      }
+    }catch(e){
+      this.lastStatus=`alarm error: ${String(e?.message||e)}`;
+    }
     await this.ctx.storage.setAlarm(Date.now()+10000);
   }
-  async ensureSocket(){
-    if(this.ws&&this.ws.readyState===1)return;
+
+  async forceReconnect(reason="manual reconnect"){
+    this.reconnectCount++;
+    this.lastStatus=`reconnecting: ${reason}`;
+    try{
+      if(this.ws){
+        try{ this.ws.close(1000,"reconnect"); }catch(_){}
+      }
+    }catch(_){}
+    this.ws=null;
+    this.connecting=false;
+    await sleep(150);
+    await this.ensureSocket(true);
+  }
+
+  async ensureSocket(force=false){
+    if(!force && this.ws&&this.ws.readyState===1)return;
     if(this.connecting)return;
+
     const key=String(this.env.TWELVE_DATA_WS_API_KEY||"").trim();
     if(!key){this.lastStatus="missing TWELVE_DATA_WS_API_KEY";return;}
+
     this.connecting=true;
     try{
       const ws=new WebSocket(`wss://ws.twelvedata.com/v1/quotes/price?apikey=${encodeURIComponent(key)}`);
       this.ws=ws;
+
       ws.addEventListener("open",()=>{
-        this.connecting=false; this.lastStatus="connected";
-        if(this.symbols.size) ws.send(JSON.stringify({action:"subscribe",params:{symbols:[...this.symbols].join(",")}}));
+        this.connecting=false;
+        this.lastConnectAt=Date.now();
+        this.lastWsMessageAt=Date.now();
+        this.lastStatus="connected";
+        if(this.symbols.size){
+          ws.send(JSON.stringify({
+            action:"subscribe",
+            params:{symbols:[...this.symbols].join(",")}
+          }));
+        }
       });
+
       ws.addEventListener("message",ev=>this.onMessage(ev));
-      ws.addEventListener("close",()=>{this.ws=null;this.connecting=false;this.lastStatus="closed";});
-      ws.addEventListener("error",()=>{this.lastStatus="websocket error";});
-    }catch(e){this.connecting=false;this.lastStatus=String(e?.message||e);}
+
+      ws.addEventListener("close",()=>{
+        if(this.ws===ws) this.ws=null;
+        this.connecting=false;
+        this.lastStatus="closed";
+      });
+
+      ws.addEventListener("error",()=>{
+        this.lastStatus="websocket error";
+      });
+    }catch(e){
+      this.connecting=false;
+      this.ws=null;
+      this.lastStatus=String(e?.message||e);
+    }
   }
+
   onMessage(ev){
+    this.lastWsMessageAt=Date.now();
     try{
       const x=JSON.parse(String(ev.data||"{}"));
-      if(x.event==="subscribe-status"){this.lastStatus=x.status||"subscribe-status";return;}
+
+      if(x.event==="subscribe-status"){
+        this.lastSubscribeStatus=x;
+        this.lastStatus=x.status||"subscribe-status";
+        return;
+      }
+
+      if(x.event==="heartbeat"){
+        if(this.lastStatus==="closed"||this.lastStatus==="reconnecting") this.lastStatus="connected";
+        return;
+      }
+
       if(x.event!=="price")return;
-      const s=normalizeSymbol(x.symbol), p=Number(x.price), t=tsMs(x.timestamp);
+
+      const s=normalizeSymbol(x.symbol), p=Number(x.price), t=tsMs(x.timestamp), r=Date.now();
       if(!s||!Number.isFinite(p))return;
-      const arr=this.ticks.get(s)||[]; arr.push({t,p});
+
+      this.lastPriceReceivedAt=r;
+      const arr=this.ticks.get(s)||[];
+      arr.push({t,p,r});
+
       const cutoff=Date.now()-5*60*1000;
-      while(arr.length&&arr[0].t<cutoff)arr.shift();
+      while(arr.length&&Number(arr[0].r||arr[0].t)<cutoff)arr.shift();
       if(arr.length>5000)arr.splice(0,arr.length-5000);
       this.ticks.set(s,arr);
     }catch(_){}
   }
+
   async subscribe(symbol){
     symbol=normalizeSymbol(symbol); if(!symbol)return false;
     if(!this.symbols.has(symbol)){
-      this.symbols.add(symbol); await this.ctx.storage.put("symbols",[...this.symbols]);
+      this.symbols.add(symbol);
+      await this.ctx.storage.put("symbols",[...this.symbols]);
       await this.ensureSocket();
-      if(this.ws&&this.ws.readyState===1) this.ws.send(JSON.stringify({action:"subscribe",params:{symbols:symbol}}));
+      if(this.ws&&this.ws.readyState===1){
+        this.ws.send(JSON.stringify({action:"subscribe",params:{symbols:symbol}}));
+      }
     }
     return true;
   }
+
+  async refreshIfStale(symbol){
+    const receiveAge=this.latestReceivedAge(symbol);
+    const msgAge=this.lastWsMessageAt?Math.max(0,(Date.now()-this.lastWsMessageAt)/1000):Infinity;
+
+    if(receiveAge>15 || msgAge>25 || !(this.ws&&this.ws.readyState===1)){
+      await this.forceReconnect(`stale ${symbol} feed`);
+      await sleep(1800);
+    }
+  }
+
   async analyze(symbol){
     symbol=normalizeSymbol(symbol); if(!symbol)return {ok:false,error:"invalid symbol"};
-    await this.subscribe(symbol); await this.ensureSocket();
+
+    await this.subscribe(symbol);
+    await this.ensureSocket();
+    await this.refreshIfStale(symbol);
+
     let arr=this.ticks.get(symbol)||[];
-    // Short wait lets a just-opened stream accumulate some fresh ticks without blocking excessively.
-    if(arr.length<16){ await sleep(1500); arr=this.ticks.get(symbol)||[]; }
-    const age=arr.length?Math.max(0,(Date.now()-arr.at(-1).t)/1000):Infinity;
-    const bars15=buildBars(arr,15).length;
-    if(arr.length<40 || bars15<5){
-      return {ok:false,warming:true,symbol,ticks:arr.length,bars15,ageSeconds:age,status:this.lastStatus,reason:"micro-feed warming; keep the Durable Object connected for ~75-90 seconds"};
+    if(arr.length<16){
+      await sleep(1500);
+      arr=this.ticks.get(symbol)||[];
     }
-    if(age>8)return {ok:false,symbol,ticks:arr.length,bars15,ageSeconds:age,status:this.lastStatus,reason:"tick feed stale"};
+
+    const receiveAge=arr.length?this.latestReceivedAge(symbol):Infinity;
+    const marketAge=arr.length?this.latestMarketAge(symbol):Infinity;
+    const bars15=buildBars(arr,15).length;
+
+    if(arr.length<40 || bars15<5){
+      return {
+        ok:false,warming:true,symbol,ticks:arr.length,bars15,
+        receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
+        status:this.lastStatus,
+        subscribeStatus:this.lastSubscribeStatus?.status||null,
+        reason:"micro-feed warming; wait for at least 40 ticks and 5 completed 15s bars"
+      };
+    }
+
+    // Never manufacture a 15-second signal from a feed that is not currently updating.
+    if(receiveAge>8){
+      return {
+        ok:false,symbol,ticks:arr.length,bars15,
+        receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
+        status:this.lastStatus,
+        subscribeStatus:this.lastSubscribeStatus?.status||null,
+        reason:`live feed stale: no received tick for ${receiveAge.toFixed(1)}s`
+      };
+    }
+
+    // Also block a materially delayed provider timestamp. This prevents "freshly received"
+    // but old/delayed quotes from being treated as a true 15-second entry feed.
+    if(marketAge>20){
+      return {
+        ok:false,symbol,ticks:arr.length,bars15,
+        receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
+        status:this.lastStatus,
+        subscribeStatus:this.lastSubscribeStatus?.status||null,
+        reason:`provider timestamp is ${marketAge.toFixed(1)}s behind live time`
+      };
+    }
+
     const s=score15s(arr);
-    return {ok:true,symbol,expirySeconds:15,...s,ticks:arr.length,ageSeconds:age,status:this.lastStatus,generatedAt:Date.now()};
+    return {
+      ok:true,symbol,expirySeconds:15,...s,ticks:arr.length,
+      receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
+      status:this.lastStatus,reconnectCount:this.reconnectCount,
+      generatedAt:Date.now()
+    };
   }
+
   async fetch(req){
     const u=new URL(req.url), symbol=normalizeSymbol(u.searchParams.get("symbol")||"");
-    if(u.pathname==="/signal")return json(await this.analyze(symbol));
-    if(u.pathname==="/status"){
-      if(symbol)await this.subscribe(symbol); const arr=symbol?(this.ticks.get(symbol)||[]):[];
-      return json({version:VERSION,status:this.lastStatus,connected:Boolean(this.ws&&this.ws.readyState===1),symbols:[...this.symbols],symbol,ticks:arr.length,bars5:buildBars(arr,5).length,bars15:buildBars(arr,15).length,lastTickAgeSeconds:arr.length?Math.max(0,(Date.now()-arr.at(-1).t)/1000):null});
+
+    if(u.pathname==="/reconnect"){
+      await this.forceReconnect("requested");
+      return json({ok:true,version:VERSION,status:this.lastStatus,reconnectCount:this.reconnectCount});
     }
+
+    if(u.pathname==="/signal")return json(await this.analyze(symbol));
+
+    if(u.pathname==="/status"){
+      if(symbol) await this.subscribe(symbol);
+
+      // Status calls also heal a stale socket, but do not wait long enough to hide the diagnosis.
+      if(symbol && this.latestReceivedAge(symbol)>20) {
+        try{ await this.forceReconnect(`status detected stale ${symbol}`); }catch(_){}
+      } else {
+        await this.ensureSocket();
+      }
+
+      const arr=symbol?(this.ticks.get(symbol)||[]):[];
+      const lastMessageAge=this.lastWsMessageAt?Math.max(0,(Date.now()-this.lastWsMessageAt)/1000):null;
+
+      return json({
+        version:VERSION,
+        status:this.lastStatus,
+        subscribeStatus:this.lastSubscribeStatus,
+        connected:Boolean(this.ws&&this.ws.readyState===1),
+        symbols:[...this.symbols],
+        symbol,
+        ticks:arr.length,
+        bars5:buildBars(arr,5).length,
+        bars15:buildBars(arr,15).length,
+        lastTickAgeSeconds:arr.length?this.latestReceivedAge(symbol):null,
+        providerTickAgeSeconds:arr.length?this.latestMarketAge(symbol):null,
+        lastWsMessageAgeSeconds:lastMessageAge,
+        reconnectCount:this.reconnectCount
+      });
+    }
+
     return json({ok:true,version:VERSION});
   }
 }
@@ -229,23 +406,50 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/JPY")||"EUR/JPY";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11 15s tick sniper",{status:200});
+    if(request.method!=="POST")return new Response("V11.2 15s tick sniper",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
     const update=await request.json(); const msg=update.message||update.edited_message; if(!msg?.chat?.id)return new Response("ok");
     const chatId=msg.chat.id, text=String(msg.text||"").trim();
     if(/^\/version$/i.test(text)){await tgSend(env,chatId,VERSION);return new Response("ok");}
-    if(/^\/start$/i.test(text)){await tgSend(env,chatId,"Send a pair such as EUR/JPY, or use /signal EUR/JPY. The engine uses live Twelve Data ticks and returns a 15-second UP/DOWN direction after the micro-feed is warm.");return new Response("ok");}
+    if(/^\/start$/i.test(text)){await tgSend(env,chatId,"V11.2 live-tick engine. On a Twelve Data Basic/trial key, test EUR/USD first. Use /feed EUR/USD, /signal EUR/USD, or /reconnect.");return new Response("ok");}
+    if(/^\/reconnect$/i.test(text)){
+      const st=await hub(env,"/reconnect");
+      await tgSend(env,chatId,`FEED RECONNECT REQUESTED\nSTATUS: ${st.status||"n/a"}\nRECONNECTS: ${st.reconnectCount||0}`);
+      return new Response("ok");
+    }
     if(/^\/feed/i.test(text)){
-      const s=normalizeSymbol(text.replace(/^\/feed\s*/i,""))||"EUR/JPY"; const st=await hub(env,`/status?symbol=${encodeURIComponent(s)}`);
-      await tgSend(env,chatId,`FEED ${s}\nCONNECTED: ${st.connected?"YES":"NO"}\nTICKS: ${st.ticks||0}\n5s BARS: ${st.bars5||0}\n15s BARS: ${st.bars15||0}\nLAST TICK AGE: ${st.lastTickAgeSeconds??"n/a"}s\nSTATUS: ${st.status||"n/a"}`); return new Response("ok");
+      const s=normalizeSymbol(text.replace(/^\/feed\s*/i,""))||"EUR/USD";
+      const st=await hub(env,`/status?symbol=${encodeURIComponent(s)}`);
+      await tgSend(env,chatId,
+        `FEED ${s}\n`+
+        `CONNECTED: ${st.connected?"YES":"NO"}\n`+
+        `TICKS: ${st.ticks||0}\n`+
+        `5s BARS: ${st.bars5||0}\n`+
+        `15s BARS: ${st.bars15||0}\n`+
+        `RECEIVED TICK AGE: ${st.lastTickAgeSeconds??"n/a"}s\n`+
+        `PROVIDER TICK AGE: ${st.providerTickAgeSeconds??"n/a"}s\n`+
+        `WS MESSAGE AGE: ${st.lastWsMessageAgeSeconds??"n/a"}s\n`+
+        `RECONNECTS: ${st.reconnectCount||0}\n`+
+        `STATUS: ${st.status||"n/a"}\n`+
+        `SUBSCRIBE: ${st.subscribeStatus?.status||st.subscribeStatus||"n/a"}`
+      );
+      return new Response("ok");
     }
     const symbol=parseSignalText(text);
     if(!symbol)return new Response("ok");
     const result=await hub(env,`/signal?symbol=${encodeURIComponent(symbol)}`);
     if(!result.ok){
-      await tgSend(env,chatId,`⏳ ${symbol} feed warming\n${result.reason||"Waiting for live ticks"}\nTicks: ${result.ticks||0} • 15s bars: ${result.bars15||0}`); return new Response("ok");
+      await tgSend(env,chatId,
+        `⏳ ${symbol} NOT READY\n`+
+        `${result.reason||"Waiting for live ticks"}\n`+
+        `Ticks: ${result.ticks||0} • 15s bars: ${result.bars15||0}\n`+
+        `Received age: ${Number.isFinite(Number(result.receiveAgeSeconds))?Number(result.receiveAgeSeconds).toFixed(1):"n/a"}s • `+
+        `Provider age: ${Number.isFinite(Number(result.marketAgeSeconds))?Number(result.marketAgeSeconds).toFixed(1):"n/a"}s\n`+
+        `Status: ${result.status||"n/a"}`
+      );
+      return new Response("ok");
     }
     const arrow=result.direction==="CALL"?"⬆️":"⬇️";
     const compact=String(env.BOT_COMPACT_MODE??"1")!=="0";
