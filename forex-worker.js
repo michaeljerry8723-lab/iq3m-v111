@@ -279,8 +279,15 @@ export class MarketHub extends DurableObject{
   }
   async forceReconnect(){try{this.fxWs?.close(1000,"reconnect");}catch(_){}try{this.cryptoWs?.close(1000,"reconnect");}catch(_){}this.fxWs=null;this.cryptoWs=null;this.connectingFx=false;this.connectingCrypto=false;await sleep(100);await this.ensureSockets();}
   async fetchHistorical5m(symbol){
-    const cached=this.base5m.get(symbol); const live=buildBarsFromTicks(this.ticks.get(symbol)||[],300000);
-    if(cached&&cached.bars?.length>=120){return mergeBars(cached.bars,live);}
+    let cached=this.base5m.get(symbol);
+    if(!cached){
+      const saved=await this.ctx.storage.get(`bars5m:${symbol}`);
+      if(saved&&Array.isArray(saved.bars)){cached=saved;this.base5m.set(symbol,saved);}
+    }
+    const live=buildBarsFromTicks(this.ticks.get(symbol)||[],300000);
+    const cachedLast=Number(cached?.bars?.at(-1)?.t||0);
+    const cacheFresh=cachedLast>0&&(Date.now()-cachedLast)<30*60*1000;
+    if(cached&&cached.bars?.length>=120&&cacheFresh){return mergeBars(cached.bars,live);}
     if(this.quotaBlockedUntil>Date.now())throw new Error("Tiingo hourly request quota temporarily exhausted");
     const key=String(this.env.TIINGO_API_TOKEN||"").trim(); if(!key)throw new Error("missing TIINGO_API_TOKEN");
     const start=new Date(Date.now()-6*24*60*60*1000).toISOString().slice(0,10); let url;
@@ -296,7 +303,10 @@ export class MarketHub extends DurableObject{
     const current=Math.floor(Date.now()/300000)*300000;
     const bars=rows.map(v=>({t:Date.parse(String(v.date||"")),o:Number(v.open),h:Number(v.high),l:Number(v.low),c:Number(v.close),n:1})).filter(b=>Number.isFinite(b.t)&&[b.o,b.h,b.l,b.c].every(Number.isFinite)&&b.t<current).sort((a,b)=>a.t-b.t).slice(-1500);
     if(bars.length<120)throw new Error(`only ${bars.length} completed 5m bars available`);
-    this.base5m.set(symbol,{at:Date.now(),bars}); return mergeBars(bars,live);
+    const pack={at:Date.now(),bars};
+    this.base5m.set(symbol,pack);
+    await this.ctx.storage.put(`bars5m:${symbol}`,pack);
+    return mergeBars(bars,live);
   }
   async analyze(symbol){
     symbol=normalizeSymbol(symbol); if(!symbol)return{ok:false,error:"invalid symbol"}; await this.ensureSockets();
