@@ -1,7 +1,7 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.4.2-tiingo-six-pair-health";
+const VERSION = "11.5.0-tiingo-auto-track-six-scan";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 60;
@@ -25,6 +25,11 @@ function fromTiingoSymbol(ticker){
 }
 function tsMs(t){ const n=Number(t); if(!Number.isFinite(n)) return Date.now(); return n<1e12?n*1000:n; }
 function json(data,status=200){ return new Response(JSON.stringify(data,null,2),{status,headers:{"content-type":"application/json;charset=UTF-8"}}); }
+function formatFxPrice(symbol,p){
+  const n=Number(p);
+  if(!Number.isFinite(n))return "n/a";
+  return n.toFixed(String(symbol||"").endsWith("/JPY")?3:5);
+}
 
 function buildBars(ticks, seconds){
   const m=new Map(), span=seconds*1000;
@@ -224,7 +229,7 @@ export class TickHub extends DurableObject {
     super(ctx,env);
     this.ctx=ctx; this.env=env; this.ws=null; this.ticks=new Map(); this.symbols=new Set();
     this.lastStatus="starting"; this.lastSubscribeStatus=null; this.connecting=false; this.provider="tiingo";
-    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map();
+    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map(); this.pendingSignals=[]; this.signalStats={total:0,wins:0,losses:0,draws:0,voids:0}; this.signalHistory=[];
 
     this.ctx.blockConcurrencyWhile(async()=>{
       // V11.2: prefer the configured warm list over old persisted symbols so a Basic/trial
@@ -232,8 +237,11 @@ export class TickHub extends DurableObject {
       const configured=String(env.WS_SYMBOLS||DEFAULT_SYMBOLS).split(",").map(normalizeSymbol).filter(Boolean);
       for(const s of (configured.length?configured:[...DEFAULT_SYMBOLS.split(",")])) if(s) this.symbols.add(s);
       await this.ctx.storage.put("symbols",[...this.symbols]);
+      this.pendingSignals=(await this.ctx.storage.get("pendingSignals"))||[];
+      this.signalStats=(await this.ctx.storage.get("signalStats"))||{total:0,wins:0,losses:0,draws:0,voids:0};
+      this.signalHistory=(await this.ctx.storage.get("signalHistory"))||[];
       await this.ensureSocket();
-      await this.ctx.storage.setAlarm(Date.now()+10000);
+      await this.scheduleAlarm();
     });
   }
 
@@ -250,21 +258,102 @@ export class TickHub extends DurableObject {
     return Math.max(0,(Date.now()-Number(arr.at(-1).t))/1000);
   }
 
+  async scheduleAlarm(){
+    const now=Date.now();
+    let next=now+10000;
+    for(const p of this.pendingSignals){
+      const exp=Number(p.expiresAt||0);
+      if(exp>now) next=Math.min(next,exp);
+      else next=Math.min(next,now+1000);
+    }
+    await this.ctx.storage.setAlarm(Math.max(now+250,next));
+  }
+
+  async sendTrackedResult(chatId,text){
+    const token=String(this.env.TELEGRAM_BOT_TOKEN||"").trim();
+    if(!token)return;
+    try{
+      await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{
+        method:"POST",
+        headers:{"content-type":"application/json"},
+        body:JSON.stringify({chat_id:chatId,text,disable_web_page_preview:true})
+      });
+    }catch(_){}
+  }
+
+  async settlePendingSignals(){
+    if(!this.pendingSignals.length)return;
+    const now=Date.now(), keep=[], settled=[];
+
+    for(const sig of this.pendingSignals){
+      if(Number(sig.expiresAt)>now){keep.push(sig);continue;}
+
+      const arr=this.ticks.get(sig.symbol)||[];
+      const exitTick=arr.find(t=>Number(t.r||t.t)>=Number(sig.expiresAt));
+
+      if(!exitTick){
+        if(now-Number(sig.expiresAt)<15000){keep.push(sig);continue;}
+
+        const rec={...sig,result:"VOID",exitPrice:null,settledAt:now};
+        settled.push(rec);
+        this.signalStats.total++;
+        this.signalStats.voids++;
+        await this.sendTrackedResult(
+          sig.chatId,
+          `RESULT — ${sig.symbol}\n${sig.direction==="CALL"?"⬆️ CALL":"⬇️ PUT"} • 1 minute\n⚪ VOID — no fresh Tiingo tick was available at expiry`
+        );
+        continue;
+      }
+
+      const entry=Number(sig.entryPrice), exit=Number(exitTick.p);
+      const delta=exit-entry;
+      let result="DRAW";
+      if(Math.abs(delta)>1e-12){
+        const won=sig.direction==="CALL"?delta>0:delta<0;
+        result=won?"WIN":"LOSS";
+      }
+
+      const rec={...sig,result,exitPrice:exit,exitTickAt:Number(exitTick.r||exitTick.t),settledAt:now};
+      settled.push(rec);
+      this.signalStats.total++;
+      if(result==="WIN")this.signalStats.wins++;
+      else if(result==="LOSS")this.signalStats.losses++;
+      else this.signalStats.draws++;
+
+      const mark=result==="WIN"?"✅":result==="LOSS"?"❌":"➖";
+      await this.sendTrackedResult(
+        sig.chatId,
+        `RESULT — ${sig.symbol}\n${sig.direction==="CALL"?"⬆️ CALL":"⬇️ PUT"} • 1 minute\nENTRY: ${formatFxPrice(sig.symbol,entry)}\nEXIT: ${formatFxPrice(sig.symbol,exit)}\n${mark} ${result}\nTRACKING: Tiingo feed`
+      );
+    }
+
+    this.pendingSignals=keep;
+    if(settled.length){
+      this.signalHistory=[...settled,...this.signalHistory].slice(0,100);
+      await this.ctx.storage.put("pendingSignals",this.pendingSignals);
+      await this.ctx.storage.put("signalStats",this.signalStats);
+      await this.ctx.storage.put("signalHistory",this.signalHistory);
+    }else if(keep.length!==this.pendingSignals.length){
+      await this.ctx.storage.put("pendingSignals",this.pendingSignals);
+    }
+  }
+
   async alarm(){
     try{
       await this.ensureSocket();
 
       if(this.ws&&this.ws.readyState===1){
-        // Tiingo sends server-side heartbeat frames; only watch inbound freshness here.
         const msgAge=this.lastWsMessageAt?((Date.now()-this.lastWsMessageAt)/1000):Infinity;
         if(msgAge>45) await this.forceReconnect("no websocket messages for >45s");
-      } else {
+      }else{
         await this.forceReconnect("socket not open");
       }
+
+      await this.settlePendingSignals();
     }catch(e){
       this.lastStatus=`alarm error: ${String(e?.message||e)}`;
     }
-    await this.ctx.storage.setAlarm(Date.now()+10000);
+    await this.scheduleAlarm();
   }
 
   async forceReconnect(reason="manual reconnect"){
@@ -485,6 +574,53 @@ export class TickHub extends DurableObject {
       status:this.lastStatus,reconnectCount:this.reconnectCount,generatedAt:Date.now()};
   }
 
+  async trackSignal(req){
+    const body=await req.json();
+    const symbol=normalizeSymbol(body?.symbol);
+    const direction=String(body?.direction||"").toUpperCase();
+    const entryPrice=Number(body?.entryPrice);
+    const chatId=body?.chatId;
+    const sourceUpdateId=String(body?.sourceUpdateId??"");
+    const entryAt=Number(body?.entryAt)||Date.now();
+
+    if(!symbol||!FIXED_UNIVERSE.includes(symbol))return {ok:false,error:"invalid symbol"};
+    if(!["CALL","PUT"].includes(direction))return {ok:false,error:"invalid direction"};
+    if(!Number.isFinite(entryPrice)||!chatId)return {ok:false,error:"invalid tracking payload"};
+
+    if(sourceUpdateId){
+      const duplicate=this.pendingSignals.find(x=>String(x.sourceUpdateId)===sourceUpdateId)||
+        this.signalHistory.find(x=>String(x.sourceUpdateId)===sourceUpdateId);
+      if(duplicate)return {ok:true,duplicate:true,id:duplicate.id};
+    }
+
+    const sig={
+      id:crypto.randomUUID(),
+      sourceUpdateId,
+      chatId,
+      symbol,
+      direction,
+      entryPrice,
+      entryAt,
+      expiresAt:entryAt+EXPIRY_SECONDS*1000
+    };
+    this.pendingSignals.push(sig);
+    await this.ctx.storage.put("pendingSignals",this.pendingSignals);
+    await this.scheduleAlarm();
+    return {ok:true,id:sig.id,expiresAt:sig.expiresAt};
+  }
+
+  async getTrackingStats(){
+    const resolved=(this.signalStats.wins||0)+(this.signalStats.losses||0);
+    const winRate=resolved>0?(this.signalStats.wins/resolved)*100:null;
+    return {
+      ok:true,
+      ...this.signalStats,
+      pending:this.pendingSignals.length,
+      winRate,
+      recent:this.signalHistory.slice(0,5)
+    };
+  }
+
   async fetch(req){
     const u=new URL(req.url), symbol=normalizeSymbol(u.searchParams.get("symbol")||"");
 
@@ -494,6 +630,8 @@ export class TickHub extends DurableObject {
     }
 
     if(u.pathname==="/signal")return json(await this.analyze(symbol));
+    if(u.pathname==="/track"&&req.method==="POST")return json(await this.trackSignal(req));
+    if(u.pathname==="/stats")return json(await this.getTrackingStats());
 
     if(u.pathname==="/status"){
       if(symbol) await this.subscribe(symbol);
@@ -531,16 +669,6 @@ export class TickHub extends DurableObject {
   }
 }
 
-function pairKeyboard(){
-  return {
-    keyboard: FIXED_UNIVERSE.map(symbol=>[{text:symbol}]),
-    resize_keyboard:true,
-    one_time_keyboard:false,
-    is_persistent:true,
-    input_field_placeholder:"Choose a pair for a 1-minute signal"
-  };
-}
-
 async function tgSend(env,chatId,text,replyMarkup=null){
   const token=String(env.TELEGRAM_BOT_TOKEN||"").trim();
   if(!token)throw new Error("Missing TELEGRAM_BOT_TOKEN");
@@ -562,18 +690,26 @@ async function hub(env,path){
   const id=env.TICK_HUB.idFromName("global-market-feed"), stub=env.TICK_HUB.get(id);
   const r=await stub.fetch(`https://tickhub${path}`); return await r.json();
 }
+async function hubPost(env,path,body){
+  const id=env.TICK_HUB.idFromName("global-market-feed"), stub=env.TICK_HUB.get(id);
+  const r=await stub.fetch(`https://tickhub${path}`,{
+    method:"POST",
+    headers:{"content-type":"application/json"},
+    body:JSON.stringify(body)
+  });
+  return await r.json();
+}
 
 
 async function scanSixPairUniverse(env){
-  const checked=[];
-  for(const symbol of FIXED_UNIVERSE){
+  const checked=await Promise.all(FIXED_UNIVERSE.map(async symbol=>{
     try{
       const r=await hub(env,`/signal?symbol=${encodeURIComponent(symbol)}`);
-      checked.push({...r,symbol});
+      return {...r,symbol};
     }catch(e){
-      checked.push({ok:false,symbol,reason:String(e?.message||e)});
+      return {ok:false,symbol,reason:String(e?.message||e)};
     }
-  }
+  }));
 
   const qualified=checked.filter(x=>x?.ok&&x?.direction&&Number.isFinite(Number(x.quality)));
   qualified.sort((a,b)=>
@@ -583,11 +719,7 @@ async function scanSixPairUniverse(env){
   );
 
   if(!qualified.length){
-    return {
-      ok:false,
-      checked,
-      reason:"No qualified 1-minute entry across the fixed six-pair universe."
-    };
+    return {ok:false,checked,reason:"No qualified 1-minute entry across the fixed six-pair universe."};
   }
   return {ok:true,best:qualified[0],checked};
 }
@@ -643,7 +775,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.4.2 Tiingo six-pair health engine",{status:200});
+    if(request.method!=="POST")return new Response("V11.5 Tiingo auto-track six-pair scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -654,17 +786,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V11.4.2 — Tiingo live FX engine. Choose any pair below for a 1-minute signal. Use /signal to scan all six or /checkall to check feed health.",
-        pairKeyboard()
-      );
-      return new Response("ok");
-    }
-    if(/^\/(?:pairs|menu)$/i.test(text)){
-      await tgSend(
-        env,
-        chatId,
-        `SELECT A PAIR FOR A 1-MINUTE SIGNAL\n\n${FIXED_UNIVERSE.join("\n")}\n\nTap a button below.`,
-        pairKeyboard()
+        "V11.5 — use /signal to scan all 6 FX pairs and return only the strongest qualified 1-minute setup. Results are automatically tracked for 60 seconds. Use /stats for tracked performance and /checkall for feed health."
       );
       return new Response("ok");
     }
@@ -680,8 +802,17 @@ export default {
       await tgSend(
         env,
         chatId,
-        `SIX-PAIR FEED HEALTH\nLIVE: ${liveCount}/${FIXED_UNIVERSE.length}\n\n${lines.join("\n\n")}`,
-        pairKeyboard()
+        `SIX-PAIR FEED HEALTH\nLIVE: ${liveCount}/${FIXED_UNIVERSE.length}\n\n${lines.join("\n\n")}`
+      );
+      return new Response("ok");
+    }
+    if(/^\/stats$/i.test(text)){
+      const st=await hub(env,"/stats");
+      const wr=st.winRate==null?"n/a":Number(st.winRate).toFixed(1)+"%";
+      await tgSend(
+        env,
+        chatId,
+        `TRACKED SIGNAL STATS\nTotal settled: ${st.total||0}\nWins: ${st.wins||0}\nLosses: ${st.losses||0}\nDraws: ${st.draws||0}\nVoids: ${st.voids||0}\nPending: ${st.pending||0}\nWin rate (W/L only): ${wr}\n\nResults are measured from Tiingo prices, not Pocket Option settlement prices.`
       );
       return new Response("ok");
     }
@@ -718,36 +849,34 @@ export default {
         await tgSend(env,chatId,`⏳ SIX-PAIR SCAN: WAIT\n${scan.reason}\n\n${summary}`);
         return new Response("ok");
       }
+
       const result=scan.best, symbol=result.symbol;
       const arrow=result.direction==="CALL"?"⬆️":"⬇️";
       const compact=String(env.BOT_COMPACT_MODE??"1")!=="0";
-      if(compact) await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 1 minute`);
-      else await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 1 minute\nSETUP QUALITY: ${(Number(result.quality)*100).toFixed(1)}%\nCALL SCORE: ${Number(result.callScore).toFixed(1)}\nPUT SCORE: ${Number(result.putScore).toFixed(1)}\nMICRO CONFIRMATIONS: ${result.microConfirmations}`);
+
+      if(compact){
+        await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 1 minute\nTRACKING: ON`);
+      }else{
+        await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 1 minute\nSETUP QUALITY: ${(Number(result.quality)*100).toFixed(1)}%\nCALL SCORE: ${Number(result.callScore).toFixed(1)}\nPUT SCORE: ${Number(result.putScore).toFixed(1)}\nMICRO CONFIRMATIONS: ${result.microConfirmations}\nTRACKING: ON`);
+      }
+
+      await hubPost(env,"/track",{
+        sourceUpdateId:update.update_id,
+        chatId,
+        symbol,
+        direction:result.direction,
+        entryPrice:result.lastPrice,
+        entryAt:result.generatedAt||Date.now()
+      });
       return new Response("ok");
     }
 
-    const symbol=parseSignalText(text);
-    if(!symbol)return new Response("ok");
-    if(!FIXED_UNIVERSE.includes(symbol)){
-      await tgSend(env,chatId,`PAIR NOT IN FIXED UNIVERSE\nAllowed: ${FIXED_UNIVERSE.join(", ")}`);
+    if(/^\/signal\b/i.test(text)){
+      await tgSend(env,chatId,"Use /signal by itself. The bot now scans all 6 pairs automatically and returns the strongest qualified setup.");
       return new Response("ok");
     }
-    const result=await hub(env,`/signal?symbol=${encodeURIComponent(symbol)}`);
-    if(!result.ok){
-      await tgSend(env,chatId,
-        `⏳ ${symbol} WAIT\n`+
-        `${result.reason||"No complete 1-minute setup yet"}\n`+
-        `Ticks: ${result.ticks||0} • 15s bars: ${result.bars15||0}\n`+
-        `Received age: ${Number.isFinite(Number(result.receiveAgeSeconds))?Number(result.receiveAgeSeconds).toFixed(1):"n/a"}s • `+
-        `Provider age: ${Number.isFinite(Number(result.marketAgeSeconds))?Number(result.marketAgeSeconds).toFixed(1):"n/a"}s\n`+
-        `Status: ${result.status||"n/a"}`
-      );
-      return new Response("ok");
-    }
-    const arrow=result.direction==="CALL"?"⬆️":"⬇️";
-    const compact=String(env.BOT_COMPACT_MODE??"1")!=="0";
-    if(compact) await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 1 minute`);
-    else await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 1 minute\nSETUP QUALITY: ${(Number(result.quality)*100).toFixed(1)}%\nCALL SCORE: ${Number(result.callScore).toFixed(1)}\nPUT SCORE: ${Number(result.putScore).toFixed(1)}\nMICRO CONFIRMATIONS: ${result.microConfirmations}`);
+
+    return new Response("ok");
     return new Response("ok");
   }
 };
