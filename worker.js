@@ -1,7 +1,7 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.5.2-tiingo-bar-ready-six-scan";
+const VERSION = "11.5.3-tiingo-quota-smart-six-scan";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 60;
@@ -229,7 +229,7 @@ export class TickHub extends DurableObject {
     super(ctx,env);
     this.ctx=ctx; this.env=env; this.ws=null; this.ticks=new Map(); this.symbols=new Set();
     this.lastStatus="starting"; this.lastSubscribeStatus=null; this.connecting=false; this.provider="tiingo";
-    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map(); this.pendingSignals=[]; this.signalStats={total:0,wins:0,losses:0,draws:0,voids:0}; this.signalHistory=[];
+    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map(); this.quotaBlockedUntil=0; this.pendingSignals=[]; this.signalStats={total:0,wins:0,losses:0,draws:0,voids:0}; this.signalHistory=[];
 
     this.ctx.blockConcurrencyWhile(async()=>{
       // V11.2: prefer the configured warm list over old persisted symbols so a Basic/trial
@@ -237,6 +237,11 @@ export class TickHub extends DurableObject {
       const configured=String(env.WS_SYMBOLS||DEFAULT_SYMBOLS).split(",").map(normalizeSymbol).filter(Boolean);
       for(const s of (configured.length?configured:[...DEFAULT_SYMBOLS.split(",")])) if(s) this.symbols.add(s);
       await this.ctx.storage.put("symbols",[...this.symbols]);
+      const persistedContext=(await this.ctx.storage.get("oneMinuteCacheData"))||{};
+      for(const [symbol,value] of Object.entries(persistedContext)){
+        if(value&&Array.isArray(value.bars))this.oneMinuteCache.set(symbol,value);
+      }
+      this.quotaBlockedUntil=Number((await this.ctx.storage.get("tiingoQuotaBlockedUntil"))||0);
       this.pendingSignals=(await this.ctx.storage.get("pendingSignals"))||[];
       this.signalStats=(await this.ctx.storage.get("signalStats"))||{total:0,wins:0,losses:0,draws:0,voids:0};
       this.signalHistory=(await this.ctx.storage.get("signalHistory"))||[];
@@ -497,9 +502,57 @@ export class TickHub extends DurableObject {
     }
   }
 
+  async persistOneMinuteCache(){
+    const out={};
+    for(const [symbol,value] of this.oneMinuteCache.entries())out[symbol]=value;
+    await this.ctx.storage.put("oneMinuteCacheData",out);
+  }
+
+  mergeOneMinuteContext(symbol,cachedBars=[]){
+    const currentMinute=Math.floor(Date.now()/60000)*60000;
+    const liveBars=buildBars(this.ticks.get(symbol)||[],60).filter(b=>b.t<currentMinute);
+    const merged=new Map();
+    for(const b of cachedBars||[])merged.set(Number(b.t),b);
+    for(const b of liveBars)merged.set(Number(b.t),b);
+    return [...merged.values()].sort((a,b)=>a.t-b.t).slice(-80);
+  }
+
+  contextIsUsable(bars){
+    if(!Array.isArray(bars)||bars.length<24)return false;
+    const xs=bars.slice(-24);
+    const last=xs.at(-1);
+    if(!last||Date.now()-Number(last.t)>3*60*1000)return false;
+    // Reject a context window with a large missing-data gap.
+    for(let i=1;i<xs.length;i++){
+      if(Number(xs[i].t)-Number(xs[i-1].t)>3*60*1000)return false;
+    }
+    return true;
+  }
+
+  quotaRetryMinutes(){
+    const left=Math.max(0,this.quotaBlockedUntil-Date.now());
+    return Math.max(1,Math.ceil(left/60000));
+  }
+
   async fetchOneMinuteBars(symbol){
     const cached=this.oneMinuteCache.get(symbol);
-    if(cached&&Date.now()-cached.at<20000&&Array.isArray(cached.bars)&&cached.bars.length>=24)return cached.bars;
+    const merged=this.mergeOneMinuteContext(symbol,cached?.bars||[]);
+
+    // Once bootstrapped, use the real-time Tiingo stream to keep 1m context current.
+    // This avoids spending a REST request on every /signal scan.
+    if(this.contextIsUsable(merged)){
+      if(!cached||merged.at(-1)?.t!==cached.bars?.at(-1)?.t){
+        this.oneMinuteCache.set(symbol,{at:Date.now(),bars:merged});
+      }
+      return merged;
+    }
+
+    if(this.quotaBlockedUntil>Date.now()){
+      const e=new Error("Tiingo hourly request quota is temporarily exhausted");
+      e.quotaExceeded=true;
+      e.retryAfterMinutes=this.quotaRetryMinutes();
+      throw e;
+    }
 
     const key=String(this.env.TIINGO_API_TOKEN||"").trim();
     if(!key)throw new Error("missing TIINGO_API_TOKEN");
@@ -507,34 +560,49 @@ export class TickHub extends DurableObject {
     const ticker=toTiingoSymbol(symbol);
     if(!ticker)throw new Error("invalid Tiingo FX ticker");
 
-    // Ask for recent intraday history and retain only the latest completed bars.
     const start=new Date(Date.now()-24*60*60*1000).toISOString().slice(0,10);
     const u=new URL(`https://api.tiingo.com/tiingo/fx/${ticker}/prices`);
     u.searchParams.set("startDate",start);
     u.searchParams.set("resampleFreq","1min");
 
     const res=await fetch(u.toString(),{
-      headers:{
-        accept:"application/json",
-        authorization:`Token ${key}`
-      }
+      headers:{accept:"application/json",authorization:`Token ${key}`}
     });
-    const data=await res.json();
+
+    let data;
+    try{data=await res.json();}catch(_){data=null;}
+
     if(!res.ok||!Array.isArray(data)){
-      throw new Error(data?.detail||data?.message||`Tiingo 1m context request failed (${res.status})`);
+      const msg=String(data?.detail||data?.message||`Tiingo 1m context request failed (${res.status})`);
+      if(/hourly request allocation|hourly.*limit|request.*hour/i.test(msg)){
+        // Tiingo documents hourly request limits as resetting every hour.
+        // Add a one-minute buffer beyond the next clock-hour boundary.
+        this.quotaBlockedUntil=(Math.floor(Date.now()/3600000)+1)*3600000+60000;
+        await this.ctx.storage.put("tiingoQuotaBlockedUntil",this.quotaBlockedUntil);
+        const e=new Error("Tiingo hourly request quota is temporarily exhausted");
+        e.quotaExceeded=true;
+        e.retryAfterMinutes=this.quotaRetryMinutes();
+        throw e;
+      }
+      throw new Error(msg);
     }
 
     const currentMinute=Math.floor(Date.now()/60000)*60000;
-    const bars=data.map(v=>({
+    const restBars=data.map(v=>({
       t:Date.parse(String(v.date||"")),
       o:Number(v.open),h:Number(v.high),l:Number(v.low),c:Number(v.close),n:1
     })).filter(b=>Number.isFinite(b.t)&&[b.o,b.h,b.l,b.c].every(Number.isFinite)&&b.t<currentMinute)
       .sort((a,b)=>a.t-b.t)
       .slice(-80);
 
-    if(bars.length<24)throw new Error(`only ${bars.length} completed Tiingo 1m bars available`);
-    this.oneMinuteCache.set(symbol,{at:Date.now(),bars});
-    return bars;
+    if(restBars.length<24)throw new Error(`only ${restBars.length} completed Tiingo 1m bars available`);
+
+    const fresh=this.mergeOneMinuteContext(symbol,restBars);
+    this.oneMinuteCache.set(symbol,{at:Date.now(),bars:fresh});
+    this.quotaBlockedUntil=0;
+    await this.ctx.storage.delete("tiingoQuotaBlockedUntil");
+    await this.persistOneMinuteCache();
+    return fresh;
   }
 
   async analyze(symbol){
@@ -565,6 +633,11 @@ export class TickHub extends DurableObject {
     let bars1m;
     try{bars1m=await this.fetchOneMinuteBars(symbol);}
     catch(e){
+      if(e?.quotaExceeded){
+        return {ok:false,quotaExceeded:true,retryAfterMinutes:Number(e.retryAfterMinutes)||1,symbol,ticks:arr.length,bars15,
+          receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status:this.lastStatus,
+          reason:"Tiingo hourly request quota is temporarily exhausted"};
+      }
       return {ok:false,symbol,ticks:arr.length,bars15,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
         status:this.lastStatus,reason:`1m context unavailable: ${String(e?.message||e)}`};
     }
@@ -704,14 +777,24 @@ async function hubPost(env,path,body){
 
 
 async function scanSixPairUniverse(env){
-  const checked=await Promise.all(FIXED_UNIVERSE.map(async symbol=>{
+  const checked=[];
+  for(const symbol of FIXED_UNIVERSE){
     try{
       const r=await hub(env,`/signal?symbol=${encodeURIComponent(symbol)}`);
-      return {...r,symbol};
+      checked.push({...r,symbol});
+      if(r?.quotaExceeded){
+        return {
+          ok:false,
+          quotaExceeded:true,
+          retryAfterMinutes:Number(r.retryAfterMinutes)||1,
+          checked,
+          reason:"Tiingo hourly request quota is temporarily exhausted."
+        };
+      }
     }catch(e){
-      return {ok:false,symbol,reason:String(e?.message||e)};
+      checked.push({ok:false,symbol,reason:String(e?.message||e)});
     }
-  }));
+  }
 
   const qualified=checked.filter(x=>x?.ok&&x?.direction&&Number.isFinite(Number(x.quality)));
   qualified.sort((a,b)=>
@@ -777,7 +860,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.5.2 Tiingo bar-ready six-pair scanner",{status:200});
+    if(request.method!=="POST")return new Response("V11.5.3 Tiingo quota-smart six-pair scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -788,7 +871,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V11.5.2 — use /signal to scan all 6 FX pairs and return only the strongest qualified 1-minute setup. Raw tick-count blocking has been removed; readiness now uses completed 5s/15s bars. Results are automatically tracked for 60 seconds."
+        "V11.5.3 — use /signal only. The bot scans all 6 FX pairs, reuses live Tiingo data to conserve the free API quota, and automatically tracks issued signals for 60 seconds."
       );
       return new Response("ok");
     }
@@ -847,12 +930,33 @@ export default {
     if(isUniverseScan){
       const scan=await scanSixPairUniverse(env);
       if(!scan.ok){
-        const summary=(scan.checked||[]).map(x=>{
-          if(x.ok)return `${x.symbol}: qualified`;
-          if(x.warming)return `${x.symbol}: ${x.reason} • ticks ${x.ticks||0}`;
-          return `${x.symbol}: ${x.reason||"not ready"}`;
-        }).join("\n");
-        await tgSend(env,chatId,`⏳ SIX-PAIR SCAN: WAIT\n${scan.reason}\n\n${summary}`);
+        if(scan.quotaExceeded){
+          const mins=Math.max(1,Number(scan.retryAfterMinutes)||1);
+          await tgSend(
+            env,
+            chatId,
+            `⏳ DATA LIMIT REACHED\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.\nThe bot will scan all 6 pairs again and will only issue a trade if a qualified setup is present.`
+          );
+          return new Response("ok");
+        }
+
+        const warming=(scan.checked||[]).filter(x=>x?.warming);
+        if(warming.length){
+          const need15=Math.max(...warming.map(x=>Math.max(0,6-Number(x.bars15||0))));
+          const retry=Math.max(1,Math.ceil((need15*15)/60));
+          await tgSend(
+            env,
+            chatId,
+            `⏳ MARKET DATA WARMING\nTry /signal again in about ${retry} minute${retry===1?"":"s"}.\nThe bot will scan all 6 pairs and only return a qualified setup.`
+          );
+          return new Response("ok");
+        }
+
+        await tgSend(
+          env,
+          chatId,
+          "⏳ NO QUALIFIED SETUP RIGHT NOW\nTry /signal again in 1 minute. The bot will scan all 6 pairs again."
+        );
         return new Response("ok");
       }
 
