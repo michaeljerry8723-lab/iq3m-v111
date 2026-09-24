@@ -4,7 +4,7 @@ compatibility_date = "2026-09-24"
 
 [vars]
 BOT_COMPACT_MODE = "1"
-WS_SYMBOLS = "EUR/USD,GBP/USD,USD/JPY,EUR/JPY,GBP/JPY,AUD/USD,USD/CAD"
+WS_SYMBOLS = "EUR/USD"
 
 [[durable_objects.bindings]]
 name = "TICK_HUB"
@@ -12,4 +12,5 @@ class_name = "TickHub"
 
 [exports.TickHub]
 type = "durable-object"
+state = "created"
 storage = "sqlite"
