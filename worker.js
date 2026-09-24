@@ -1,7 +1,7 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.3.1-60s-six-pair-scanner";
+const VERSION = "11.3.2-60s-six-pair-menu";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 60;
@@ -493,10 +493,26 @@ export class TickHub extends DurableObject {
   }
 }
 
-async function tgSend(env,chatId,text){
+function pairKeyboard(){
+  return {
+    keyboard: FIXED_UNIVERSE.map(symbol=>[{text:symbol}]),
+    resize_keyboard:true,
+    one_time_keyboard:false,
+    is_persistent:true,
+    input_field_placeholder:"Choose a pair for a 1-minute signal"
+  };
+}
+
+async function tgSend(env,chatId,text,replyMarkup=null){
   const token=String(env.TELEGRAM_BOT_TOKEN||"").trim();
   if(!token)throw new Error("Missing TELEGRAM_BOT_TOKEN");
-  const r=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({chat_id:chatId,text,disable_web_page_preview:true})});
+  const body={chat_id:chatId,text,disable_web_page_preview:true};
+  if(replyMarkup) body.reply_markup=replyMarkup;
+  const r=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{
+    method:"POST",
+    headers:{"content-type":"application/json"},
+    body:JSON.stringify(body)
+  });
   if(!r.ok)throw new Error(`Telegram ${r.status}: ${await r.text()}`);
 }
 function parseSignalText(text){
@@ -546,16 +562,29 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.3.1 60s six-pair scanner",{status:200});
+    if(request.method!=="POST")return new Response("V11.3.2 60s six-pair menu",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
     const update=await request.json(); const msg=update.message||update.edited_message; if(!msg?.chat?.id)return new Response("ok");
     const chatId=msg.chat.id, text=String(msg.text||"").trim();
     if(/^\/version$/i.test(text)){await tgSend(env,chatId,VERSION);return new Response("ok");}
-    if(/^\/start$/i.test(text)){await tgSend(env,chatId,"V11.3.1 fixed six-pair 1-minute scanner. Use /signal to scan all six, /signal EUR/USD for one pair, /pairs to list the universe, or /reconnect.");return new Response("ok");}
-    if(/^\/pairs$/i.test(text)){
-      await tgSend(env,chatId,`FIXED 6-PAIR UNIVERSE\n${FIXED_UNIVERSE.join("\n")}\n\nEXPIRY: 1 minute`);
+    if(/^\/start$/i.test(text)){
+      await tgSend(
+        env,
+        chatId,
+        "V11.3.2 — choose any pair below for a 1-minute signal. The six buttons stay available in Telegram for quick selection. Use /signal for the best qualified setup across all six.",
+        pairKeyboard()
+      );
+      return new Response("ok");
+    }
+    if(/^\/(?:pairs|menu)$/i.test(text)){
+      await tgSend(
+        env,
+        chatId,
+        `SELECT A PAIR FOR A 1-MINUTE SIGNAL\n\n${FIXED_UNIVERSE.join("\n")}\n\nTap a button below.`,
+        pairKeyboard()
+      );
       return new Response("ok");
     }
     if(/^\/reconnect$/i.test(text)){
