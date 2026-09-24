@@ -1,16 +1,16 @@
-name = "iq3m-predictor"
-main = "worker.js"
+name = "forex-daytrader-v1"
+main = "forex-worker.js"
 compatibility_date = "2026-09-24"
 
 [vars]
-BOT_COMPACT_MODE = "1"
-WS_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF"
+MIN_SETUP_SCORE = "82"
+MAX_HOLD_MINUTES = "360"
 
 [[durable_objects.bindings]]
-name = "TICK_HUB"
-class_name = "TickHub"
+name = "MARKET_HUB"
+class_name = "MarketHub"
 
-[exports.TickHub]
+[exports.MarketHub]
 type = "durable-object"
 state = "created"
 storage = "sqlite"
