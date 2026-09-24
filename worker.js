@@ -1,7 +1,7 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.4.0-tiingo-60s-six-pair";
+const VERSION = "11.4.1-tiingo-six-pair-health";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 60;
@@ -592,6 +592,49 @@ async function scanSixPairUniverse(env){
   return {ok:true,best:qualified[0],checked};
 }
 
+
+async function checkAllFeeds(env){
+  const results=[];
+  for(const symbol of FIXED_UNIVERSE){
+    try{
+      const st=await hub(env,`/status?symbol=${encodeURIComponent(symbol)}`);
+      const ticks=Number(st.ticks||0);
+      const received=Number(st.lastTickAgeSeconds);
+      const provider=Number(st.providerTickAgeSeconds);
+
+      let health="NO DATA";
+      if(st.connected && ticks>0 && Number.isFinite(received) && Number.isFinite(provider)){
+        if(received<=8 && provider<=10) health="LIVE";
+        else if(received<=20 && provider<=30) health="WARMING";
+        else health="STALE";
+      }else if(st.connected){
+        health="WARMING";
+      }
+
+      results.push({
+        symbol,
+        health,
+        connected:Boolean(st.connected),
+        ticks,
+        receivedAge:Number.isFinite(received)?received:null,
+        providerAge:Number.isFinite(provider)?provider:null,
+        status:st.status||"n/a"
+      });
+    }catch(e){
+      results.push({
+        symbol,
+        health:"ERROR",
+        connected:false,
+        ticks:0,
+        receivedAge:null,
+        providerAge:null,
+        status:String(e?.message||e)
+      });
+    }
+  }
+  return results;
+}
+
 export default {
   async fetch(request,env,ctx){
     const u=new URL(request.url);
@@ -600,7 +643,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.4 Tiingo 60s six-pair engine",{status:200});
+    if(request.method!=="POST")return new Response("V11.4.1 Tiingo six-pair health engine",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -611,7 +654,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V11.4 — Tiingo live FX engine. Choose any pair below for a 1-minute signal. Use /signal to scan the fixed six-pair universe.",
+        "V11.4.1 — Tiingo live FX engine. Choose any pair below for a 1-minute signal. Use /signal to scan all six or /checkall to check feed health.",
         pairKeyboard()
       );
       return new Response("ok");
