@@ -1,7 +1,7 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.5.1-tiingo-auto-track-six-scan";
+const VERSION = "11.5.2-tiingo-bar-ready-six-scan";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 60;
@@ -548,9 +548,10 @@ export class TickHub extends DurableObject {
     const marketAge=arr.length?this.latestMarketAge(symbol):Infinity;
     const bars15=buildBars(arr,15).length;
 
-    if(arr.length<40||bars15<6){
-      return {ok:false,warming:true,symbol,ticks:arr.length,bars15,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
-        status:this.lastStatus,reason:"live micro-feed warming; wait for at least 40 ticks and 6 x 15s bars"};
+    const bars5=buildBars(arr,5).length;
+    if(bars15<6||bars5<12){
+      return {ok:false,warming:true,symbol,ticks:arr.length,bars15,bars5,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
+        status:this.lastStatus,reason:`micro-feed warming: ${bars15}/6 x 15s bars, ${bars5}/12 x 5s bars ready`};
     }
     if(receiveAge>8){
       return {ok:false,symbol,ticks:arr.length,bars15,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
@@ -776,7 +777,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.5.1 Tiingo auto-track six-pair scanner",{status:200});
+    if(request.method!=="POST")return new Response("V11.5.2 Tiingo bar-ready six-pair scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -787,7 +788,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V11.5.1 — use /signal to scan all 6 FX pairs and return only the strongest qualified 1-minute setup. Pair buttons have been removed. Results are automatically tracked for 60 seconds. Use /stats for tracked performance and /checkall for feed health."
+        "V11.5.2 — use /signal to scan all 6 FX pairs and return only the strongest qualified 1-minute setup. Raw tick-count blocking has been removed; readiness now uses completed 5s/15s bars. Results are automatically tracked for 60 seconds."
       );
       return new Response("ok");
     }
@@ -846,7 +847,11 @@ export default {
     if(isUniverseScan){
       const scan=await scanSixPairUniverse(env);
       if(!scan.ok){
-        const summary=(scan.checked||[]).map(x=>`${x.symbol}: ${x.ok?"qualified":(x.reason||"not ready")}`).join("\n");
+        const summary=(scan.checked||[]).map(x=>{
+          if(x.ok)return `${x.symbol}: qualified`;
+          if(x.warming)return `${x.symbol}: ${x.reason} • ticks ${x.ticks||0}`;
+          return `${x.symbol}: ${x.reason||"not ready"}`;
+        }).join("\n");
         await tgSend(env,chatId,`⏳ SIX-PAIR SCAN: WAIT\n${scan.reason}\n\n${summary}`);
         return new Response("ok");
       }
