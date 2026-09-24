@@ -1,7 +1,7 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.5.0-tiingo-auto-track-six-scan";
+const VERSION = "11.5.1-tiingo-auto-track-six-scan";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 60;
@@ -673,7 +673,8 @@ async function tgSend(env,chatId,text,replyMarkup=null){
   const token=String(env.TELEGRAM_BOT_TOKEN||"").trim();
   if(!token)throw new Error("Missing TELEGRAM_BOT_TOKEN");
   const body={chat_id:chatId,text,disable_web_page_preview:true};
-  if(replyMarkup) body.reply_markup=replyMarkup;
+  // Explicitly remove any old persistent reply keyboard left by previous versions.
+  body.reply_markup=replyMarkup||{remove_keyboard:true};
   const r=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{
     method:"POST",
     headers:{"content-type":"application/json"},
@@ -775,7 +776,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.5 Tiingo auto-track six-pair scanner",{status:200});
+    if(request.method!=="POST")return new Response("V11.5.1 Tiingo auto-track six-pair scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -786,7 +787,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V11.5 — use /signal to scan all 6 FX pairs and return only the strongest qualified 1-minute setup. Results are automatically tracked for 60 seconds. Use /stats for tracked performance and /checkall for feed health."
+        "V11.5.1 — use /signal to scan all 6 FX pairs and return only the strongest qualified 1-minute setup. Pair buttons have been removed. Results are automatically tracked for 60 seconds. Use /stats for tracked performance and /checkall for feed health."
       );
       return new Response("ok");
     }
