@@ -811,7 +811,7 @@ export class TickHub extends DurableObject {
     const merged=new Map();
     for(const b of cachedBars||[])merged.set(Number(b.t),b);
     for(const b of liveBars)merged.set(Number(b.t),b);
-    return [...merged.values()].sort((a,b)=>a.t-b.t).slice(-80);
+    return [...merged.values()].sort((a,b)=>a.t-b.t).slice(-480);
   }
 
   contextIsUsable(bars){
@@ -899,7 +899,7 @@ export class TickHub extends DurableObject {
       o:Number(v.open),h:Number(v.high),l:Number(v.low),c:Number(v.close),n:Number(v.tradesDone||1)
     })).filter(b=>Number.isFinite(b.t)&&[b.o,b.h,b.l,b.c].every(Number.isFinite)&&b.t<currentMinute)
       .sort((a,b)=>a.t-b.t)
-      .slice(-120);
+      .slice(-480);
 
     if(restBars.length<30)throw new Error(`only ${restBars.length} completed Tiingo 1m bars available for ${symbol}`);
 
@@ -914,46 +914,49 @@ export class TickHub extends DurableObject {
   async analyze(symbol){
     symbol=normalizeSymbol(symbol); if(!symbol)return {ok:false,error:"invalid symbol"};
     const pairWait=this.pairCooldownSeconds(symbol);
-    if(pairWait>0)return {ok:false,cooldown:true,retrySeconds:pairWait,symbol,reason:"pair precision cooldown"};
-    await this.subscribe(symbol); await this.ensureSocket(); await this.refreshIfStale(symbol);
+    if(pairWait>0)return {ok:false,cooldown:true,retrySeconds:pairWait,symbol,reason:"pair cooldown"};
+
+    await this.subscribe(symbol);
+    if(isCryptoSymbol(symbol)) await this.ensureCryptoSocket();
+    else await this.ensureSocket();
+    await this.refreshIfStale(symbol);
 
     let arr=this.ticks.get(symbol)||[];
-    if(arr.length<24){await sleep(1500);arr=this.ticks.get(symbol)||[];}
+    if(arr.length<8){await sleep(1000);arr=this.ticks.get(symbol)||[];}
 
     const receiveAge=arr.length?this.latestReceivedAge(symbol):Infinity;
     const marketAge=arr.length?this.latestMarketAge(symbol):Infinity;
-    const bars15=buildBars(arr,15).length;
+    const status=isCryptoSymbol(symbol)?this.lastCryptoStatus:this.lastStatus;
 
-    const bars5=buildBars(arr,5).length;
     if(!arr.length){
-      return {ok:false,warming:true,symbol,ticks:0,bars15:0,bars5:0,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
-        status:this.lastStatus,reason:"waiting for first live Tiingo quote"};
+      return {ok:false,warming:true,symbol,ticks:0,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
+        status,reason:"waiting for first live Tiingo quote"};
     }
-    if(receiveAge>8){
-      return {ok:false,symbol,ticks:arr.length,bars15,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
-        status:this.lastStatus,reason:`live feed stale: no received tick for ${receiveAge.toFixed(1)}s`};
+    if(receiveAge>12){
+      return {ok:false,symbol,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
+        status,reason:`live feed stale: no received tick for ${receiveAge.toFixed(1)}s`};
     }
-    if(marketAge>10){
-      return {ok:false,symbol,ticks:arr.length,bars15,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
-        status:this.lastStatus,reason:`Tiingo quote timestamp is ${marketAge.toFixed(1)}s behind live time`};
+    if(marketAge>20){
+      return {ok:false,symbol,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
+        status,reason:`Tiingo quote timestamp is ${marketAge.toFixed(1)}s behind live time`};
     }
 
     let bars1m;
     try{bars1m=await this.fetchOneMinuteBars(symbol);}
     catch(e){
       if(e?.quotaExceeded){
-        return {ok:false,quotaExceeded:true,retryAfterMinutes:Number(e.retryAfterMinutes)||1,symbol,ticks:arr.length,bars15,
-          receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status:this.lastStatus,
+        return {ok:false,quotaExceeded:true,retryAfterMinutes:Number(e.retryAfterMinutes)||1,symbol,ticks:arr.length,
+          receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status,
           reason:"Tiingo hourly request quota is temporarily exhausted"};
       }
-      return {ok:false,symbol,ticks:arr.length,bars15,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
-        status:this.lastStatus,reason:`1m context unavailable: ${String(e?.message||e)}`};
+      return {ok:false,symbol,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
+        status,reason:`1m context unavailable: ${String(e?.message||e)}`};
     }
 
     const x=score5m(arr,bars1m);
-    if(!x.ok)return {...x,symbol,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status:this.lastStatus};
+    if(!x.ok)return {...x,symbol,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status};
     return {...x,symbol,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
-      status:this.lastStatus,reconnectCount:this.reconnectCount,generatedAt:Date.now()};
+      status,reconnectCount:this.reconnectCount,generatedAt:Date.now()};
   }
 
   isCurrentStrategyRecord(record){
