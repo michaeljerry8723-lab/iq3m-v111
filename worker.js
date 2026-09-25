@@ -830,9 +830,6 @@ export class TickHub extends DurableObject {
   async fetchOneMinuteBars(symbol){
     const cached=this.oneMinuteCache.get(symbol);
     const merged=this.mergeOneMinuteContext(symbol,cached?.bars||[]);
-
-    // Once bootstrapped, use the real-time Tiingo stream to keep 1m context current.
-    // This avoids spending a REST request on every /signal scan.
     if(this.contextIsUsable(merged)){
       if(!cached||merged.at(-1)?.t!==cached.bars?.at(-1)?.t){
         this.oneMinuteCache.set(symbol,{at:Date.now(),bars:merged});
@@ -851,14 +848,22 @@ export class TickHub extends DurableObject {
     if(!key)throw new Error("missing TIINGO_API_TOKEN");
 
     const ticker=toTiingoSymbol(symbol);
-    if(!ticker)throw new Error("invalid Tiingo FX ticker");
+    if(!ticker)throw new Error("invalid Tiingo ticker");
 
     const start=new Date(Date.now()-24*60*60*1000).toISOString().slice(0,10);
-    const u=new URL(`https://api.tiingo.com/tiingo/fx/${ticker}/prices`);
-    u.searchParams.set("startDate",start);
-    u.searchParams.set("resampleFreq","1min");
+    let url;
+    if(isCryptoSymbol(symbol)){
+      url=new URL("https://api.tiingo.com/tiingo/crypto/prices");
+      url.searchParams.set("tickers",ticker);
+      url.searchParams.set("startDate",start);
+      url.searchParams.set("resampleFreq","1min");
+    }else{
+      url=new URL(`https://api.tiingo.com/tiingo/fx/${ticker}/prices`);
+      url.searchParams.set("startDate",start);
+      url.searchParams.set("resampleFreq","1min");
+    }
 
-    const res=await fetch(u.toString(),{
+    const res=await fetch(url.toString(),{
       headers:{accept:"application/json",authorization:`Token ${key}`}
     });
 
@@ -868,8 +873,6 @@ export class TickHub extends DurableObject {
     if(!res.ok||!Array.isArray(data)){
       const msg=String(data?.detail||data?.message||`Tiingo 1m context request failed (${res.status})`);
       if(/hourly request allocation|hourly.*limit|request.*hour/i.test(msg)){
-        // Tiingo documents hourly request limits as resetting every hour.
-        // Add a one-minute buffer beyond the next clock-hour boundary.
         this.quotaBlockedUntil=(Math.floor(Date.now()/3600000)+1)*3600000+60000;
         await this.ctx.storage.put("tiingoQuotaBlockedUntil",this.quotaBlockedUntil);
         const e=new Error("Tiingo hourly request quota is temporarily exhausted");
@@ -881,14 +884,20 @@ export class TickHub extends DurableObject {
     }
 
     const currentMinute=Math.floor(Date.now()/60000)*60000;
-    const restBars=data.map(v=>({
+    let rows=data;
+    if(isCryptoSymbol(symbol)){
+      const item=data.find(x=>String(x?.ticker||"").toLowerCase()===ticker)||data[0];
+      rows=Array.isArray(item?.priceData)?item.priceData:[];
+    }
+
+    const restBars=rows.map(v=>({
       t:Date.parse(String(v.date||"")),
-      o:Number(v.open),h:Number(v.high),l:Number(v.low),c:Number(v.close),n:1
+      o:Number(v.open),h:Number(v.high),l:Number(v.low),c:Number(v.close),n:Number(v.tradesDone||1)
     })).filter(b=>Number.isFinite(b.t)&&[b.o,b.h,b.l,b.c].every(Number.isFinite)&&b.t<currentMinute)
       .sort((a,b)=>a.t-b.t)
-      .slice(-80);
+      .slice(-120);
 
-    if(restBars.length<24)throw new Error(`only ${restBars.length} completed Tiingo 1m bars available`);
+    if(restBars.length<30)throw new Error(`only ${restBars.length} completed Tiingo 1m bars available for ${symbol}`);
 
     const fresh=this.mergeOneMinuteContext(symbol,restBars);
     this.oneMinuteCache.set(symbol,{at:Date.now(),bars:fresh});
