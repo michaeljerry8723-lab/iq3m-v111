@@ -1,11 +1,11 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.10.0-pullback-continuation";
+const VERSION = "11.10.1-balanced-pullback";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 300;
-const STRATEGY_ID = "5m-pullback-v11.10";
+const STRATEGY_ID = "5m-balanced-pullback-v11.10.1";
 const GLOBAL_SIGNAL_COOLDOWN_MS = 6*60*1000;
 const PAIR_SIGNAL_COOLDOWN_MS = 10*60*1000;
 const LOSS_CIRCUIT_BREAKER_MS = 20*60*1000;
@@ -249,8 +249,8 @@ function score5m(ticks,bars1m){
   const dmi=dmiAdxSnapshot(bars1m,7);
   const pressure=candlePressure(bars1m,3);
 
-  if(!sma1.ready||!fr1.ready||!m1.ready||!ar1.ready||!atr1.ready||!regime.ready||!rsi1.ready||!dmi.ready||!pressure.ready){
-    return {ok:false,reason:"5-minute pullback context not ready",bars15:bars15.length};
+  if(!sma1.ready||!fr1.ready||!m1.ready||!ar1.ready||!atr1.ready||!rsi1.ready||!dmi.ready||!pressure.ready){
+    return {ok:false,reason:"5-minute context not ready",bars15:bars15.length};
   }
 
   const last=Number(ticks.at(-1)?.p);
@@ -259,174 +259,163 @@ function score5m(ticks,bars1m){
   const spreadAtrRatio=Number.isFinite(spread)&&spread>=0&&atr1.atr>0?spread/atr1.atr:Infinity;
   const atrRatio=Number.isFinite(last)&&last>0?atr1.atr/last:0;
 
-  if(!Number.isFinite(spreadAtrRatio)||spreadAtrRatio>0.18){
-    return {ok:false,reason:"spread too wide for pullback entry",spreadAtrRatio,bars15:bars15.length};
+  if(!Number.isFinite(spreadAtrRatio)||spreadAtrRatio>0.20){
+    return {ok:false,reason:"spread too wide",spreadAtrRatio,bars15:bars15.length};
   }
-  if(atrRatio<0.000008||atrRatio>0.0025){
-    return {ok:false,reason:"volatility outside pullback strategy range",atrRatio,bars15:bars15.length};
+  if(atrRatio<0.000007||atrRatio>0.0028){
+    return {ok:false,reason:"volatility outside strategy range",atrRatio,bars15:bars15.length};
   }
 
   let direction="NEUTRAL";
-  if(sma1.fast>sma1.slow&&sma1.fastSlope>0&&sma1.slowSlope>=0)direction="CALL";
-  if(sma1.fast<sma1.slow&&sma1.fastSlope<0&&sma1.slowSlope<=0)direction="PUT";
+  if(sma1.fast>sma1.slow&&sma1.fastSlope>0)direction="CALL";
+  if(sma1.fast<sma1.slow&&sma1.fastSlope<0)direction="PUT";
   if(direction==="NEUTRAL"){
-    return {ok:false,reason:"SMA(5/13) trend structure is not clean",bars15:bars15.length};
+    return {ok:false,reason:"SMA(5/13) trend is not clean",bars15:bars15.length};
   }
 
-  // Higher-timeframe direction must actively agree, not merely avoid disagreement.
-  if(regime.direction!==direction||regime.efficiency<0.28){
-    return {ok:false,reason:"completed 5m regime is not aligned strongly enough",coreDirection:direction,
-      regimeDirection:regime.direction,regimeEfficiency:regime.efficiency,bars15:bars15.length};
+  if((direction==="CALL"&&last<=sma1.fast)||(direction==="PUT"&&last>=sma1.fast)){
+    return {ok:false,reason:"price has not resumed beyond SMA(5)",coreDirection:direction,bars15:bars15.length};
   }
 
-  // Fractal(2) must provide a recent structural anchor for the pullback.
-  const anchor=direction==="CALL"?fr1.lastLow:fr1.lastHigh;
-  if(!anchor){
-    return {ok:false,reason:"no confirmed Fractal(2) pullback anchor",coreDirection:direction,bars15:bars15.length};
-  }
-  const anchorAgeMinutes=(Date.now()-Number(anchor.t))/60000;
-  if(anchorAgeMinutes>18){
-    return {ok:false,reason:"Fractal(2) pullback anchor is too old",coreDirection:direction,anchorAgeMinutes,bars15:bars15.length};
-  }
-  if(direction==="CALL"&&last<=fr1.lastLow.price){
+  if(direction==="CALL"&&fr1.lastLow&&last<=fr1.lastLow.price){
     return {ok:false,reason:"Fractal(2) support failed",coreDirection:direction,bars15:bars15.length};
   }
-  if(direction==="PUT"&&last>=fr1.lastHigh.price){
+  if(direction==="PUT"&&fr1.lastHigh&&last>=fr1.lastHigh.price){
     return {ok:false,reason:"Fractal(2) resistance failed",coreDirection:direction,bars15:bars15.length};
   }
 
-  // Require an actual pullback toward SMA(5), then a continuation away from it.
-  const recent=bars1m.slice(-4);
-  if(recent.length<4){
-    return {ok:false,reason:"not enough recent 1m bars for pullback test",coreDirection:direction,bars15:bars15.length};
+  // 5m context only hard-vetoes a strong opposite regime.
+  if(regime?.ready&&regime.direction!=="NEUTRAL"&&regime.direction!==direction&&regime.efficiency>=0.45){
+    return {ok:false,reason:"strong completed 5m regime opposes setup",coreDirection:direction,
+      regimeDirection:regime.direction,regimeEfficiency:regime.efficiency,bars15:bars15.length};
   }
-  const recentLow=Math.min(...recent.map(b=>Number(b.l)));
-  const recentHigh=Math.max(...recent.map(b=>Number(b.h)));
-  const touchedFast=direction==="CALL"
-    ? recentLow<=sma1.fast+0.25*atr1.atr
-    : recentHigh>=sma1.fast-0.25*atr1.atr;
-  if(!touchedFast){
-    return {ok:false,reason:"waiting for pullback toward SMA(5)",coreDirection:direction,bars15:bars15.length};
+
+  // Look for a practical pullback zone over the last 6 completed 1m bars.
+  // It can tag SMA(5) directly or come reasonably close in ATR terms.
+  const recent=bars1m.slice(-6);
+  if(recent.length<5){
+    return {ok:false,reason:"not enough recent 1m bars",coreDirection:direction,bars15:bars15.length};
+  }
+  const nearFast=recent.some(b=>{
+    if(direction==="CALL"){
+      const d=Math.abs(Number(b.l)-sma1.fast)/atr1.atr;
+      return Number(b.l)<=sma1.fast+0.45*atr1.atr || d<=0.45;
+    }else{
+      const d=Math.abs(Number(b.h)-sma1.fast)/atr1.atr;
+      return Number(b.h)>=sma1.fast-0.45*atr1.atr || d<=0.45;
+    }
+  });
+  if(!nearFast){
+    return {ok:false,reason:"waiting for a usable pullback near SMA(5)",coreDirection:direction,bars15:bars15.length};
   }
 
   const distanceFast=Math.abs(last-sma1.fast)/atr1.atr;
-  if(distanceFast>0.75){
-    return {ok:false,reason:"continuation already too extended from SMA(5)",distanceFastAtr:distanceFast,
+  if(distanceFast>1.05){
+    return {ok:false,reason:"entry is too extended from SMA(5)",distanceFastAtr:distanceFast,
       coreDirection:direction,bars15:bars15.length};
   }
-  if((direction==="CALL"&&last<=sma1.fast)||(direction==="PUT"&&last>=sma1.fast)){
-    return {ok:false,reason:"pullback has not resumed through SMA(5)",coreDirection:direction,bars15:bars15.length};
+
+  // Require continuation in at least one of the last two closed 1m bars.
+  const last2=bars1m.slice(-2);
+  const continuationBars=last2.filter(b=>direction==="CALL"
+    ? Number(b.c)>Number(b.o)&&Number(b.c)>=sma1.fast
+    : Number(b.c)<Number(b.o)&&Number(b.c)<=sma1.fast
+  ).length;
+  if(continuationBars<1){
+    return {ok:false,reason:"1m continuation has not appeared yet",coreDirection:direction,bars15:bars15.length};
   }
 
-  // The last completed 1m candle must show continuation in the trend direction.
-  const last1=bars1m.at(-1);
-  const oneMinuteContinuation=direction==="CALL"
-    ? Number(last1.c)>Number(last1.o)&&Number(last1.c)>=sma1.fast
-    : Number(last1.c)<Number(last1.o)&&Number(last1.c)<=sma1.fast;
-  if(!oneMinuteContinuation){
-    return {ok:false,reason:"1m continuation candle not confirmed",coreDirection:direction,bars15:bars15.length};
+  let score=3.2, confirms=1;
+  const reasons=[`SMA(5/13) ${direction==="CALL"?"bullish":"bearish"}`];
+
+  if((direction==="CALL"&&sma1.slowSlope>=0)||(direction==="PUT"&&sma1.slowSlope<=0)){
+    score+=0.8;reasons.push("SMA(13) slope aligned");
   }
 
-  // Momentum must be re-accelerating after the pullback.
-  const macdContinuation=direction==="CALL"
-    ? (m1.macd>m1.signal&&m1.hist>0&&m1.hist>=m1.prevHist)
-    : (m1.macd<m1.signal&&m1.hist<0&&m1.hist<=m1.prevHist);
-  if(!macdContinuation){
-    return {ok:false,reason:"1m MACD has not resumed after pullback",coreDirection:direction,bars15:bars15.length};
+  const anchor=direction==="CALL"?fr1.lastLow:fr1.lastHigh;
+  if(anchor){
+    const age=(Date.now()-Number(anchor.t))/60000;
+    if(age<=25){score+=0.9;confirms++;reasons.push("recent Fractal(2) structure");}
   }
+
+  const macdAligned=direction==="CALL"
+    ? (m1.macd>m1.signal&&m1.hist>0)
+    : (m1.macd<m1.signal&&m1.hist<0);
+  if(macdAligned){score+=1.2;confirms++;reasons.push("1m MACD aligned");}
 
   const dmiAligned=direction==="CALL"
-    ? dmi.plusDI>dmi.minusDI+3
-    : dmi.minusDI>dmi.plusDI+3;
-  if(!dmiAligned||dmi.adx<16){
-    return {ok:false,reason:"ADX/DMI trend strength is insufficient",adx:dmi.adx,plusDI:dmi.plusDI,minusDI:dmi.minusDI,
-      coreDirection:direction,bars15:bars15.length};
-  }
+    ? dmi.plusDI>dmi.minusDI+2
+    : dmi.minusDI>dmi.plusDI+2;
+  if(dmiAligned&&dmi.adx>=14){score+=1.0;confirms++;reasons.push("ADX/DMI aligned");}
 
   const rsiAligned=direction==="CALL"
-    ? (rsi1.rsi>=50&&rsi1.rsi<=69)
-    : (rsi1.rsi<=50&&rsi1.rsi>=31);
-  if(!rsiAligned){
-    return {ok:false,reason:"RSI(7) is not in the continuation zone",rsi:rsi1.rsi,coreDirection:direction,bars15:bars15.length};
-  }
+    ? (rsi1.rsi>=48&&rsi1.rsi<=72)
+    : (rsi1.rsi<=52&&rsi1.rsi>=28);
+  if(rsiAligned){score+=0.8;confirms++;reasons.push("RSI(7) aligned");}
 
   const aroonAligned=direction==="CALL"
-    ? ar1.up>ar1.down+12
-    : ar1.down>ar1.up+12;
-  if(!aroonAligned){
-    return {ok:false,reason:"Aroon does not confirm continuation",coreDirection:direction,bars15:bars15.length};
+    ? ar1.up>ar1.down+10
+    : ar1.down>ar1.up+10;
+  if(aroonAligned){score+=0.8;confirms++;reasons.push("Aroon aligned");}
+
+  const pressureAligned=direction==="CALL"?pressure.bull>=2:pressure.bear>=2;
+  if(pressureAligned){score+=0.6;reasons.push("1m candle pressure aligned");}
+
+  if(regime?.ready&&regime.direction===direction){
+    score+=0.9;reasons.push("completed 5m regime aligned");
   }
 
-  // Entry timing must be fresh: 15s momentum and live tick impulse both need to agree.
+  if(score<6.0||confirms<3){
+    return {ok:false,reason:`pullback setup not strong enough (score ${score.toFixed(1)}, confirmations ${confirms})`,
+      coreDirection:direction,score,confirms,bars15:bars15.length};
+  }
+
+  // Fresh timing: two of three is enough, but strong opposing ticks still veto.
   const m15=macdSnapshot(bars15,3,8,3);
   const imp=tickImpulse(ticks);
-  if(!m15.ready||!imp.ready){
-    return {ok:false,reason:"fresh entry-timing layer not ready",coreDirection:direction,bars15:bars15.length};
-  }
-
   const bullish=direction==="CALL";
-  const m15Aligned=bullish
+  const m15Aligned=m15.ready&&(bullish
     ? (m15.macd>m15.signal&&m15.hist>0)
-    : (m15.macd<m15.signal&&m15.hist<0);
-  const impAligned=bullish
-    ? (imp.upRatio>=0.58&&imp.norm>0)
-    : (imp.downRatio>=0.58&&imp.norm<0);
-  const strongOppImpulse=bullish
-    ? (imp.downRatio>=0.68&&imp.norm<0)
-    : (imp.upRatio>=0.68&&imp.norm>0);
+    : (m15.macd<m15.signal&&m15.hist<0));
+  const impAligned=imp.ready&&(bullish
+    ? (imp.upRatio>=0.55&&imp.norm>0)
+    : (imp.downRatio>=0.55&&imp.norm<0));
+  const strongOppImpulse=imp.ready&&(bullish
+    ? (imp.downRatio>=0.70&&imp.norm<0)
+    : (imp.upRatio>=0.70&&imp.norm>0));
   const b15=bars15.at(-1);
   const candleAligned=b15
     ? ((bullish&&Number(b15.c)>Number(b15.o))||(!bullish&&Number(b15.c)<Number(b15.o)))
     : false;
 
   if(strongOppImpulse){
-    return {ok:false,reason:"live tick impulse opposes continuation",coreDirection:direction,bars15:bars15.length};
-  }
-  if(!m15Aligned||!impAligned){
-    return {ok:false,reason:"15s MACD/live tick continuation not aligned",coreDirection:direction,bars15:bars15.length};
-  }
-  if(!candleAligned&&!((bullish&&m15.rising)||(!bullish&&m15.falling))){
-    return {ok:false,reason:"15s continuation trigger is not fresh",coreDirection:direction,bars15:bars15.length};
+    return {ok:false,reason:"live tick impulse strongly opposes entry",coreDirection:direction,bars15:bars15.length};
   }
 
-  const pressureAligned=direction==="CALL"?pressure.bull>=2:pressure.bear>=2;
-  const fractalBreak=direction==="CALL"
-    ? Boolean(fr1.lastHigh&&last>fr1.lastHigh.price)
-    : Boolean(fr1.lastLow&&last<fr1.lastLow.price);
+  const timingCount=[m15Aligned,impAligned,candleAligned].filter(Boolean).length;
+  if(timingCount<2){
+    return {ok:false,reason:"waiting for fresh 15s/live entry confirmation",coreDirection:direction,
+      timingCount,bars15:bars15.length};
+  }
 
-  let score=7.5;
-  const reasons=[
-    `SMA(5/13) ${direction==="CALL"?"bullish":"bearish"}`,
-    "completed 5m regime aligned",
-    "Fractal(2) pullback anchor",
-    "pullback touched SMA(5)",
-    "1m continuation candle",
-    "1m MACD resumed",
-    "ADX/DMI aligned",
-    "RSI continuation zone",
-    "Aroon aligned",
-    "15s MACD aligned",
-    "live tick impulse aligned"
-  ];
-  if(pressureAligned){score+=0.5;reasons.push("1m candle pressure aligned");}
-  if(fractalBreak){score+=0.5;reasons.push("fractal continuation break");}
-  if(candleAligned){score+=0.4;reasons.push("15s candle aligned");}
-
+  const timingScore=(m15Aligned?1.2:0)+(impAligned?1.3:0)+(candleAligned?0.6:0);
   const quality=clamp(
-    0.76 + Math.min(score-7.5,1.4)*0.04 +
-    Math.min(regime.efficiency,0.7)*0.05 +
-    Math.min(dmi.adx,35)/35*0.04,
-    0.76,0.93
+    0.69 + Math.min(score-6.0,3.5)*0.035 +
+    Math.min(timingScore,3.1)*0.025 +
+    (regime?.ready&&regime.direction===direction?0.025:0),
+    0.69,0.92
   );
 
   return {
     ok:true,direction,expirySeconds:EXPIRY_SECONDS,quality,
     callScore:direction==="CALL"?score:0,putScore:direction==="PUT"?score:0,
-    edge:score,coreMajor:7,microConfirmations:2+(candleAligned?1:0),microScore:2.7+(candleAligned?0.6:0),
-    regimeEfficiency:regime.efficiency,spreadAtrRatio,atrRatio,rsi:rsi1.rsi,adx:dmi.adx,
+    edge:score,coreMajor:confirms,microConfirmations:timingCount,microScore:timingScore,
+    regimeEfficiency:regime?.efficiency??null,spreadAtrRatio,atrRatio,rsi:rsi1.rsi,adx:dmi.adx,
     smaFastPeriod:5,smaSlowPeriod:13,fractalPeriod:2,timeframe:"1min",expiryMinutes:5,
-    smaFast:sma1.fast,smaSlow:sma1.slow,distanceFastAtr:distanceFast,anchorAgeMinutes,
-    reasons,bars15:bars15.length,bars1m:bars1m.length,lastPrice:last
+    smaFast:sma1.fast,smaSlow:sma1.slow,distanceFastAtr:distanceFast,
+    reasons:[...reasons,"pullback near SMA(5)","1m continuation",...(m15Aligned?["15s MACD aligned"]:[]),
+      ...(impAligned?["live tick impulse aligned"]:[]),...(candleAligned?["15s candle aligned"]:[])],
+    bars15:bars15.length,bars1m:bars1m.length,lastPrice:last
   };
 }
 
@@ -1166,7 +1155,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.10 pullback-continuation five-minute scanner",{status:200});
+    if(request.method!=="POST")return new Response("V11.10.1 balanced pullback five-minute scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -1177,7 +1166,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V11.10 — PULLBACK-CONTINUATION MODE. /signal scans all 6 pairs for a 5-minute setup only after SMA(5/13) trend alignment, completed 5m regime agreement, a recent Fractal(2) pullback toward SMA(5), 1m continuation, MACD/ADX-DMI/RSI/Aroon confirmation, and fresh 15s plus live-tick resumption."
+        "V11.10.1 — BALANCED PULLBACK MODE. Keeps SMA(5/13), Fractal(2), pullback-and-continuation structure and 5-minute expiry, but secondary indicators are weighted instead of all mandatory. A strong opposite 5m regime or live tick impulse still vetoes the trade."
       );
       return new Response("ok");
     }
@@ -1281,10 +1270,14 @@ export default {
           return new Response("ok");
         }
 
+        const reasons=(checked||[]).map(x=>x?.reason).filter(Boolean);
+        const top=reasons.length?reasons.sort((a,b)=>
+          reasons.filter(x=>x===b).length-reasons.filter(x=>x===a).length
+        )[0]:null;
         await tgSend(
           env,
           chatId,
-          "⏳ NO QUALIFIED 5-MINUTE SETUP RIGHT NOW\nThe live feeds are active, but none of the 6 pairs currently meets the 5-minute entry rules. Try /signal again in about 2 minutes."
+          `⏳ NO QUALIFIED 5-MINUTE SETUP RIGHT NOW\nFeeds are live across the scan.${top?"\nMain blocker: "+top:""}\nTry /signal again in about 1–2 minutes.`
         );
         return new Response("ok");
       }
