@@ -1216,7 +1216,7 @@ export default {
         await tgSend(
           env,
           chatId,
-          "⏳ NO QUALIFIED SETUP RIGHT NOW\nTry /signal again in 1 minute. The bot will scan all 6 pairs again."
+          "⏳ NO QUALIFIED 5-MINUTE SETUP RIGHT NOW\nTry /signal again in about 2 minutes. The bot will scan all 6 pairs again."
         );
         return new Response("ok");
       }
