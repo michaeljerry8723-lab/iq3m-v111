@@ -1,7 +1,7 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.8.2-five-minute-no-warm-lock";
+const VERSION = "11.9.0-five-minute-revalidated-entry";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 300;
@@ -173,7 +173,9 @@ function efficiencyRatio(bars,p=8){
   return travel>0?net/travel:0;
 }
 function regime5mSnapshot(bars1m){
-  const b5=aggregateOhlcBars(bars1m,300);
+  const currentMinute=Math.floor(Date.now()/60000)*60000;
+  const b5=aggregateOhlcBars(bars1m,300)
+    .filter(b=>Number(b.t)+300000<=currentMinute);
   if(b5.length<15)return {ready:false,bars:b5.length};
   const c=b5.map(b=>Number(b.c)), e5=emaSeries(c,5), e13=emaSeries(c,13), i=c.length-1;
   if(![e5[i],e5[i-1],e13[i],e13[i-1]].every(Number.isFinite))return {ready:false,bars:b5.length};
@@ -287,6 +289,14 @@ function score5m(ticks,bars1m){
       regimeDirection:regime.direction,regimeEfficiency:regime.efficiency,bars15:bars15.length};
   }
 
+  if(atr1.atr>0){
+    const distanceFast=Math.abs(last-sma1.fast)/atr1.atr;
+    if(distanceFast>0.90){
+      return {ok:false,reason:"price is too far from SMA(5) for a fresh 5m entry",distanceFastAtr:distanceFast,
+        coreDirection:direction,bars15:bars15.length};
+    }
+  }
+
   const last1=bars1m.at(-1);
   if(last1&&atr1.atr>0){
     const extension=Math.abs(last-Number(last1.c))/atr1.atr;
@@ -372,8 +382,8 @@ function score5m(ticks,bars1m){
   const timingCount=[m15Aligned,impAligned,candleAligned].filter(Boolean).length;
   const timingScore=(m15Aligned?1.2:0)+(impAligned?1.2:0)+(candleAligned?0.6:0);
 
-  if(timingCount===0&&score<7.0){
-    return {ok:false,reason:"5m setup exists but entry timing is not clean yet",coreDirection:direction,
+  if(timingCount===0){
+    return {ok:false,reason:"5m setup exists but fresh entry timing is not aligned",coreDirection:direction,
       score,bars15:bars15.length};
   }
   const quality=clamp(
