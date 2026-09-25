@@ -966,6 +966,25 @@ export class TickHub extends DurableObject {
     }
 
     if(u.pathname==="/signal")return json(await this.analyze(symbol));
+    if(u.pathname==="/quote"){
+      if(!symbol)return json({ok:false,error:"invalid symbol"},400);
+      await this.subscribe(symbol);
+      await this.ensureSocket();
+      const arr=this.ticks.get(symbol)||[];
+      const q=arr.at(-1);
+      if(!q)return json({ok:false,symbol,error:"no live quote"});
+      return json({
+        ok:true,
+        symbol,
+        price:Number(q.p),
+        bid:q.bid,
+        ask:q.ask,
+        providerAt:Number(q.t),
+        receivedAt:Number(q.r||q.t),
+        receiveAgeSeconds:this.latestReceivedAge(symbol),
+        marketAgeSeconds:this.latestMarketAge(symbol)
+      });
+    }
     if(u.pathname==="/risk")return json(this.getRiskGate());
     if(u.pathname==="/track"&&req.method==="POST")return json(await this.trackSignal(req));
     if(u.pathname==="/stats")return json(await this.getTrackingStats());
@@ -1010,14 +1029,15 @@ async function tgSend(env,chatId,text,replyMarkup=null){
   const token=String(env.TELEGRAM_BOT_TOKEN||"").trim();
   if(!token)throw new Error("Missing TELEGRAM_BOT_TOKEN");
   const body={chat_id:chatId,text,disable_web_page_preview:true};
-  // Explicitly remove any old persistent reply keyboard left by previous versions.
   body.reply_markup=replyMarkup||{remove_keyboard:true};
   const r=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{
     method:"POST",
     headers:{"content-type":"application/json"},
     body:JSON.stringify(body)
   });
-  if(!r.ok)throw new Error(`Telegram ${r.status}: ${await r.text()}`);
+  const data=await r.json().catch(()=>null);
+  if(!r.ok)throw new Error(`Telegram ${r.status}: ${JSON.stringify(data)||"send failed"}`);
+  return data?.result||null;
 }
 function parseSignalText(text){
   const t=String(text||"").trim();
@@ -1067,7 +1087,7 @@ async function scanSixPairUniverse(env){
   );
 
   if(!qualified.length){
-    return {ok:false,checked,reason:"No qualified 1-minute entry across the fixed six-pair universe."};
+    return {ok:false,checked,reason:"No qualified 5-minute entry across the fixed six-pair universe."};
   }
   return {ok:true,best:qualified[0],checked};
 }
