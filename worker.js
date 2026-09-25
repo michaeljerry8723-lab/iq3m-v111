@@ -1,14 +1,14 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "12.0.3-continuation-consensus";
+const VERSION = "12.1.0-stateful-entry";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF,XAU/USD,BTC/USD";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set(["BTC/USD"]);
 const A_GRADE_MIN_QUALITY = 0.82;
 const EXPIRY_SECONDS = 300;
-const STRATEGY_ID = "v12.0.3-continuation-consensus";
-const GLOBAL_SIGNAL_COOLDOWN_MS = 6*60*1000;
+const STRATEGY_ID = "v12.1-stateful-entry";
+const GLOBAL_SIGNAL_COOLDOWN_MS = 0;
 const PAIR_SIGNAL_COOLDOWN_MS = 10*60*1000;
 const LOSS_CIRCUIT_BREAKER_MS = 20*60*1000;
 
@@ -313,6 +313,54 @@ function roomToMoveSnapshot(bars1m,last,direction,atr){
   return {ready:true,roomAtr:(last-level)/atr,level};
 }
 
+function usdExposureSide(symbol,direction){
+  const s=normalizeSymbol(symbol);
+  const d=String(direction||"").toUpperCase();
+  if(!s||!["CALL","PUT"].includes(d))return null;
+  const usdBase=new Set(["USD/JPY","USD/CAD","USD/CHF"]);
+  const usdQuote=new Set(["EUR/USD","GBP/USD","AUD/USD","XAU/USD","BTC/USD"]);
+  if(usdBase.has(s))return d==="CALL"?"USD_LONG":"USD_SHORT";
+  if(usdQuote.has(s))return d==="CALL"?"USD_SHORT":"USD_LONG";
+  return null;
+}
+
+function setupSequenceSnapshot(bars1m){
+  const sma=smaTrendSnapshot(bars1m,5,13);
+  const fr=fractalSnapshot(bars1m,2);
+  const atr=atrSnapshot(bars1m,14);
+  const b5=completedAggregate(bars1m,300);
+  const reg5=trendRegime(b5,5,13,0.16);
+  if(!sma.ready||!fr.ready||!atr.ready||!reg5.ready){
+    return {ready:false,direction:"NEUTRAL"};
+  }
+
+  const direction=reg5.direction;
+  const lastBar=bars1m.at(-1);
+  if(!lastBar||direction==="NEUTRAL"){
+    return {ready:true,direction:"NEUTRAL",barT:Number(lastBar?.t||0)};
+  }
+
+  const last=Number(lastBar.c);
+  const structureOk=direction==="CALL"
+    ? (!fr.lastLow||last>Number(fr.lastLow.price))
+    : (!fr.lastHigh||last<Number(fr.lastHigh.price));
+
+  const zoneLow=Math.min(sma.fast,sma.slow)-0.30*atr.atr;
+  const zoneHigh=Math.max(sma.fast,sma.slow)+0.30*atr.atr;
+  const recent=bars1m.slice(-4);
+  const pullbackSeen=recent.some(b=>Number(b.l)<=zoneHigh&&Number(b.h)>=zoneLow);
+
+  const last2=bars1m.slice(-2);
+  const resumed=last2.some(b=>direction==="CALL"
+    ? Number(b.c)>Number(b.o)&&Number(b.c)>sma.fast
+    : Number(b.c)<Number(b.o)&&Number(b.c)<sma.fast);
+
+  return {
+    ready:true,direction,barT:Number(lastBar.t),structureOk,pullbackSeen,resumed,
+    smaFast:sma.fast,smaSlow:sma.slow,atr:atr.atr,regimeEfficiency:reg5.efficiency
+  };
+}
+
 function score5m(ticks,bars1m,symbol){
   const sma1=smaTrendSnapshot(bars1m,5,13);
   const fr1=fractalSnapshot(bars1m,2);
@@ -505,7 +553,7 @@ export class TickHub extends DurableObject {
     super(ctx,env);
     this.ctx=ctx; this.env=env; this.ws=null; this.cryptoWs=null; this.ticks=new Map(); this.symbols=new Set();
     this.lastStatus="starting"; this.lastSubscribeStatus=null; this.connecting=false; this.cryptoConnecting=false; this.provider="tiingo"; this.lastCryptoStatus="starting"; this.lastCryptoSubscribeStatus=null; this.lastCryptoWsMessageAt=0;
-    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map(); this.quotaBlockedUntil=0; this.pendingSignals=[]; this.signalStats={total:0,wins:0,losses:0,draws:0,voids:0}; this.signalHistory=[]; this.alertChats=[];
+    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map(); this.quotaBlockedUntil=0; this.pendingSignals=[]; this.signalStats={total:0,wins:0,losses:0,draws:0,voids:0}; this.signalHistory=[]; this.alertChats=[]; this.setupStates={};
 
     this.ctx.blockConcurrencyWhile(async()=>{
       // V11.2: prefer the configured warm list over old persisted symbols so a Basic/trial
@@ -522,6 +570,7 @@ export class TickHub extends DurableObject {
       this.signalStats=(await this.ctx.storage.get("signalStats"))||{total:0,wins:0,losses:0,draws:0,voids:0};
       this.signalHistory=(await this.ctx.storage.get("signalHistory"))||[];
       this.alertChats=(await this.ctx.storage.get("alertChats"))||[];
+      this.setupStates=(await this.ctx.storage.get("setupStates"))||{};
       if(!this.alertChats.length){
         const recovered=[...this.pendingSignals,...this.signalHistory]
           .flatMap(x=>Array.isArray(x.chatIds)?x.chatIds:[x.chatId])
@@ -991,6 +1040,71 @@ export class TickHub extends DurableObject {
     await this.ctx.storage.delete("tiingoQuotaBlockedUntil");
     await this.persistOneMinuteCache();
     return fresh;
+  }
+
+  async advanceSetupState(symbol,bars1m){
+    const snap=setupSequenceSnapshot(bars1m);
+    const now=Date.now();
+    let st=this.setupStates[symbol]||{stage:"SEEK",direction:null,lastBarT:0,updatedAt:0};
+
+    const save=async next=>{
+      this.setupStates[symbol]=next;
+      await this.ctx.storage.put("setupStates",this.setupStates);
+      return next;
+    };
+
+    if(!snap.ready||snap.direction==="NEUTRAL"||!snap.structureOk){
+      const next={stage:"SEEK",direction:null,lastBarT:Number(snap.barT||0),updatedAt:now};
+      if(st.stage!=="SEEK"||st.direction||Number(st.lastBarT)!==Number(next.lastBarT))await save(next);
+      return {...next,snapshot:snap};
+    }
+
+    if(st.direction!==snap.direction||now-Number(st.updatedAt||0)>35*60*1000){
+      const next={stage:"ARMED",direction:snap.direction,lastBarT:snap.barT,updatedAt:now};
+      await save(next);
+      return {...next,snapshot:snap};
+    }
+
+    // Repeated /signal commands within the same completed 1m candle must not
+    // artificially advance the sequence.
+    if(Number(st.lastBarT)===Number(snap.barT)){
+      return {...st,snapshot:snap};
+    }
+
+    let next={...st,lastBarT:snap.barT,updatedAt:now};
+    if(st.stage==="SEEK"){
+      next={stage:"ARMED",direction:snap.direction,lastBarT:snap.barT,updatedAt:now};
+    }else if(st.stage==="ARMED"&&snap.pullbackSeen){
+      next={stage:"PULLBACK",direction:snap.direction,lastBarT:snap.barT,updatedAt:now};
+    }else if(st.stage==="PULLBACK"&&snap.resumed){
+      next={stage:"READY",direction:snap.direction,lastBarT:snap.barT,readyBarT:snap.barT,updatedAt:now};
+    }else if(st.stage==="READY"){
+      const ageBars=Math.max(0,(Number(snap.barT)-Number(st.readyBarT||st.lastBarT))/60000);
+      if(ageBars>2){
+        next={stage:"ARMED",direction:snap.direction,lastBarT:snap.barT,updatedAt:now};
+      }
+    }
+
+    if(JSON.stringify(next)!==JSON.stringify(st))await save(next);
+    return {...next,snapshot:snap};
+  }
+
+  exposureConflict(symbol,direction){
+    const side=usdExposureSide(symbol,direction);
+    if(!side)return null;
+    const now=Date.now();
+    for(const sig of this.pendingSignals){
+      if(!this.isCurrentStrategyRecord(sig)||Number(sig.expiresAt)<=now)continue;
+      if(sig.symbol===symbol)continue;
+      const other=usdExposureSide(sig.symbol,sig.direction);
+      if(other===side){
+        return {
+          conflict:true,side,withSymbol:sig.symbol,withDirection:sig.direction,
+          retrySeconds:Math.max(1,Math.ceil((Number(sig.expiresAt)-now)/1000))
+        };
+      }
+    }
+    return null;
   }
 
   async analyze(symbol){
