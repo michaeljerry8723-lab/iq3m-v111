@@ -1,7 +1,7 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "12.0.0-a-grade-auto";
+const VERSION = "12.0.1-adaptive-spread";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF,XAU/USD,BTC/USD";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set(["BTC/USD"]);
@@ -40,6 +40,48 @@ function formatFxPrice(symbol,p){
   return n.toFixed(s.endsWith("/JPY")?3:5);
 }
 function isCryptoSymbol(symbol){ return CRYPTO_SYMBOLS.has(normalizeSymbol(symbol)); }
+function medianNumber(xs){
+  const a=(xs||[]).filter(Number.isFinite).sort((x,y)=>x-y);
+  if(!a.length)return NaN;
+  const m=Math.floor(a.length/2);
+  return a.length%2?a[m]:(a[m-1]+a[m])/2;
+}
+function spreadQualitySnapshot(symbol,ticks,last,atr){
+  const now=Date.now(), cutoff=now-60000;
+  const spreads=(ticks||[])
+    .filter(t=>Number(t.r||t.t)>=cutoff)
+    .map(t=>{
+      const bid=Number(t.bid), ask=Number(t.ask);
+      return Number.isFinite(bid)&&Number.isFinite(ask)&&ask>=bid ? ask-bid : NaN;
+    })
+    .filter(Number.isFinite)
+    .slice(-60);
+
+  const spread=medianNumber(spreads);
+  if(!Number.isFinite(spread)||spread<=0||!Number.isFinite(last)||last<=0){
+    return {ready:false,abnormal:false,spread:null,spreadBps:null,spreadAtrRatio:null,samples:spreads.length};
+  }
+
+  const spreadBps=(spread/last)*10000;
+  const spreadAtrRatio=Number.isFinite(atr)&&atr>0?spread/atr:null;
+  const s=normalizeSymbol(symbol);
+
+  // Tiingo is our market-data reference, not the user's execution venue.
+  // Spread is therefore a sanity veto only for clearly abnormal conditions,
+  // not a hard filter on ordinary quote differences.
+  let maxBps=3.5, softBps=1.0, maxAtr=0.65;
+  if(s==="XAU/USD"){maxBps=5.0;softBps=1.5;maxAtr=0.75;}
+  if(s==="BTC/USD"){maxBps=12.0;softBps=2.5;maxAtr=0.90;}
+
+  const extremeAbsolute=spreadBps>maxBps;
+  const extremeRelative=Number.isFinite(spreadAtrRatio)&&spreadAtrRatio>maxAtr&&spreadBps>softBps;
+  return {
+    ready:true,
+    abnormal:extremeAbsolute||extremeRelative,
+    spread,spreadBps,spreadAtrRatio,samples:spreads.length,
+    maxBps,maxAtr
+  };
+}
 
 function buildBars(ticks, seconds){
   const m=new Map(), span=seconds*1000;
@@ -271,7 +313,7 @@ function roomToMoveSnapshot(bars1m,last,direction,atr){
   return {ready:true,roomAtr:(last-level)/atr,level};
 }
 
-function score5m(ticks,bars1m){
+function score5m(ticks,bars1m,symbol){
   const sma1=smaTrendSnapshot(bars1m,5,13);
   const fr1=fractalSnapshot(bars1m,2);
   const m1=macdSnapshot(bars1m,5,13,4);
@@ -292,13 +334,16 @@ function score5m(ticks,bars1m){
   const last=Number(ticks.at(-1)?.p);
   if(!Number.isFinite(last))return {ok:false,grade:"NO TRADE",reason:"no valid live price"};
 
-  const spreadTick=[...ticks].reverse().find(x=>Number.isFinite(Number(x.bid))&&Number.isFinite(Number(x.ask)));
-  const spread=spreadTick?Number(spreadTick.ask)-Number(spreadTick.bid):NaN;
-  const spreadAtrRatio=Number.isFinite(spread)&&spread>=0&&atr1.atr>0?spread/atr1.atr:null;
+  const spreadInfo=spreadQualitySnapshot(symbol,ticks,last,atr1.atr);
+  const spreadAtrRatio=spreadInfo.spreadAtrRatio;
+  const spreadBps=spreadInfo.spreadBps;
   const atrRatio=last>0?atr1.atr/last:0;
 
-  if(Number.isFinite(spreadAtrRatio)&&spreadAtrRatio>0.20){
-    return {ok:false,grade:"NO TRADE",reason:"spread is too wide",spreadAtrRatio};
+  if(spreadInfo.abnormal){
+    return {
+      ok:false,grade:"NO TRADE",reason:"spread is abnormally wide",
+      spreadAtrRatio,spreadBps,spreadSamples:spreadInfo.samples
+    };
   }
   if(atrRatio<0.000006||atrRatio>0.0040){
     return {ok:false,grade:"NO TRADE",reason:"volatility is outside the A-grade range",atrRatio};
@@ -422,7 +467,7 @@ function score5m(ticks,bars1m){
     edge:score,coreMajor:8,microConfirmations:0,microScore:0,
     regime5:regime5.direction,regime15:regime15.direction,
     regime5Efficiency:regime5.efficiency,regime15Efficiency:regime15.efficiency,
-    roomAtr:room.roomAtr,spreadAtrRatio,atrRatio,rsi:rsi1.rsi,adx:dmi.adx,
+    roomAtr:room.roomAtr,spreadAtrRatio,spreadBps,atrRatio,rsi:rsi1.rsi,adx:dmi.adx,
     smaFastPeriod:5,smaSlowPeriod:13,fractalPeriod:2,timeframe:"1min",expiryMinutes:5,
     smaFast:sma1.fast,smaSlow:sma1.slow,distanceFastAtr:distanceFast,
     reasons,bars1m:bars1m.length,lastPrice:last
@@ -964,7 +1009,7 @@ export class TickHub extends DurableObject {
         status,reason:`1m context unavailable: ${String(e?.message||e)}`};
     }
 
-    const x=score5m(arr,bars1m);
+    const x=score5m(arr,bars1m,symbol);
     if(!x.ok)return {...x,symbol,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status};
     return {...x,symbol,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
       status,reconnectCount:this.reconnectCount,generatedAt:Date.now()};
@@ -1374,7 +1419,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V12 A-grade automatic five-minute scanner",{status:200});
+    if(request.method!=="POST")return new Response("V12.0.1 adaptive-spread A-grade scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -1386,7 +1431,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V12 — A-GRADE AUTO MODE. Eight symbols: six FX majors + XAU/USD + BTC/USD. The bot scans automatically every minute and only alerts when the 1m entry, completed 5m and 15m trend, pullback/continuation, momentum, volatility and room-to-move vetoes all qualify as Grade A. /signal remains available for an immediate scan."
+        "V12.0.1 — A-GRADE AUTO MODE. Eight symbols with 5-minute expiry. The spread gate now uses a recent median and asset-aware abnormal-spread sanity check, so ordinary Tiingo quote differences no longer block otherwise valid A-grade setups. Automatic one-minute scanning remains active."
       );
       return new Response("ok");
     }
