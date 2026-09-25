@@ -1,7 +1,7 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.9.0-five-minute-revalidated-entry";
+const VERSION = "11.9.1-multi-pair-concurrent";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 300;
@@ -840,12 +840,9 @@ export class TickHub extends DurableObject {
 
   getRiskGate(){
     const now=Date.now();
-    const pending=this.pendingSignals.filter(x=>this.isCurrentStrategyRecord(x)).sort((a,b)=>Number(b.entryAt)-Number(a.entryAt));
-    if(pending.length){
-      const latest=pending[0];
-      const retryMs=Math.max(1000,Number(latest.expiresAt||now)-now+30000);
-      return {ok:false,reason:"an existing signal is still being settled",retrySeconds:Math.ceil(retryMs/1000)};
-    }
+    // Do not globally block /signal while another 5-minute trade is still pending.
+    // pairCooldownSeconds() already excludes the active pair, so the remaining pairs
+    // can still be scanned for independent qualified opportunities.
 
     const hist=this.signalHistory.filter(x=>this.isCurrentStrategyRecord(x)).sort((a,b)=>Number(b.settledAt||b.entryAt)-Number(a.settledAt||a.entryAt));
     const latest=hist[0];
@@ -1143,7 +1140,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.9 revalidated five-minute scanner",{status:200});
+    if(request.method!=="POST")return new Response("V11.9.1 concurrent multi-pair five-minute scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -1154,7 +1151,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V11.9 — REVALIDATED 5-MINUTE MODE. Uses completed 5m regime candles, rejects stretched entries, requires fresh timing confirmation, rechecks the selected pair immediately before sending, and starts tracking from a fresh Tiingo quote after Telegram delivery."
+        "V11.9.1 — MULTI-PAIR 5-MINUTE MODE. An active signal no longer blocks /signal globally. The pair already being tracked stays excluded by its own cooldown, while the bot continues scanning the other five pairs for an independent qualified setup."
       );
       return new Response("ok");
     }
