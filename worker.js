@@ -1,7 +1,7 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.6.0-tiingo-precision-veto";
+const VERSION = "11.6.1-sma2-5-fractal2";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 60;
@@ -50,6 +50,17 @@ function emaSeries(vals,p){
   for(let i=p;i<vals.length;i++) out[i]=Number(vals[i])*k+out[i-1]*(1-k);
   return out;
 }
+function smaSeries(vals,p){
+  p=Math.max(2,Math.floor(p)); const out=new Array(vals.length).fill(NaN);
+  if(vals.length<p)return out;
+  let sum=0;
+  for(let i=0;i<vals.length;i++){
+    sum+=Number(vals[i]);
+    if(i>=p)sum-=Number(vals[i-p]);
+    if(i>=p-1)out[i]=sum/p;
+  }
+  return out;
+}
 function smmaSeries(vals,p){
   p=Math.max(2,Math.floor(p)); const out=new Array(vals.length).fill(NaN); if(vals.length<p)return out;
   let seed=mean(vals.slice(0,p)); out[p-1]=seed;
@@ -80,15 +91,21 @@ function aroonSnapshot(bars,p=7){
   const sinceHi=p-1-hiIdx, sinceLo=p-1-loIdx;
   return {ready:true,up:100*(p-sinceHi)/p,down:100*(p-sinceLo)/p,spread:100*((p-sinceHi)-(p-sinceLo))/p};
 }
-function fractalSnapshot(bars){
-  if(!bars || bars.length<7)return {ready:false};
+function fractalSnapshot(bars,p=2){
+  p=Math.max(1,Math.floor(p));
+  if(!bars || bars.length<(p*2+3))return {ready:false};
   let lastHigh=null,lastLow=null;
-  for(let i=2;i<bars.length-2;i++){
+  for(let i=p;i<bars.length-p;i++){
     const b=bars[i];
-    if(Number(b.h)>Number(bars[i-1].h)&&Number(b.h)>Number(bars[i-2].h)&&Number(b.h)>Number(bars[i+1].h)&&Number(b.h)>Number(bars[i+2].h)) lastHigh={price:Number(b.h),t:b.t};
-    if(Number(b.l)<Number(bars[i-1].l)&&Number(b.l)<Number(bars[i-2].l)&&Number(b.l)<Number(bars[i+1].l)&&Number(b.l)<Number(bars[i+2].l)) lastLow={price:Number(b.l),t:b.t};
+    let high=true,low=true;
+    for(let k=1;k<=p;k++){
+      if(!(Number(b.h)>Number(bars[i-k].h)&&Number(b.h)>Number(bars[i+k].h)))high=false;
+      if(!(Number(b.l)<Number(bars[i-k].l)&&Number(b.l)<Number(bars[i+k].l)))low=false;
+    }
+    if(high)lastHigh={price:Number(b.h),t:b.t};
+    if(low)lastLow={price:Number(b.l),t:b.t};
   }
-  return {ready:Boolean(lastHigh||lastLow),lastHigh,lastLow};
+  return {ready:Boolean(lastHigh||lastLow),lastHigh,lastLow,period:p};
 }
 function tickImpulse(ticks){
   const xs=ticks.slice(-24); if(xs.length<8)return {ready:false};
@@ -100,11 +117,19 @@ function tickImpulse(ticks){
   return {ready:true,upRatio:up/Math.max(1,up+down),downRatio:down/Math.max(1,up+down),delta,norm:avg>0?delta/avg:0};
 }
 
-function emaTrendSnapshot(bars){
-  if(!bars || bars.length<24)return {ready:false};
-  const c=bars.map(b=>Number(b.c)), e9=emaSeries(c,9), e21=emaSeries(c,21), i=c.length-1;
-  if(![e9[i],e9[i-1],e21[i],e21[i-1]].every(Number.isFinite))return {ready:false};
-  return {ready:true,ema9:e9[i],ema21:e21[i],slope9:e9[i]-e9[i-1],slope21:e21[i]-e21[i-1]};
+function smaTrendSnapshot(bars,fast=2,slow=5){
+  if(!bars || bars.length<slow+2)return {ready:false};
+  const c=bars.map(b=>Number(b.c)), sf=smaSeries(c,fast), ss=smaSeries(c,slow), i=c.length-1;
+  if(![sf[i],sf[i-1],ss[i],ss[i-1]].every(Number.isFinite))return {ready:false};
+  return {
+    ready:true,
+    fast:sf[i],slow:ss[i],
+    prevFast:sf[i-1],prevSlow:ss[i-1],
+    fastSlope:sf[i]-sf[i-1],
+    slowSlope:ss[i]-ss[i-1],
+    crossedUp:sf[i]>ss[i]&&sf[i-1]<=ss[i-1],
+    crossedDown:sf[i]<ss[i]&&sf[i-1]>=ss[i-1]
+  };
 }
 function parseUtcDateTime(v){
   const x=String(v||"").trim().replace(" ","T");
@@ -167,12 +192,12 @@ function score60s(ticks,bars1m){
   const a1=alligatorSnapshot(bars1m);
   const m1=macdSnapshot(bars1m,5,13,4);
   const ar1=aroonSnapshot(bars1m,14);
-  const fr1=fractalSnapshot(bars1m);
-  const et1=emaTrendSnapshot(bars1m);
+  const fr1=fractalSnapshot(bars1m,2);
+  const sma1=smaTrendSnapshot(bars1m,2,5);
   const atr1=atrSnapshot(bars1m,14);
   const regime=regime5mSnapshot(bars1m);
 
-  if(!a1.ready||!m1.ready||!ar1.ready||!et1.ready||!atr1.ready||!regime.ready){
+  if(!a1.ready||!m1.ready||!ar1.ready||!fr1.ready||!sma1.ready||!atr1.ready||!regime.ready){
     return {ok:false,reason:"precision context not ready",bars15:bars15.length,bars5:bars5.length};
   }
 
@@ -206,11 +231,21 @@ function score60s(ticks,bars1m){
     else if(a1.lips<a1.jaws){put.score+=0.8;put.reasons.push("Alligator expanding");}
   }
 
-  if(et1.ema9>et1.ema21&&et1.slope9>0&&et1.slope21>=0){
-    call.score+=2.5;call.major++;call.reasons.push("1m EMA trend bullish");
+  let smaDirection="NEUTRAL";
+  if(sma1.fast>sma1.slow&&sma1.fastSlope>0){
+    smaDirection="CALL";
+    call.score+=3.5;call.major++;call.reasons.push("1m SMA(2) above SMA(5)");
+    if(sma1.slowSlope>=0){call.score+=0.7;call.reasons.push("SMA(5) slope supportive");}
+    if(sma1.crossedUp){call.score+=1.0;call.reasons.push("fresh SMA(2/5) bullish crossover");}
   }
-  if(et1.ema9<et1.ema21&&et1.slope9<0&&et1.slope21<=0){
-    put.score+=2.5;put.major++;put.reasons.push("1m EMA trend bearish");
+  if(sma1.fast<sma1.slow&&sma1.fastSlope<0){
+    smaDirection="PUT";
+    put.score+=3.5;put.major++;put.reasons.push("1m SMA(2) below SMA(5)");
+    if(sma1.slowSlope<=0){put.score+=0.7;put.reasons.push("SMA(5) slope supportive");}
+    if(sma1.crossedDown){put.score+=1.0;put.reasons.push("fresh SMA(2/5) bearish crossover");}
+  }
+  if(smaDirection==="NEUTRAL"){
+    return {ok:false,reason:"1m SMA(2/5) direction is not clean",bars15:bars15.length,bars5:bars5.length};
   }
 
   if(m1.macd>m1.signal&&m1.hist>0&&m1.rising){
@@ -229,14 +264,34 @@ function score60s(ticks,bars1m){
     if(net<0){put.score+=0.6;put.reasons.push("closed 1m momentum down");}
   }
 
-  if(fr1.ready&&Number.isFinite(last)){
-    if(fr1.lastHigh&&last>fr1.lastHigh.price){call.score+=1;call.reasons.push("confirmed fractal breakout");}
-    else if(fr1.lastLow&&last<fr1.lastLow.price){put.score+=1;put.reasons.push("confirmed fractal breakdown");}
+  if(Number.isFinite(last)){
+    if(fr1.lastLow&&last<=fr1.lastLow.price){
+      if(smaDirection==="CALL")return {ok:false,reason:"fractal(2) support failed against CALL bias",bars15:bars15.length,bars5:bars5.length};
+      put.score+=1.2;put.major++;put.reasons.push("fractal(2) breakdown");
+    }
+    if(fr1.lastHigh&&last>=fr1.lastHigh.price){
+      if(smaDirection==="PUT")return {ok:false,reason:"fractal(2) resistance failed against PUT bias",bars15:bars15.length,bars5:bars5.length};
+      call.score+=1.2;call.major++;call.reasons.push("fractal(2) breakout");
+    }
+
+    if(fr1.lastLow&&fr1.lastHigh){
+      if(smaDirection==="CALL"&&Number(fr1.lastLow.t)>Number(fr1.lastHigh.t)){
+        call.score+=0.8;call.reasons.push("recent fractal(2) swing low supports CALL");
+      }
+      if(smaDirection==="PUT"&&Number(fr1.lastHigh.t)>Number(fr1.lastLow.t)){
+        put.score+=0.8;put.reasons.push("recent fractal(2) swing high supports PUT");
+      }
+    }
   }
 
-  const direction=call.score>put.score?"CALL":"PUT";
+  const direction=smaDirection;
   const win=direction==="CALL"?call:put, lose=direction==="CALL"?put:call;
   const edge=win.score-lose.score;
+
+  if((direction==="CALL"&&last<=sma1.fast)||(direction==="PUT"&&last>=sma1.fast)){
+    return {ok:false,reason:"live price is on the wrong side of SMA(2)",coreDirection:direction,
+      callScore:call.score,putScore:put.score,bars15:bars15.length,bars5:bars5.length};
+  }
 
   if(regime.direction!==direction){
     return {ok:false,reason:"5m regime disagrees with 1m direction",coreDirection:direction,regimeDirection:regime.direction,
@@ -288,7 +343,10 @@ function score60s(ticks,bars1m){
     ok:true,direction,expirySeconds:EXPIRY_SECONDS,quality,
     callScore:call.score,putScore:put.score,edge,coreMajor:win.major,
     microConfirmations:microConfirm,microScore,regimeEfficiency:regime.efficiency,
-    spreadAtrRatio,atrRatio,reasons:[...win.reasons,"5m regime aligned",...microReasons],
+    spreadAtrRatio,atrRatio,
+    smaFastPeriod:2,smaSlowPeriod:5,fractalPeriod:2,timeframe:"1min",
+    smaFast:sma1.fast,smaSlow:sma1.slow,
+    reasons:[...win.reasons,"5m regime aligned",...microReasons],
     bars5:bars5.length,bars15:bars15.length,bars1m:bars1m.length,lastPrice:last
   };
 }
@@ -972,7 +1030,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.6 Tiingo precision-veto six-pair scanner",{status:200});
+    if(request.method!=="POST")return new Response("V11.6.1 SMA2/SMA5/Fractal2 precision scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -983,7 +1041,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V11.6 — PRECISION MODE. Use /signal only. The bot scans all 6 FX pairs but now requires 5m regime alignment, stronger 1m structure, mandatory 15s/5s/tick confirmation, spread/volatility filters, cooldowns, and a two-loss circuit breaker."
+        "V11.6.1 — PRECISION MODE with your 1-minute settings: SMA(2), SMA(5), Fractal(2). /signal scans all 6 pairs and only trades when the SMA direction, fractal structure, 5m regime, 15s/5s momentum, live ticks, spread and volatility filters agree."
       );
       return new Response("ok");
     }
