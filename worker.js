@@ -1,11 +1,13 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.10.1-balanced-pullback";
-const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
+const VERSION = "12.0.0-a-grade-auto";
+const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF,XAU/USD,BTC/USD";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
+const CRYPTO_SYMBOLS = new Set(["BTC/USD"]);
+const A_GRADE_MIN_QUALITY = 0.86;
 const EXPIRY_SECONDS = 300;
-const STRATEGY_ID = "5m-balanced-pullback-v11.10.1";
+const STRATEGY_ID = "v12-a-grade-5m";
 const GLOBAL_SIGNAL_COOLDOWN_MS = 6*60*1000;
 const PAIR_SIGNAL_COOLDOWN_MS = 10*60*1000;
 const LOSS_CIRCUIT_BREAKER_MS = 20*60*1000;
@@ -32,8 +34,12 @@ function json(data,status=200){ return new Response(JSON.stringify(data,null,2),
 function formatFxPrice(symbol,p){
   const n=Number(p);
   if(!Number.isFinite(n))return "n/a";
-  return n.toFixed(String(symbol||"").endsWith("/JPY")?3:5);
+  const s=String(symbol||"");
+  if(s==="BTC/USD")return n.toFixed(2);
+  if(s==="XAU/USD")return n.toFixed(2);
+  return n.toFixed(s.endsWith("/JPY")?3:5);
 }
+function isCryptoSymbol(symbol){ return CRYPTO_SYMBOLS.has(normalizeSymbol(symbol)); }
 
 function buildBars(ticks, seconds){
   const m=new Map(), span=seconds*1000;
@@ -422,8 +428,8 @@ function score5m(ticks,bars1m){
 export class TickHub extends DurableObject {
   constructor(ctx,env){
     super(ctx,env);
-    this.ctx=ctx; this.env=env; this.ws=null; this.ticks=new Map(); this.symbols=new Set();
-    this.lastStatus="starting"; this.lastSubscribeStatus=null; this.connecting=false; this.provider="tiingo";
+    this.ctx=ctx; this.env=env; this.ws=null; this.cryptoWs=null; this.ticks=new Map(); this.symbols=new Set();
+    this.lastStatus="starting"; this.lastSubscribeStatus=null; this.connecting=false; this.cryptoConnecting=false; this.provider="tiingo"; this.lastCryptoStatus="starting"; this.lastCryptoSubscribeStatus=null; this.lastCryptoWsMessageAt=0;
     this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map(); this.quotaBlockedUntil=0; this.pendingSignals=[]; this.signalStats={total:0,wins:0,losses:0,draws:0,voids:0}; this.signalHistory=[];
 
     this.ctx.blockConcurrencyWhile(async()=>{
@@ -441,6 +447,7 @@ export class TickHub extends DurableObject {
       this.signalStats=(await this.ctx.storage.get("signalStats"))||{total:0,wins:0,losses:0,draws:0,voids:0};
       this.signalHistory=(await this.ctx.storage.get("signalHistory"))||[];
       await this.ensureSocket();
+      await this.ensureCryptoSocket();
       await this.scheduleAlarm();
     });
   }
