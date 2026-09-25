@@ -5,7 +5,7 @@ const VERSION = "11.9.0-five-minute-revalidated-entry";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 300;
-const STRATEGY_ID = "5m-trend-v11.8";
+const STRATEGY_ID = "5m-revalidated-v11.9";
 const GLOBAL_SIGNAL_COOLDOWN_MS = 6*60*1000;
 const PAIR_SIGNAL_COOLDOWN_MS = 10*60*1000;
 const LOSS_CIRCUIT_BREAKER_MS = 20*60*1000;
@@ -1143,7 +1143,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.8.2 five-minute no-warm-lock scanner",{status:200});
+    if(request.method!=="POST")return new Response("V11.9 revalidated five-minute scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -1154,7 +1154,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V11.8.2 — 5-MINUTE TREND MODE. The 15-second warm-up lock has been removed. Core decisions use 1m SMA(5), SMA(13), Fractal(2), MACD/Aroon/RSI/ADX-DMI and 5m regime context; live 15s/tick data improves entry timing but no longer blocks a strong setup just because the short-term buffer is still filling."
+        "V11.9 — REVALIDATED 5-MINUTE MODE. Uses completed 5m regime candles, rejects stretched entries, requires fresh timing confirmation, rechecks the selected pair immediately before sending, and starts tracking from a fresh Tiingo quote after Telegram delivery."
       );
       return new Response("ok");
     }
