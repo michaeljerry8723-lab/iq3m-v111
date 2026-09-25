@@ -1149,9 +1149,34 @@ export class TickHub extends DurableObject {
         status,reason:`1m context unavailable: ${String(e?.message||e)}`};
     }
 
+    const phase=await this.advanceSetupState(symbol,bars1m);
+    if(phase.stage!=="READY"){
+      const phaseReason=phase.stage==="SEEK"
+        ? "waiting for a clean completed 5m trend"
+        : phase.stage==="ARMED"
+          ? "trend armed — waiting for the next pullback into the SMA zone"
+          : "pullback recorded — waiting for a fresh 1m continuation";
+      return {
+        ok:false,grade:"NO TRADE",symbol,setupStage:phase.stage,setupDirection:phase.direction,
+        ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status,
+        reason:phaseReason
+      };
+    }
+
     const x=score5m(arr,bars1m,symbol);
-    if(!x.ok)return {...x,symbol,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status};
-    return {...x,symbol,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
+    if(!x.ok)return {...x,symbol,setupStage:phase.stage,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status};
+
+    const conflict=this.exposureConflict(symbol,x.direction);
+    if(conflict){
+      return {
+        ok:false,grade:"NO TRADE",symbol,setupStage:phase.stage,
+        reason:`correlated ${conflict.side==="USD_LONG"?"USD-long":"USD-short"} exposure already active on ${conflict.withSymbol}`,
+        retrySeconds:conflict.retrySeconds,exposureConflict:conflict,
+        ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status
+      };
+    }
+
+    return {...x,symbol,setupStage:phase.stage,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
       status,reconnectCount:this.reconnectCount,generatedAt:Date.now()};
   }
 
@@ -1257,6 +1282,8 @@ export class TickHub extends DurableObject {
     };
     this.pendingSignals.push(sig);
     await this.ctx.storage.put("pendingSignals",this.pendingSignals);
+    this.setupStates[symbol]={stage:"SEEK",direction:null,lastBarT:0,updatedAt:Date.now()};
+    await this.ctx.storage.put("setupStates",this.setupStates);
     await this.scheduleAlarm();
     return {ok:true,id:sig.id,expiresAt:sig.expiresAt};
   }
