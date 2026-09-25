@@ -1,10 +1,13 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.5.3-tiingo-quota-smart-six-scan";
+const VERSION = "11.6.0-tiingo-precision-veto";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 60;
+const GLOBAL_SIGNAL_COOLDOWN_MS = 3*60*1000;
+const PAIR_SIGNAL_COOLDOWN_MS = 10*60*1000;
+const LOSS_CIRCUIT_BREAKER_MS = 15*60*1000;
 
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 function clamp(x,a,b){ return Math.max(a,Math.min(b,Number(x)||0)); }
@@ -109,10 +112,56 @@ function parseUtcDateTime(v){
   return Date.parse(/Z$|[+-]\d\d:\d\d$/.test(x)?x:x+"Z");
 }
 
+function aggregateOhlcBars(bars,seconds){
+  const span=seconds*1000, m=new Map();
+  for(const b of bars||[]){
+    const bucket=Math.floor(Number(b.t)/span)*span;
+    let x=m.get(bucket);
+    if(!x){
+      x={t:bucket,o:Number(b.o),h:Number(b.h),l:Number(b.l),c:Number(b.c),n:Number(b.n||1)};
+      m.set(bucket,x);
+    }else{
+      x.h=Math.max(x.h,Number(b.h));
+      x.l=Math.min(x.l,Number(b.l));
+      x.c=Number(b.c);
+      x.n+=Number(b.n||1);
+    }
+  }
+  return [...m.values()].sort((a,b)=>a.t-b.t);
+}
+function atrSnapshot(bars,p=14){
+  if(!bars||bars.length<p+1)return {ready:false};
+  const xs=bars.slice(-(p+1)); let sum=0;
+  for(let i=1;i<xs.length;i++){
+    const h=Number(xs[i].h),l=Number(xs[i].l),pc=Number(xs[i-1].c);
+    sum+=Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc));
+  }
+  return {ready:true,atr:sum/p};
+}
+function efficiencyRatio(bars,p=8){
+  if(!bars||bars.length<p+1)return 0;
+  const xs=bars.slice(-(p+1)).map(b=>Number(b.c));
+  const net=Math.abs(xs.at(-1)-xs[0]);
+  let travel=0;
+  for(let i=1;i<xs.length;i++)travel+=Math.abs(xs[i]-xs[i-1]);
+  return travel>0?net/travel:0;
+}
+function regime5mSnapshot(bars1m){
+  const b5=aggregateOhlcBars(bars1m,300);
+  if(b5.length<15)return {ready:false,bars:b5.length};
+  const c=b5.map(b=>Number(b.c)), e5=emaSeries(c,5), e13=emaSeries(c,13), i=c.length-1;
+  if(![e5[i],e5[i-1],e13[i],e13[i-1]].every(Number.isFinite))return {ready:false,bars:b5.length};
+  const eff=efficiencyRatio(b5,8);
+  let direction="NEUTRAL";
+  if(e5[i]>e13[i]&&e5[i]>e5[i-1]&&e13[i]>=e13[i-1]&&eff>=0.32)direction="CALL";
+  if(e5[i]<e13[i]&&e5[i]<e5[i-1]&&e13[i]<=e13[i-1]&&eff>=0.32)direction="PUT";
+  return {ready:true,direction,efficiency:eff,emaFast:e5[i],emaSlow:e13[i],bars:b5.length};
+}
+
 function score60s(ticks,bars1m){
   const bars15=buildBars(ticks,15), bars5=buildBars(ticks,5);
-  if(bars15.length<6 || bars5.length<12){
-    return {ok:false,reason:"micro-entry layer still warming",bars15:bars15.length,bars5:bars5.length};
+  if(bars15.length<8||bars5.length<18){
+    return {ok:false,reason:"precision micro-layer warming",bars15:bars15.length,bars5:bars5.length};
   }
 
   const a1=alligatorSnapshot(bars1m);
@@ -120,12 +169,31 @@ function score60s(ticks,bars1m){
   const ar1=aroonSnapshot(bars1m,14);
   const fr1=fractalSnapshot(bars1m);
   const et1=emaTrendSnapshot(bars1m);
-  if(!a1.ready||!m1.ready||!ar1.ready||!et1.ready){
-    return {ok:false,reason:"1-minute context not ready",bars15:bars15.length,bars5:bars5.length};
+  const atr1=atrSnapshot(bars1m,14);
+  const regime=regime5mSnapshot(bars1m);
+
+  if(!a1.ready||!m1.ready||!ar1.ready||!et1.ready||!atr1.ready||!regime.ready){
+    return {ok:false,reason:"precision context not ready",bars15:bars15.length,bars5:bars5.length};
+  }
+
+  const last=Number(ticks.at(-1)?.p);
+  const lastTick=ticks.at(-1)||{};
+  const spread=Number(lastTick.ask)-Number(lastTick.bid);
+  const spreadAtrRatio=Number.isFinite(spread)&&spread>=0&&atr1.atr>0?spread/atr1.atr:Infinity;
+  const atrRatio=Number.isFinite(last)&&last>0?atr1.atr/last:0;
+
+  if(!Number.isFinite(spreadAtrRatio)||spreadAtrRatio>0.12){
+    return {ok:false,reason:"spread too wide for precision entry",spreadAtrRatio,bars15:bars15.length,bars5:bars5.length};
+  }
+  if(atrRatio<0.000015||atrRatio>0.0015){
+    return {ok:false,reason:"1m volatility outside precision range",atrRatio,bars15:bars15.length,bars5:bars5.length};
+  }
+  if(regime.direction==="NEUTRAL"){
+    return {ok:false,reason:"5m regime is choppy/neutral",regimeEfficiency:regime.efficiency,bars15:bars15.length,bars5:bars5.length};
   }
 
   const call={score:0,major:0,reasons:[]}, put={score:0,major:0,reasons:[]};
-  const last=Number(ticks.at(-1)?.p), last1=bars1m.at(-1), prev1=bars1m.at(-2);
+  const last1=bars1m.at(-1), prev1=bars1m.at(-2);
 
   if(a1.lips>a1.teeth&&a1.teeth>a1.jaws&&a1.lipsSlope>0&&a1.teethSlope>=0){
     call.score+=3;call.major++;call.reasons.push("1m Alligator bullish");
@@ -134,30 +202,26 @@ function score60s(ticks,bars1m){
     put.score+=3;put.major++;put.reasons.push("1m Alligator bearish");
   }
   if(a1.gap>a1.prevGap){
-    if(a1.lips>a1.jaws){call.score+=0.7;call.reasons.push("1m Alligator expanding");}
-    else if(a1.lips<a1.jaws){put.score+=0.7;put.reasons.push("1m Alligator expanding");}
+    if(a1.lips>a1.jaws){call.score+=0.8;call.reasons.push("Alligator expanding");}
+    else if(a1.lips<a1.jaws){put.score+=0.8;put.reasons.push("Alligator expanding");}
   }
 
-  if(et1.ema9>et1.ema21&&et1.slope9>0){
-    call.score+=2;call.major++;call.reasons.push("1m EMA trend bullish");
-    if(et1.slope21>=0)call.score+=0.5;
+  if(et1.ema9>et1.ema21&&et1.slope9>0&&et1.slope21>=0){
+    call.score+=2.5;call.major++;call.reasons.push("1m EMA trend bullish");
   }
-  if(et1.ema9<et1.ema21&&et1.slope9<0){
-    put.score+=2;put.major++;put.reasons.push("1m EMA trend bearish");
-    if(et1.slope21<=0)put.score+=0.5;
+  if(et1.ema9<et1.ema21&&et1.slope9<0&&et1.slope21<=0){
+    put.score+=2.5;put.major++;put.reasons.push("1m EMA trend bearish");
   }
 
-  if(m1.macd>m1.signal&&m1.hist>0){
-    call.score+=2;call.major++;call.reasons.push("1m MACD bullish");
-    if(m1.rising)call.score+=0.5;
+  if(m1.macd>m1.signal&&m1.hist>0&&m1.rising){
+    call.score+=2.5;call.major++;call.reasons.push("1m MACD bullish + accelerating");
   }
-  if(m1.macd<m1.signal&&m1.hist<0){
-    put.score+=2;put.major++;put.reasons.push("1m MACD bearish");
-    if(m1.falling)put.score+=0.5;
+  if(m1.macd<m1.signal&&m1.hist<0&&m1.falling){
+    put.score+=2.5;put.major++;put.reasons.push("1m MACD bearish + accelerating");
   }
 
-  if(ar1.up>ar1.down+20){call.score+=1.5;call.major++;call.reasons.push("1m Aroon up dominant");}
-  if(ar1.down>ar1.up+20){put.score+=1.5;put.major++;put.reasons.push("1m Aroon down dominant");}
+  if(ar1.up>ar1.down+30){call.score+=1.8;call.major++;call.reasons.push("1m Aroon strongly bullish");}
+  if(ar1.down>ar1.up+30){put.score+=1.8;put.major++;put.reasons.push("1m Aroon strongly bearish");}
 
   if(last1&&prev1){
     const net=Number(last1.c)-Number(prev1.c);
@@ -166,62 +230,67 @@ function score60s(ticks,bars1m){
   }
 
   if(fr1.ready&&Number.isFinite(last)){
-    if(fr1.lastHigh&&last>fr1.lastHigh.price){call.score+=0.8;call.reasons.push("above confirmed 1m fractal high");}
-    else if(fr1.lastLow&&last<fr1.lastLow.price){put.score+=0.8;put.reasons.push("below confirmed 1m fractal low");}
+    if(fr1.lastHigh&&last>fr1.lastHigh.price){call.score+=1;call.reasons.push("confirmed fractal breakout");}
+    else if(fr1.lastLow&&last<fr1.lastLow.price){put.score+=1;put.reasons.push("confirmed fractal breakdown");}
   }
 
   const direction=call.score>put.score?"CALL":"PUT";
   const win=direction==="CALL"?call:put, lose=direction==="CALL"?put:call;
   const edge=win.score-lose.score;
-  if(win.score<7 || win.major<3 || edge<2.5){
-    return {ok:false,reason:`1m direction not selective enough (score ${win.score.toFixed(1)}, edge ${edge.toFixed(1)}, major ${win.major})`,
+
+  if(regime.direction!==direction){
+    return {ok:false,reason:"5m regime disagrees with 1m direction",coreDirection:direction,regimeDirection:regime.direction,
+      callScore:call.score,putScore:put.score,bars15:bars15.length,bars5:bars5.length};
+  }
+  if(win.score<9||win.major<4||edge<4){
+    return {ok:false,reason:`precision core below threshold (score ${win.score.toFixed(1)}, edge ${edge.toFixed(1)}, major ${win.major})`,
       coreDirection:direction,callScore:call.score,putScore:put.score,bars15:bars15.length,bars5:bars5.length};
+  }
+
+  if(last1&&Number.isFinite(last)&&atr1.atr>0){
+    const extension=Math.abs(last-Number(last1.c))/atr1.atr;
+    if(extension>1.1){
+      return {ok:false,reason:"entry would chase an already-extended move",extensionAtr:extension,
+        coreDirection:direction,callScore:call.score,putScore:put.score,bars15:bars15.length,bars5:bars5.length};
+    }
   }
 
   const m15=macdSnapshot(bars15,3,8,3), ar15=aroonSnapshot(bars15,7), m5=macdSnapshot(bars5,3,8,3), imp=tickImpulse(ticks);
+  if(!m15.ready||!m5.ready||!ar15.ready||!imp.ready){
+    return {ok:false,reason:"precision micro-confirmation not ready",bars15:bars15.length,bars5:bars5.length};
+  }
+
   const bullish=direction==="CALL";
-  let microConfirm=0,microScore=0,hardOpposition=false;
-  const microReasons=[];
-
-  if(m15.ready){
-    const aligned=bullish?(m15.macd>m15.signal&&m15.hist>0):(m15.macd<m15.signal&&m15.hist<0);
-    const opposed=bullish?(m15.macd<m15.signal&&m15.hist<0):(m15.macd>m15.signal&&m15.hist>0);
-    if(aligned){microConfirm++;microScore+=1.5;microReasons.push("15s MACD aligned");}
-    if(opposed&&Math.abs(m15.hist)>Math.abs(m15.prevHist||0))hardOpposition=true;
-  }
-  if(ar15.ready){
-    const aligned=bullish?(ar15.up>ar15.down+15):(ar15.down>ar15.up+15);
-    if(aligned){microConfirm++;microScore+=1;microReasons.push("15s Aroon aligned");}
-  }
+  const m15Aligned=bullish?(m15.macd>m15.signal&&m15.hist>0&&m15.hist>=m15.prevHist):(m15.macd<m15.signal&&m15.hist<0&&m15.hist<=m15.prevHist);
+  const m5Aligned=bullish?(m5.macd>m5.signal&&m5.hist>0&&m5.hist>=m5.prevHist):(m5.macd<m5.signal&&m5.hist<0&&m5.hist<=m5.prevHist);
+  const a15Aligned=bullish?(ar15.up>ar15.down+20):(ar15.down>ar15.up+20);
+  const impAligned=bullish?(imp.upRatio>=0.62&&imp.norm>0):(imp.downRatio>=0.62&&imp.norm<0);
   const b15=bars15.at(-1);
-  if(b15){
-    const d=Number(b15.c)-Number(b15.o);
-    if((bullish&&d>0)||(!bullish&&d<0)){microConfirm++;microScore+=0.7;microReasons.push("15s candle aligned");}
-  }
-  if(m5.ready){
-    const aligned=bullish?(m5.macd>m5.signal&&m5.hist>0):(m5.macd<m5.signal&&m5.hist<0);
-    if(aligned){microConfirm++;microScore+=1;microReasons.push("5s MACD aligned");}
-  }
-  if(imp.ready){
-    const aligned=bullish?(imp.upRatio>=0.58&&imp.norm>0):(imp.downRatio>=0.58&&imp.norm<0);
-    const strongOpp=bullish?(imp.downRatio>=0.68&&imp.norm<0):(imp.upRatio>=0.68&&imp.norm>0);
-    if(aligned){microConfirm++;microScore+=1.5;microReasons.push("live tick impulse aligned");}
-    if(strongOpp)hardOpposition=true;
-  }
+  const candleAligned=b15?((bullish&&Number(b15.c)>Number(b15.o))||(!bullish&&Number(b15.c)<Number(b15.o))):false;
 
-  if(hardOpposition){
-    return {ok:false,reason:"micro-entry momentum is actively opposing the 1m direction",
-      coreDirection:direction,callScore:call.score,putScore:put.score,bars15:bars15.length,bars5:bars5.length};
-  }
-  if(microConfirm<2||microScore<2){
-    return {ok:false,reason:`waiting for lower-timeframe entry confirmation (${microConfirm} confirmations)`,
+  if(!m15Aligned||!m5Aligned||!impAligned){
+    return {ok:false,reason:"mandatory 15s/5s/tick momentum alignment missing",
       coreDirection:direction,callScore:call.score,putScore:put.score,bars15:bars15.length,bars5:bars5.length};
   }
 
-  const quality=clamp(0.55+Math.min(win.score,10)/10*0.20+Math.min(microScore,5)/5*0.10+Math.min(edge,4)*0.015,0.55,0.92);
-  return {ok:true,direction,expirySeconds:EXPIRY_SECONDS,quality,callScore:call.score,putScore:put.score,edge,
-    coreMajor:win.major,microConfirmations:microConfirm,microScore,reasons:[...win.reasons,...microReasons],
-    bars5:bars5.length,bars15:bars15.length,bars1m:bars1m.length,lastPrice:last};
+  let microConfirm=3,microScore=4.2;
+  const microReasons=["15s MACD aligned","5s MACD aligned","live tick impulse aligned"];
+  if(a15Aligned){microConfirm++;microScore+=1;microReasons.push("15s Aroon aligned");}
+  if(candleAligned){microConfirm++;microScore+=0.8;microReasons.push("15s candle aligned");}
+
+  if(microConfirm<4||microScore<5){
+    return {ok:false,reason:"precision entry needs one more lower-timeframe confirmation",
+      coreDirection:direction,callScore:call.score,putScore:put.score,bars15:bars15.length,bars5:bars5.length};
+  }
+
+  const quality=clamp(0.72+Math.min(edge,6)*0.02+Math.min(microScore,6)*0.015+Math.min(regime.efficiency,0.8)*0.08,0.72,0.95);
+  return {
+    ok:true,direction,expirySeconds:EXPIRY_SECONDS,quality,
+    callScore:call.score,putScore:put.score,edge,coreMajor:win.major,
+    microConfirmations:microConfirm,microScore,regimeEfficiency:regime.efficiency,
+    spreadAtrRatio,atrRatio,reasons:[...win.reasons,"5m regime aligned",...microReasons],
+    bars5:bars5.length,bars15:bars15.length,bars1m:bars1m.length,lastPrice:last
+  };
 }
 
 export class TickHub extends DurableObject {
@@ -607,6 +676,8 @@ export class TickHub extends DurableObject {
 
   async analyze(symbol){
     symbol=normalizeSymbol(symbol); if(!symbol)return {ok:false,error:"invalid symbol"};
+    const pairWait=this.pairCooldownSeconds(symbol);
+    if(pairWait>0)return {ok:false,cooldown:true,retrySeconds:pairWait,symbol,reason:"pair precision cooldown"};
     await this.subscribe(symbol); await this.ensureSocket(); await this.refreshIfStale(symbol);
 
     let arr=this.ticks.get(symbol)||[];
@@ -617,9 +688,9 @@ export class TickHub extends DurableObject {
     const bars15=buildBars(arr,15).length;
 
     const bars5=buildBars(arr,5).length;
-    if(bars15<6||bars5<12){
+    if(bars15<8||bars5<18){
       return {ok:false,warming:true,symbol,ticks:arr.length,bars15,bars5,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
-        status:this.lastStatus,reason:`micro-feed warming: ${bars15}/6 x 15s bars, ${bars5}/12 x 5s bars ready`};
+        status:this.lastStatus,reason:`precision feed warming: ${bars15}/8 x 15s bars, ${bars5}/18 x 5s bars ready`};
     }
     if(receiveAge>8){
       return {ok:false,symbol,ticks:arr.length,bars15,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
@@ -646,6 +717,46 @@ export class TickHub extends DurableObject {
     if(!x.ok)return {...x,symbol,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status:this.lastStatus};
     return {...x,symbol,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
       status:this.lastStatus,reconnectCount:this.reconnectCount,generatedAt:Date.now()};
+  }
+
+  getRiskGate(){
+    const now=Date.now();
+    const pending=[...this.pendingSignals].sort((a,b)=>Number(b.entryAt)-Number(a.entryAt));
+    if(pending.length){
+      const latest=pending[0];
+      const retryMs=Math.max(1000,Number(latest.expiresAt||now)-now+30000);
+      return {ok:false,reason:"an existing signal is still being settled",retrySeconds:Math.ceil(retryMs/1000)};
+    }
+
+    const hist=[...this.signalHistory].sort((a,b)=>Number(b.settledAt||b.entryAt)-Number(a.settledAt||a.entryAt));
+    const latest=hist[0];
+    if(latest){
+      const sinceEntry=now-Number(latest.entryAt||0);
+      if(sinceEntry<GLOBAL_SIGNAL_COOLDOWN_MS){
+        return {ok:false,reason:"global precision cooldown",retrySeconds:Math.ceil((GLOBAL_SIGNAL_COOLDOWN_MS-sinceEntry)/1000)};
+      }
+    }
+
+    const resolved=hist.filter(x=>x.result==="WIN"||x.result==="LOSS");
+    if(resolved.length>=2&&resolved[0].result==="LOSS"&&resolved[1].result==="LOSS"){
+      const sinceLatest=now-Number(resolved[0].settledAt||resolved[0].entryAt||0);
+      if(sinceLatest<LOSS_CIRCUIT_BREAKER_MS){
+        return {ok:false,reason:"two-loss circuit breaker",retrySeconds:Math.ceil((LOSS_CIRCUIT_BREAKER_MS-sinceLatest)/1000)};
+      }
+    }
+
+    return {ok:true};
+  }
+
+  pairCooldownSeconds(symbol){
+    const now=Date.now();
+    const all=[...this.pendingSignals,...this.signalHistory]
+      .filter(x=>x.symbol===symbol)
+      .sort((a,b)=>Number(b.entryAt)-Number(a.entryAt));
+    const latest=all[0];
+    if(!latest)return 0;
+    const left=PAIR_SIGNAL_COOLDOWN_MS-(now-Number(latest.entryAt||0));
+    return left>0?Math.ceil(left/1000):0;
   }
 
   async trackSignal(req){
@@ -704,6 +815,7 @@ export class TickHub extends DurableObject {
     }
 
     if(u.pathname==="/signal")return json(await this.analyze(symbol));
+    if(u.pathname==="/risk")return json(this.getRiskGate());
     if(u.pathname==="/track"&&req.method==="POST")return json(await this.trackSignal(req));
     if(u.pathname==="/stats")return json(await this.getTrackingStats());
 
@@ -860,7 +972,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.5.3 Tiingo quota-smart six-pair scanner",{status:200});
+    if(request.method!=="POST")return new Response("V11.6 Tiingo precision-veto six-pair scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -871,7 +983,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V11.5.3 — use /signal only. The bot scans all 6 FX pairs, reuses live Tiingo data to conserve the free API quota, and automatically tracks issued signals for 60 seconds."
+        "V11.6 — PRECISION MODE. Use /signal only. The bot scans all 6 FX pairs but now requires 5m regime alignment, stronger 1m structure, mandatory 15s/5s/tick confirmation, spread/volatility filters, cooldowns, and a two-loss circuit breaker."
       );
       return new Response("ok");
     }
@@ -928,6 +1040,17 @@ export default {
     }
     const isUniverseScan=/^\/signal\s*$/i.test(text);
     if(isUniverseScan){
+      const risk=await hub(env,"/risk");
+      if(!risk.ok){
+        const mins=Math.max(1,Math.ceil(Number(risk.retrySeconds||60)/60));
+        await tgSend(
+          env,
+          chatId,
+          `🛡️ PRECISION MODE PAUSED\n${risk.reason}.\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.`
+        );
+        return new Response("ok");
+      }
+
       const scan=await scanSixPairUniverse(env);
       if(!scan.ok){
         if(scan.quotaExceeded){
