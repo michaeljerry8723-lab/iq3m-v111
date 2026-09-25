@@ -1,12 +1,12 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.7.1-adaptive-consensus";
+const VERSION = "11.8.0-five-minute-trend";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
-const EXPIRY_SECONDS = 60;
-const GLOBAL_SIGNAL_COOLDOWN_MS = 3*60*1000;
-const PAIR_SIGNAL_COOLDOWN_MS = 7*60*1000;
+const EXPIRY_SECONDS = 300;
+const GLOBAL_SIGNAL_COOLDOWN_MS = 6*60*1000;
+const PAIR_SIGNAL_COOLDOWN_MS = 10*60*1000;
 const LOSS_CIRCUIT_BREAKER_MS = 20*60*1000;
 
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
@@ -233,13 +233,14 @@ function candlePressure(bars,n=3){
   return {ready:true,bull,bear};
 }
 
-function score60s(ticks,bars1m){
-  const bars15=buildBars(ticks,15), bars5=buildBars(ticks,5);
-  if(bars15.length<6||bars5.length<12){
-    return {ok:false,reason:"micro-layer warming",bars15:bars15.length,bars5:bars5.length};
+function score5m(ticks,bars1m){
+  const bars15=buildBars(ticks,15);
+  if(bars15.length<6){
+    return {ok:false,reason:"entry timing layer warming",bars15:bars15.length};
   }
 
-  const sma1=smaTrendSnapshot(bars1m,2,5);
+  // 5-minute expiry: use a slower, more stable 1m trend core.
+  const sma1=smaTrendSnapshot(bars1m,5,13);
   const fr1=fractalSnapshot(bars1m,2);
   const m1=macdSnapshot(bars1m,5,13,4);
   const ar1=aroonSnapshot(bars1m,14);
@@ -250,7 +251,7 @@ function score60s(ticks,bars1m){
   const pressure=candlePressure(bars1m,3);
 
   if(!sma1.ready||!fr1.ready||!m1.ready||!ar1.ready||!atr1.ready||!rsi1.ready||!dmi.ready||!pressure.ready){
-    return {ok:false,reason:"1m context not ready",bars15:bars15.length,bars5:bars5.length};
+    return {ok:false,reason:"5-minute context not ready",bars15:bars15.length};
   }
 
   const last=Number(ticks.at(-1)?.p);
@@ -259,56 +260,50 @@ function score60s(ticks,bars1m){
   const spreadAtrRatio=Number.isFinite(spread)&&spread>=0&&atr1.atr>0?spread/atr1.atr:Infinity;
   const atrRatio=Number.isFinite(last)&&last>0?atr1.atr/last:0;
 
-  // Hard safety vetoes only.
-  if(!Number.isFinite(spreadAtrRatio)||spreadAtrRatio>0.18){
-    return {ok:false,reason:"spread too wide",spreadAtrRatio,bars15:bars15.length,bars5:bars5.length};
+  if(!Number.isFinite(spreadAtrRatio)||spreadAtrRatio>0.22){
+    return {ok:false,reason:"spread too wide for 5m entry",spreadAtrRatio,bars15:bars15.length};
   }
-  if(atrRatio<0.000009||atrRatio>0.0022){
-    return {ok:false,reason:"1m volatility outside usable range",atrRatio,bars15:bars15.length,bars5:bars5.length};
+  if(atrRatio<0.000007||atrRatio>0.0030){
+    return {ok:false,reason:"1m volatility outside 5m strategy range",atrRatio,bars15:bars15.length};
   }
 
   let direction="NEUTRAL";
-  if(sma1.fast>sma1.slow&&sma1.fastSlope>0)direction="CALL";
-  if(sma1.fast<sma1.slow&&sma1.fastSlope<0)direction="PUT";
+  if(sma1.fast>sma1.slow&&sma1.fastSlope>0) direction="CALL";
+  if(sma1.fast<sma1.slow&&sma1.fastSlope<0) direction="PUT";
   if(direction==="NEUTRAL"){
-    return {ok:false,reason:"SMA(2/5) direction is not clean",bars15:bars15.length,bars5:bars5.length};
+    return {ok:false,reason:"SMA(5/13) trend is not established",bars15:bars15.length};
   }
 
-  if((direction==="CALL"&&last<=sma1.fast)||(direction==="PUT"&&last>=sma1.fast)){
-    return {ok:false,reason:"live price lost SMA(2) alignment",coreDirection:direction,bars15:bars15.length,bars5:bars5.length};
-  }
-
+  // Structural invalidation stays hard.
   if(direction==="CALL"&&fr1.lastLow&&last<=fr1.lastLow.price){
-    return {ok:false,reason:"Fractal(2) support failed",coreDirection:direction,bars15:bars15.length,bars5:bars5.length};
+    return {ok:false,reason:"Fractal(2) support failed",coreDirection:direction,bars15:bars15.length};
   }
   if(direction==="PUT"&&fr1.lastHigh&&last>=fr1.lastHigh.price){
-    return {ok:false,reason:"Fractal(2) resistance failed",coreDirection:direction,bars15:bars15.length,bars5:bars5.length};
+    return {ok:false,reason:"Fractal(2) resistance failed",coreDirection:direction,bars15:bars15.length};
   }
 
-  if(regime?.ready&&regime.direction!=="NEUTRAL"&&regime.direction!==direction&&regime.efficiency>=0.50){
-    return {ok:false,reason:"strong 5m regime opposes setup",coreDirection:direction,
-      regimeDirection:regime.direction,regimeEfficiency:regime.efficiency,bars15:bars15.length,bars5:bars5.length};
+  // A strongly opposite 5m regime still vetoes the entry.
+  if(regime?.ready&&regime.direction!=="NEUTRAL"&&regime.direction!==direction&&regime.efficiency>=0.48){
+    return {ok:false,reason:"5m regime strongly opposes the setup",coreDirection:direction,
+      regimeDirection:regime.direction,regimeEfficiency:regime.efficiency,bars15:bars15.length};
   }
 
   const last1=bars1m.at(-1);
   if(last1&&atr1.atr>0){
     const extension=Math.abs(last-Number(last1.c))/atr1.atr;
-    if(extension>1.40){
-      return {ok:false,reason:"entry already overextended",extensionAtr:extension,coreDirection:direction,
-        bars15:bars15.length,bars5:bars5.length};
+    if(extension>1.8){
+      return {ok:false,reason:"entry is too extended",extensionAtr:extension,coreDirection:direction,bars15:bars15.length};
     }
   }
 
-  // Weighted 1m consensus. SMA(2/5) + Fractal(2) remain the primary structure;
-  // secondary indicators strengthen or weaken the setup instead of all being mandatory.
-  let score=3.0, confirms=1;
-  const reasons=[`SMA(2/5) ${direction==="CALL"?"bullish":"bearish"}`];
+  let score=3.2, confirms=1;
+  const reasons=[`1m SMA(5/13) ${direction==="CALL"?"bullish":"bearish"}`];
 
   if((direction==="CALL"&&sma1.slowSlope>=0)||(direction==="PUT"&&sma1.slowSlope<=0)){
-    score+=0.7;reasons.push("SMA(5) slope aligned");
+    score+=0.9;reasons.push("SMA(13) slope aligned");
   }
   if((direction==="CALL"&&sma1.crossedUp)||(direction==="PUT"&&sma1.crossedDown)){
-    score+=0.7;reasons.push("fresh SMA crossover");
+    score+=0.6;reasons.push("fresh SMA(5/13) crossover");
   }
 
   if(fr1.lastLow&&fr1.lastHigh){
@@ -318,102 +313,87 @@ function score60s(ticks,bars1m){
     if(supportive){score+=1.0;confirms++;reasons.push("Fractal(2) swing structure aligned");}
   }
   if(direction==="CALL"&&fr1.lastHigh&&last>fr1.lastHigh.price){
-    score+=0.7;reasons.push("Fractal(2) breakout");
+    score+=0.6;reasons.push("Fractal(2) breakout");
   }
   if(direction==="PUT"&&fr1.lastLow&&last<fr1.lastLow.price){
-    score+=0.7;reasons.push("Fractal(2) breakdown");
+    score+=0.6;reasons.push("Fractal(2) breakdown");
   }
 
   const macdAligned=direction==="CALL"
     ? (m1.macd>m1.signal&&m1.hist>0)
     : (m1.macd<m1.signal&&m1.hist<0);
-  if(macdAligned){score+=1.2;confirms++;reasons.push("1m MACD aligned");}
+  if(macdAligned){score+=1.3;confirms++;reasons.push("1m MACD aligned");}
 
   const aroonAligned=direction==="CALL"
-    ? (ar1.up>ar1.down+15)
-    : (ar1.down>ar1.up+15);
-  if(aroonAligned){score+=1.0;confirms++;reasons.push("1m Aroon aligned");}
+    ? (ar1.up>ar1.down+12)
+    : (ar1.down>ar1.up+12);
+  if(aroonAligned){score+=0.9;confirms++;reasons.push("1m Aroon aligned");}
 
   const dmiAligned=direction==="CALL"
-    ? dmi.plusDI>dmi.minusDI+3
-    : dmi.minusDI>dmi.plusDI+3;
-  if(dmiAligned&&dmi.adx>=17){
-    score+=1.1;confirms++;reasons.push("ADX/DMI aligned");
-  }else if(dmi.adx<12){
-    score-=0.5;
+    ? dmi.plusDI>dmi.minusDI+2
+    : dmi.minusDI>dmi.plusDI+2;
+  if(dmiAligned&&dmi.adx>=15){
+    score+=1.0;confirms++;reasons.push("ADX/DMI aligned");
   }
 
   const rsiAligned=direction==="CALL"
-    ? (rsi1.rsi>=50&&rsi1.rsi<=74)
-    : (rsi1.rsi<=50&&rsi1.rsi>=26);
-  if(rsiAligned){score+=0.8;confirms++;reasons.push("RSI(7) aligned");}
+    ? (rsi1.rsi>=49&&rsi1.rsi<=76)
+    : (rsi1.rsi<=51&&rsi1.rsi>=24);
+  if(rsiAligned){score+=0.7;confirms++;reasons.push("RSI(7) aligned");}
 
   const pressureAligned=direction==="CALL"?pressure.bull>=2:pressure.bear>=2;
-  if(pressureAligned){score+=0.8;confirms++;reasons.push("1m candle pressure aligned");}
+  if(pressureAligned){score+=0.7;confirms++;reasons.push("1m candle pressure aligned");}
 
   if(regime?.ready&&regime.direction===direction){
-    score+=0.8;reasons.push("5m regime aligned");
+    score+=1.0;reasons.push("5m regime aligned");
   }
 
-  if(score<6.2||confirms<3){
-    return {ok:false,reason:`1m consensus below threshold (score ${score.toFixed(1)}, confirmations ${confirms})`,
-      coreDirection:direction,score,confirms,bars15:bars15.length,bars5:bars5.length};
+  // Longer expiry permits more entry windows: core threshold stays selective,
+  // but we no longer require perfect 5s/15s synchronization.
+  if(score<6.0||confirms<3){
+    return {ok:false,reason:`5m consensus below threshold (score ${score.toFixed(1)}, confirmations ${confirms})`,
+      coreDirection:direction,score,confirms,bars15:bars15.length};
   }
 
   const m15=macdSnapshot(bars15,3,8,3);
-  const m5=macdSnapshot(bars5,3,8,3);
-  const ar15=aroonSnapshot(bars15,7);
   const imp=tickImpulse(ticks);
-  if(!m15.ready||!m5.ready||!imp.ready){
-    return {ok:false,reason:"lower-timeframe confirmation not ready",bars15:bars15.length,bars5:bars5.length};
+  if(!m15.ready||!imp.ready){
+    return {ok:false,reason:"entry timing confirmation not ready",bars15:bars15.length};
   }
 
   const bullish=direction==="CALL";
   const m15Aligned=bullish?(m15.macd>m15.signal&&m15.hist>0):(m15.macd<m15.signal&&m15.hist<0);
-  const m5Aligned=bullish?(m5.macd>m5.signal&&m5.hist>0):(m5.macd<m5.signal&&m5.hist<0);
-  const impAligned=imp.ready&&(bullish?(imp.upRatio>=0.56&&imp.norm>0):(imp.downRatio>=0.56&&imp.norm<0));
-  const strongOppImpulse=imp.ready&&(bullish?(imp.downRatio>=0.70&&imp.norm<0):(imp.upRatio>=0.70&&imp.norm>0));
-  const a15Aligned=ar15.ready&&(bullish?(ar15.up>ar15.down+15):(ar15.down>ar15.up+15));
+  const impAligned=imp.ready&&(bullish?(imp.upRatio>=0.54&&imp.norm>0):(imp.downRatio>=0.54&&imp.norm<0));
+  const strongOppImpulse=imp.ready&&(bullish?(imp.downRatio>=0.72&&imp.norm<0):(imp.upRatio>=0.72&&imp.norm>0));
   const b15=bars15.at(-1);
   const candleAligned=b15?((bullish&&Number(b15.c)>Number(b15.o))||(!bullish&&Number(b15.c)<Number(b15.o))):false;
 
   if(strongOppImpulse){
-    return {ok:false,reason:"live tick impulse strongly opposes entry",coreDirection:direction,
-      bars15:bars15.length,bars5:bars5.length};
+    return {ok:false,reason:"live tick impulse strongly opposes entry",coreDirection:direction,bars15:bars15.length};
   }
 
-  const micro=[
-    ["15s MACD",m15Aligned,1.3],
-    ["5s MACD",m5Aligned,1.4],
-    ["live tick impulse",impAligned,1.5],
-    ["15s Aroon",a15Aligned,0.8],
-    ["15s candle",candleAligned,0.6]
-  ];
-  const aligned=micro.filter(x=>x[1]);
-  const microScore=aligned.reduce((a,x)=>a+x[2],0);
-  const microConfirmations=aligned.length;
-
-  // Require two timing confirmations, with at least one very fast input.
-  if(microConfirmations<2||microScore<2.4||(!m5Aligned&&!impAligned)){
-    return {ok:false,reason:"waiting for lower-timeframe alignment",coreDirection:direction,
-      microConfirmations,microScore,bars15:bars15.length,bars5:bars5.length};
+  // For a 5m expiry, only one short-term timing confirmation is required.
+  const timingCount=[m15Aligned,impAligned,candleAligned].filter(Boolean).length;
+  if(timingCount<1){
+    return {ok:false,reason:"waiting for a clean entry moment",coreDirection:direction,bars15:bars15.length};
   }
 
+  const timingScore=(m15Aligned?1.2:0)+(impAligned?1.2:0)+(candleAligned?0.6:0);
   const quality=clamp(
-    0.66 + Math.min(score-6.2,3.5)*0.035 + Math.min(microScore,5)*0.025 +
-    (regime?.ready&&regime.direction===direction?0.025:0),
-    0.66,0.92
+    0.65 + Math.min(score-6.0,4)*0.035 + Math.min(timingScore,3)*0.025 +
+    (regime?.ready&&regime.direction===direction?0.03:0),
+    0.65,0.92
   );
 
   return {
     ok:true,direction,expirySeconds:EXPIRY_SECONDS,quality,
     callScore:direction==="CALL"?score:0,putScore:direction==="PUT"?score:0,
-    edge:score,coreMajor:confirms,microConfirmations,microScore,
+    edge:score,coreMajor:confirms,microConfirmations:timingCount,microScore:timingScore,
     regimeEfficiency:regime?.efficiency??null,spreadAtrRatio,atrRatio,rsi:rsi1.rsi,adx:dmi.adx,
-    smaFastPeriod:2,smaSlowPeriod:5,fractalPeriod:2,timeframe:"1min",
+    smaFastPeriod:5,smaSlowPeriod:13,fractalPeriod:2,timeframe:"1min",expiryMinutes:5,
     smaFast:sma1.fast,smaSlow:sma1.slow,
-    reasons:[...reasons,...aligned.map(x=>x[0]+" aligned")],
-    bars5:bars5.length,bars15:bars15.length,bars1m:bars1m.length,lastPrice:last
+    reasons:[...reasons,m15Aligned?"15s MACD aligned":null,impAligned?"live tick impulse aligned":null,candleAligned?"15s candle aligned":null].filter(Boolean),
+    bars15:bars15.length,bars1m:bars1m.length,lastPrice:last
   };
 }
 
@@ -498,7 +478,7 @@ export class TickHub extends DurableObject {
         this.signalStats.voids++;
         await this.sendTrackedResult(
           sig.chatId,
-          `RESULT — ${sig.symbol}\n${sig.direction==="CALL"?"⬆️ CALL":"⬇️ PUT"} • 1 minute\n⚪ VOID — no fresh Tiingo tick was available at expiry`
+          `RESULT — ${sig.symbol}\n${sig.direction==="CALL"?"⬆️ CALL":"⬇️ PUT"} • 5 minutes\n⚪ VOID — no fresh Tiingo tick was available at expiry`
         );
         continue;
       }
@@ -521,7 +501,7 @@ export class TickHub extends DurableObject {
       const mark=result==="WIN"?"✅":result==="LOSS"?"❌":"➖";
       await this.sendTrackedResult(
         sig.chatId,
-        `RESULT — ${sig.symbol}\n${sig.direction==="CALL"?"⬆️ CALL":"⬇️ PUT"} • 1 minute\nENTRY: ${formatFxPrice(sig.symbol,entry)}\nEXIT: ${formatFxPrice(sig.symbol,exit)}\n${mark} ${result}\nTRACKING: Tiingo feed`
+        `RESULT — ${sig.symbol}\n${sig.direction==="CALL"?"⬆️ CALL":"⬇️ PUT"} • 5 minutes\nENTRY: ${formatFxPrice(sig.symbol,entry)}\nEXIT: ${formatFxPrice(sig.symbol,exit)}\n${mark} ${result}\nTRACKING: Tiingo feed`
       );
     }
 
@@ -812,9 +792,9 @@ export class TickHub extends DurableObject {
     const bars15=buildBars(arr,15).length;
 
     const bars5=buildBars(arr,5).length;
-    if(bars15<6||bars5<12){
+    if(bars15<6){
       return {ok:false,warming:true,symbol,ticks:arr.length,bars15,bars5,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
-        status:this.lastStatus,reason:`feed warming: ${bars15}/6 x 15s bars, ${bars5}/12 x 5s bars ready`};
+        status:this.lastStatus,reason:`feed warming: ${bars15}/6 x 15s bars ready`};
     }
     if(receiveAge>8){
       return {ok:false,symbol,ticks:arr.length,bars15,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
@@ -837,7 +817,7 @@ export class TickHub extends DurableObject {
         status:this.lastStatus,reason:`1m context unavailable: ${String(e?.message||e)}`};
     }
 
-    const x=score60s(arr,bars1m);
+    const x=score5m(arr,bars1m);
     if(!x.ok)return {...x,symbol,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status:this.lastStatus};
     return {...x,symbol,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
       status:this.lastStatus,reconnectCount:this.reconnectCount,generatedAt:Date.now()};
@@ -1117,7 +1097,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.7.1 adaptive-consensus six-pair scanner",{status:200});
+    if(request.method!=="POST")return new Response("V11.8 five-minute trend six-pair scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -1128,7 +1108,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V11.7.1 — ADAPTIVE CONSENSUS. Core remains 1m SMA(2), SMA(5), Fractal(2). Secondary indicators now use weighted confirmation instead of an all-or-nothing gate, while spread, fractal failure, strong opposite 5m regime, overextension and strong opposite live ticks remain hard vetoes."
+        "V11.8 — 5-MINUTE TREND MODE. /signal scans all 6 pairs using 1m SMA(5), SMA(13), Fractal(2), MACD(5,13,4), Aroon(14), RSI(7), ADX/DMI(7) and a 5m regime layer. Short-term 15s/live-tick inputs are used mainly for entry timing rather than blocking every otherwise-valid setup."
       );
       return new Response("ok");
     }
@@ -1190,7 +1170,7 @@ export default {
         `PROVIDER TICK AGE: ${st.providerTickAgeSeconds??"n/a"}s\n`+
         `WS MESSAGE AGE: ${st.lastWsMessageAgeSeconds??"n/a"}s\n`+
         `RECONNECTS: ${st.reconnectCount||0}\n`+
-        `EXPIRY: 60s\n`+
+        `EXPIRY: 300s\n`+
         `STATUS: ${st.status||"n/a"}\n`+
         `SUBSCRIBE: ${st.subscribeStatus?.response?.message||st.subscribeStatus?.status||"n/a"}`
       );
@@ -1246,9 +1226,9 @@ export default {
       const compact=String(env.BOT_COMPACT_MODE??"1")!=="0";
 
       if(compact){
-        await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 1 minute\nTRACKING: ON`);
+        await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 5 minutes\nTRACKING: ON`);
       }else{
-        await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 1 minute\nSETUP QUALITY: ${(Number(result.quality)*100).toFixed(1)}%\nCALL SCORE: ${Number(result.callScore).toFixed(1)}\nPUT SCORE: ${Number(result.putScore).toFixed(1)}\nMICRO CONFIRMATIONS: ${result.microConfirmations}\nTRACKING: ON`);
+        await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 5 minutes\nSETUP QUALITY: ${(Number(result.quality)*100).toFixed(1)}%\nCALL SCORE: ${Number(result.callScore).toFixed(1)}\nPUT SCORE: ${Number(result.putScore).toFixed(1)}\nMICRO CONFIRMATIONS: ${result.microConfirmations}\nTRACKING: ON`);
       }
 
       await hubPost(env,"/track",{
@@ -1263,7 +1243,7 @@ export default {
     }
 
     if(/^\/signal\b/i.test(text)){
-      await tgSend(env,chatId,"Use /signal by itself. The bot now scans all 6 pairs automatically and returns the strongest qualified setup.");
+      await tgSend(env,chatId,"Use /signal by itself. The bot scans all 6 pairs automatically and returns the strongest qualified 5-minute setup.");
       return new Response("ok");
     }
 
