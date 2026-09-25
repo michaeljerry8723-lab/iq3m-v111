@@ -1266,24 +1266,35 @@ export default {
         return new Response("ok");
       }
 
-      const result=scan.best, symbol=result.symbol;
-      const arrow=result.direction==="CALL"?"⬆️":"⬇️";
-      const compact=String(env.BOT_COMPACT_MODE??"1")!=="0";
-
-      if(compact){
-        await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 5 minutes\nTRACKING: ON`);
-      }else{
-        await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 5 minutes\nSETUP QUALITY: ${(Number(result.quality)*100).toFixed(1)}%\nCALL SCORE: ${Number(result.callScore).toFixed(1)}\nPUT SCORE: ${Number(result.putScore).toFixed(1)}\nMICRO CONFIRMATIONS: ${result.microConfirmations}\nTRACKING: ON`);
+      const candidate=scan.best, symbol=candidate.symbol;
+      const result=await hub(env,`/signal?symbol=${encodeURIComponent(symbol)}`);
+      if(!result.ok||result.direction!==candidate.direction){
+        await tgSend(
+          env,
+          chatId,
+          "⏳ SETUP CHANGED DURING FINAL CHECK\nThe best candidate no longer meets the 5-minute entry rules. Run /signal again."
+        );
+        return new Response("ok");
       }
 
-      await hubPost(env,"/track",{
-        sourceUpdateId:update.update_id,
-        chatId,
-        symbol,
-        direction:result.direction,
-        entryPrice:result.lastPrice,
-        entryAt:result.generatedAt||Date.now()
-      });
+      const arrow=result.direction==="CALL"?"⬆️":"⬇️";
+      const compact=String(env.BOT_COMPACT_MODE??"1")!=="0";
+      const sent=compact
+        ? await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 5 minutes\nTRACKING: ON`)
+        : await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 5 minutes\nSETUP QUALITY: ${(Number(result.quality)*100).toFixed(1)}%\nCALL SCORE: ${Number(result.callScore).toFixed(1)}\nPUT SCORE: ${Number(result.putScore).toFixed(1)}\nENTRY CONFIRMATIONS: ${result.microConfirmations}\nTRACKING: ON`);
+
+      const quote=await hub(env,`/quote?symbol=${encodeURIComponent(symbol)}`);
+      if(quote.ok&&Number.isFinite(Number(quote.price))){
+        await hubPost(env,"/track",{
+          sourceUpdateId:update.update_id,
+          chatId,
+          symbol,
+          direction:result.direction,
+          entryPrice:Number(quote.price),
+          entryAt:Date.now(),
+          telegramMessageDate:sent?.date||null
+        });
+      }
       return new Response("ok");
     }
 
