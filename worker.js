@@ -1586,7 +1586,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V12.0.3 continuation-consensus A-grade scanner",{status:200});
+    if(request.method!=="POST")return new Response("V12.1 stateful A-grade scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -1598,7 +1598,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V12.0.3 — CONTINUATION CONSENSUS MODE. The completed 5m trend drives direction. Entry timing now uses weighted 1m continuation consensus instead of allowing one lagging SMA condition to block all eight symbols. Strong opposite 15m trend, structural failure, weak trend strength, overextension, poor room-to-move and strong live reversal remain hard vetoes."
+        "V12.1 — STATEFUL ENTRY MODE. The bot now tracks each symbol through a real sequence: completed 5m trend → armed → pullback into the SMA zone → fresh 1m continuation → final A-grade validation. Repeated /signal calls cannot advance the sequence inside the same candle. Same-direction USD exposure is also locked while an existing correlated signal is active."
       );
       return new Response("ok");
     }
