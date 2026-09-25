@@ -349,6 +349,7 @@ function setupSequenceSnapshot(bars1m){
   const zoneHigh=Math.max(sma.fast,sma.slow)+0.30*atr.atr;
   const recent=bars1m.slice(-4);
   const pullbackSeen=recent.some(b=>Number(b.l)<=zoneHigh&&Number(b.h)>=zoneLow);
+  const pullbackBeforeLast=bars1m.slice(-4,-1).some(b=>Number(b.l)<=zoneHigh&&Number(b.h)>=zoneLow);
 
   const last2=bars1m.slice(-2);
   const resumed=last2.some(b=>direction==="CALL"
@@ -356,7 +357,7 @@ function setupSequenceSnapshot(bars1m){
     : Number(b.c)<Number(b.o)&&Number(b.c)<sma.fast);
 
   return {
-    ready:true,direction,barT:Number(lastBar.t),structureOk,pullbackSeen,resumed,
+    ready:true,direction,barT:Number(lastBar.t),structureOk,pullbackSeen,pullbackBeforeLast,resumed,
     smaFast:sma.fast,smaSlow:sma.slow,atr:atr.atr,regimeEfficiency:reg5.efficiency
   };
 }
@@ -1074,6 +1075,10 @@ export class TickHub extends DurableObject {
     let next={...st,lastBarT:snap.barT,updatedAt:now};
     if(st.stage==="SEEK"){
       next={stage:"ARMED",direction:snap.direction,lastBarT:snap.barT,updatedAt:now};
+    }else if(st.stage==="ARMED"&&snap.pullbackBeforeLast&&snap.resumed){
+      // The pullback occurred on an earlier completed candle and the newest candle
+      // has already resumed. That is a valid sequence, so do not wait an extra minute.
+      next={stage:"READY",direction:snap.direction,lastBarT:snap.barT,readyBarT:snap.barT,updatedAt:now};
     }else if(st.stage==="ARMED"&&snap.pullbackSeen){
       next={stage:"PULLBACK",direction:snap.direction,lastBarT:snap.barT,updatedAt:now};
     }else if(st.stage==="PULLBACK"&&snap.resumed){
