@@ -1106,14 +1106,20 @@ export class TickHub extends DurableObject {
 
     if(u.pathname==="/reconnect"){
       await this.forceReconnect("requested");
-      return json({ok:true,version:VERSION,status:this.lastStatus,reconnectCount:this.reconnectCount});
+      await this.forceCryptoReconnect("requested");
+      return json({
+        ok:true,version:VERSION,
+        fxStatus:this.lastStatus,cryptoStatus:this.lastCryptoStatus,
+        reconnectCount:this.reconnectCount
+      });
     }
 
     if(u.pathname==="/signal")return json(await this.analyze(symbol));
     if(u.pathname==="/quote"){
       if(!symbol)return json({ok:false,error:"invalid symbol"},400);
       await this.subscribe(symbol);
-      await this.ensureSocket();
+      if(isCryptoSymbol(symbol)) await this.ensureCryptoSocket();
+      else await this.ensureSocket();
       const arr=this.ticks.get(symbol)||[];
       const q=arr.at(-1);
       if(!q)return json({ok:false,symbol,error:"no live quote"});
@@ -1137,28 +1143,37 @@ export class TickHub extends DurableObject {
 
     if(u.pathname==="/status"){
       if(symbol) await this.subscribe(symbol);
+      const crypto=isCryptoSymbol(symbol);
 
-      // Status calls also heal a stale socket, but do not wait long enough to hide the diagnosis.
-      if(symbol && Number.isFinite(this.latestReceivedAge(symbol)) && this.latestReceivedAge(symbol)>30) {
-        try{ await this.forceReconnect(`status detected stale ${symbol}`); }catch(_){}
-      } else {
-        await this.ensureSocket();
+      if(symbol&&Number.isFinite(this.latestReceivedAge(symbol))&&this.latestReceivedAge(symbol)>30){
+        try{
+          if(crypto) await this.forceCryptoReconnect(`status detected stale ${symbol}`);
+          else await this.forceReconnect(`status detected stale ${symbol}`);
+        }catch(_){}
+      }else{
+        if(crypto) await this.ensureCryptoSocket();
+        else await this.ensureSocket();
       }
 
       const arr=symbol?(this.ticks.get(symbol)||[]):[];
-      const lastMessageAge=this.lastWsMessageAt?Math.max(0,(Date.now()-this.lastWsMessageAt)/1000):null;
+      const connected=crypto
+        ? Boolean(this.cryptoWs&&this.cryptoWs.readyState===1)
+        : Boolean(this.ws&&this.ws.readyState===1);
+      const status=crypto?this.lastCryptoStatus:this.lastStatus;
+      const subscribeStatus=crypto?this.lastCryptoSubscribeStatus:this.lastSubscribeStatus;
+      const lastMessageAt=crypto?this.lastCryptoWsMessageAt:this.lastWsMessageAt;
+      const lastMessageAge=lastMessageAt?Math.max(0,(Date.now()-lastMessageAt)/1000):null;
 
       return json({
         version:VERSION,
-        provider:this.provider,
-        status:this.lastStatus,
-        subscribeStatus:this.lastSubscribeStatus,
-        connected:Boolean(this.ws&&this.ws.readyState===1),
+        provider:crypto?"tiingo-crypto":"tiingo-fx",
+        status,
+        subscribeStatus,
+        connected,
         symbols:[...this.symbols],
         symbol,
         ticks:arr.length,
-        bars5:buildBars(arr,5).length,
-        bars15:buildBars(arr,15).length,
+        bars60:buildBars(arr,60).length,
         lastTickAgeSeconds:arr.length?this.latestReceivedAge(symbol):null,
         providerTickAgeSeconds:arr.length?this.latestMarketAge(symbol):null,
         lastWsMessageAgeSeconds:lastMessageAge,
