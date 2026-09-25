@@ -595,28 +595,21 @@ export class TickHub extends DurableObject {
         this.lastWsMessageAt=Date.now();
         this.lastStatus="connected";
 
-        const tickers=[...this.symbols].map(toTiingoSymbol).filter(Boolean);
+        const tickers=[...this.symbols].filter(x=>!isCryptoSymbol(x)).map(toTiingoSymbol).filter(Boolean);
         ws.send(JSON.stringify({
           eventName:"subscribe",
           authorization:key,
-          eventData:{
-            thresholdLevel:5,
-            tickers
-          }
+          eventData:{thresholdLevel:5,tickers}
         }));
       });
 
       ws.addEventListener("message",ev=>this.onMessage(ev));
-
       ws.addEventListener("close",()=>{
         if(this.ws===ws)this.ws=null;
         this.connecting=false;
         this.lastStatus="closed";
       });
-
-      ws.addEventListener("error",()=>{
-        this.lastStatus="tiingo websocket error";
-      });
+      ws.addEventListener("error",()=>{this.lastStatus="tiingo fx websocket error";});
     }catch(e){
       this.connecting=false;
       this.ws=null;
@@ -624,11 +617,62 @@ export class TickHub extends DurableObject {
     }
   }
 
+  async ensureCryptoSocket(force=false){
+    const wantsCrypto=[...this.symbols].some(isCryptoSymbol);
+    if(!wantsCrypto)return;
+    if(!force && this.cryptoWs&&this.cryptoWs.readyState===1)return;
+    if(this.cryptoConnecting)return;
+
+    const key=String(this.env.TIINGO_API_TOKEN||"").trim();
+    if(!key){this.lastCryptoStatus="missing TIINGO_API_TOKEN";return;}
+
+    this.cryptoConnecting=true;
+    try{
+      const ws=new WebSocket("wss://api.tiingo.com/crypto");
+      this.cryptoWs=ws;
+
+      ws.addEventListener("open",()=>{
+        this.cryptoConnecting=false;
+        this.lastCryptoWsMessageAt=Date.now();
+        this.lastCryptoStatus="connected";
+        const tickers=[...this.symbols].filter(isCryptoSymbol).map(toTiingoSymbol).filter(Boolean);
+        ws.send(JSON.stringify({
+          eventName:"subscribe",
+          authorization:key,
+          eventData:{thresholdLevel:5,tickers}
+        }));
+      });
+
+      ws.addEventListener("message",ev=>this.onCryptoMessage(ev));
+      ws.addEventListener("close",()=>{
+        if(this.cryptoWs===ws)this.cryptoWs=null;
+        this.cryptoConnecting=false;
+        this.lastCryptoStatus="closed";
+      });
+      ws.addEventListener("error",()=>{this.lastCryptoStatus="tiingo crypto websocket error";});
+    }catch(e){
+      this.cryptoConnecting=false;
+      this.cryptoWs=null;
+      this.lastCryptoStatus=String(e?.message||e);
+    }
+  }
+
+  pushTick(symbol,t,p,bid=null,ask=null){
+    const r=Date.now();
+    if(!symbol||!Number.isFinite(p)||!Number.isFinite(t)||!this.symbols.has(symbol))return;
+    this.lastPriceReceivedAt=r;
+    const arr=this.ticks.get(symbol)||[];
+    arr.push({t,p,r,bid:Number.isFinite(bid)?bid:null,ask:Number.isFinite(ask)?ask:null});
+    const cutoff=Date.now()-45*60*1000;
+    while(arr.length&&Number(arr[0].r||arr[0].t)<cutoff)arr.shift();
+    if(arr.length>20000)arr.splice(0,arr.length-20000);
+    this.ticks.set(symbol,arr);
+  }
+
   onMessage(ev){
     this.lastWsMessageAt=Date.now();
     try{
       const x=JSON.parse(String(ev.data||"{}"));
-
       if(x.messageType==="I"){
         this.lastSubscribeStatus=x;
         this.lastStatus=x?.response?.message||"subscribed";
@@ -640,51 +684,59 @@ export class TickHub extends DurableObject {
       }
       if(x.messageType==="E"){
         this.lastSubscribeStatus=x;
-        this.lastStatus=`tiingo error: ${x?.response?.message||"subscription error"}`;
+        this.lastStatus=`tiingo fx error: ${x?.response?.message||"subscription error"}`;
         return;
       }
       if(x.messageType!=="A"||x.service!=="fx"||!Array.isArray(x.data))return;
-
       const d=x.data;
       if(d[0]!=="Q")return;
-
       const symbol=fromTiingoSymbol(d[1]);
       const t=Date.parse(String(d[2]||""));
       const bid=Number(d[4]), mid=Number(d[5]), ask=Number(d[7]);
       const p=Number.isFinite(mid)?mid:(Number.isFinite(bid)&&Number.isFinite(ask)?(bid+ask)/2:NaN);
-      const r=Date.now();
-
-      if(!symbol||!Number.isFinite(p)||!Number.isFinite(t))return;
-      if(!this.symbols.has(symbol))return;
-
-      this.lastPriceReceivedAt=r;
+      if(!Number.isFinite(p)||!Number.isFinite(t))return;
       this.lastStatus="ok";
-      const arr=this.ticks.get(symbol)||[];
-      arr.push({t,p,r,bid:Number.isFinite(bid)?bid:null,ask:Number.isFinite(ask)?ask:null});
-
-      const cutoff=Date.now()-45*60*1000;
-      while(arr.length&&Number(arr[0].r||arr[0].t)<cutoff)arr.shift();
-      if(arr.length>20000)arr.splice(0,arr.length-20000);
-      this.ticks.set(symbol,arr);
+      this.pushTick(symbol,t,p,bid,ask);
     }catch(e){
-      this.lastStatus=`tiingo parse error: ${String(e?.message||e)}`;
+      this.lastStatus=`tiingo fx parse error: ${String(e?.message||e)}`;
     }
   }
 
-  async subscribe(symbol){
-    symbol=normalizeSymbol(symbol);
-    if(!symbol)return false;
-    if(!FIXED_UNIVERSE.includes(symbol))return false;
-
-    if(!this.symbols.has(symbol)){
-      this.symbols.add(symbol);
-      await this.ctx.storage.put("symbols",[...this.symbols]);
-      // Tiingo subscriptions are established from the complete ticker set at connect time.
-      await this.forceReconnect("ticker universe changed");
-    }else{
-      await this.ensureSocket();
+  onCryptoMessage(ev){
+    this.lastCryptoWsMessageAt=Date.now();
+    try{
+      const x=JSON.parse(String(ev.data||"{}"));
+      if(x.messageType==="I"){
+        this.lastCryptoSubscribeStatus=x;
+        this.lastCryptoStatus=x?.response?.message||"subscribed";
+        return;
+      }
+      if(x.messageType==="H"){
+        if(this.lastCryptoStatus==="closed"||this.lastCryptoStatus.startsWith("reconnecting"))this.lastCryptoStatus="connected";
+        return;
+      }
+      if(x.messageType==="E"){
+        this.lastCryptoSubscribeStatus=x;
+        this.lastCryptoStatus=`tiingo crypto error: ${x?.response?.message||"subscription error"}`;
+        return;
+      }
+      if(x.messageType!=="A"||x.service!=="crypto_data"||!Array.isArray(x.data))return;
+      const d=x.data;
+      const symbol=fromTiingoSymbol(d[1]);
+      const t=Date.parse(String(d[2]||""));
+      let p=NaN,bid=null,ask=null;
+      if(d[0]==="T"){
+        p=Number(d[5]);
+      }else if(d[0]==="Q"){
+        bid=Number(d[5]); const mid=Number(d[6]); ask=Number(d[8]);
+        p=Number.isFinite(mid)?mid:(Number.isFinite(bid)&&Number.isFinite(ask)?(bid+ask)/2:NaN);
+      }else return;
+      if(!Number.isFinite(p)||!Number.isFinite(t))return;
+      this.lastCryptoStatus="ok";
+      this.pushTick(symbol,t,p,bid,ask);
+    }catch(e){
+      this.lastCryptoStatus=`tiingo crypto parse error: ${String(e?.message||e)}`;
     }
-    return true;
   }
 
   async refreshIfStale(symbol){
