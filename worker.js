@@ -242,186 +242,190 @@ function candlePressure(bars,n=3){
   return {ready:true,bull,bear};
 }
 
-function score5m(ticks,bars1m){
-  const bars15=buildBars(ticks,15);
+function completedAggregate(bars1m,seconds){
+  const nowBucket=Math.floor(Date.now()/(seconds*1000))*(seconds*1000);
+  return aggregateOhlcBars(bars1m,seconds).filter(b=>Number(b.t)<nowBucket);
+}
+function trendRegime(bars,fast=5,slow=13,minEfficiency=0.25){
+  if(!bars||bars.length<slow+3)return {ready:false,direction:"NEUTRAL",efficiency:0};
+  const c=bars.map(b=>Number(b.c)), sf=smaSeries(c,fast), ss=smaSeries(c,slow), i=c.length-1;
+  if(![sf[i],sf[i-1],ss[i],ss[i-1]].every(Number.isFinite))return {ready:false,direction:"NEUTRAL",efficiency:0};
+  const eff=efficiencyRatio(bars,Math.min(8,bars.length-1));
+  let direction="NEUTRAL";
+  if(sf[i]>ss[i]&&sf[i]>=sf[i-1]&&eff>=minEfficiency)direction="CALL";
+  if(sf[i]<ss[i]&&sf[i]<=sf[i-1]&&eff>=minEfficiency)direction="PUT";
+  return {ready:true,direction,efficiency:eff,fast:sf[i],slow:ss[i]};
+}
+function roomToMoveSnapshot(bars1m,last,direction,atr){
+  const b15=completedAggregate(bars1m,900).slice(-24);
+  if(b15.length<6||!Number.isFinite(atr)||atr<=0)return {ready:false,roomAtr:0};
+  if(direction==="CALL"){
+    const levels=b15.map(b=>Number(b.h)).filter(x=>Number.isFinite(x)&&x>last);
+    if(!levels.length)return {ready:true,roomAtr:Infinity,level:null};
+    const level=Math.min(...levels);
+    return {ready:true,roomAtr:(level-last)/atr,level};
+  }
+  const levels=b15.map(b=>Number(b.l)).filter(x=>Number.isFinite(x)&&x<last);
+  if(!levels.length)return {ready:true,roomAtr:Infinity,level:null};
+  const level=Math.max(...levels);
+  return {ready:true,roomAtr:(last-level)/atr,level};
+}
 
+function score5m(ticks,bars1m){
   const sma1=smaTrendSnapshot(bars1m,5,13);
   const fr1=fractalSnapshot(bars1m,2);
   const m1=macdSnapshot(bars1m,5,13,4);
   const ar1=aroonSnapshot(bars1m,14);
   const atr1=atrSnapshot(bars1m,14);
-  const regime=regime5mSnapshot(bars1m);
   const rsi1=rsiSnapshot(bars1m,7);
   const dmi=dmiAdxSnapshot(bars1m,7);
   const pressure=candlePressure(bars1m,3);
+  const b5=completedAggregate(bars1m,300);
+  const b15=completedAggregate(bars1m,900);
+  const regime5=trendRegime(b5,5,13,0.24);
+  const regime15=trendRegime(b15,3,8,0.20);
 
-  if(!sma1.ready||!fr1.ready||!m1.ready||!ar1.ready||!atr1.ready||!rsi1.ready||!dmi.ready||!pressure.ready){
-    return {ok:false,reason:"5-minute context not ready",bars15:bars15.length};
+  if(!sma1.ready||!fr1.ready||!m1.ready||!ar1.ready||!atr1.ready||!rsi1.ready||!dmi.ready||!pressure.ready||!regime5.ready||!regime15.ready){
+    return {ok:false,grade:"NO TRADE",reason:"multi-timeframe A-grade context not ready"};
   }
 
   const last=Number(ticks.at(-1)?.p);
-  const lastTick=ticks.at(-1)||{};
-  const spread=Number(lastTick.ask)-Number(lastTick.bid);
-  const spreadAtrRatio=Number.isFinite(spread)&&spread>=0&&atr1.atr>0?spread/atr1.atr:Infinity;
-  const atrRatio=Number.isFinite(last)&&last>0?atr1.atr/last:0;
+  if(!Number.isFinite(last))return {ok:false,grade:"NO TRADE",reason:"no valid live price"};
 
-  if(!Number.isFinite(spreadAtrRatio)||spreadAtrRatio>0.20){
-    return {ok:false,reason:"spread too wide",spreadAtrRatio,bars15:bars15.length};
+  const spreadTick=[...ticks].reverse().find(x=>Number.isFinite(Number(x.bid))&&Number.isFinite(Number(x.ask)));
+  const spread=spreadTick?Number(spreadTick.ask)-Number(spreadTick.bid):NaN;
+  const spreadAtrRatio=Number.isFinite(spread)&&spread>=0&&atr1.atr>0?spread/atr1.atr:null;
+  const atrRatio=last>0?atr1.atr/last:0;
+
+  if(Number.isFinite(spreadAtrRatio)&&spreadAtrRatio>0.20){
+    return {ok:false,grade:"NO TRADE",reason:"spread is too wide",spreadAtrRatio};
   }
-  if(atrRatio<0.000007||atrRatio>0.0028){
-    return {ok:false,reason:"volatility outside strategy range",atrRatio,bars15:bars15.length};
+  if(atrRatio<0.000006||atrRatio>0.0040){
+    return {ok:false,grade:"NO TRADE",reason:"volatility is outside the A-grade range",atrRatio};
   }
 
   let direction="NEUTRAL";
   if(sma1.fast>sma1.slow&&sma1.fastSlope>0)direction="CALL";
   if(sma1.fast<sma1.slow&&sma1.fastSlope<0)direction="PUT";
-  if(direction==="NEUTRAL"){
-    return {ok:false,reason:"SMA(5/13) trend is not clean",bars15:bars15.length};
+  if(direction==="NEUTRAL")return {ok:false,grade:"NO TRADE",reason:"1m SMA(5/13) trend is unclear"};
+
+  // A-grade requires both completed higher timeframes to agree with the 1m entry direction.
+  if(regime5.direction!==direction){
+    return {ok:false,grade:"NO TRADE",reason:"completed 5m trend is not aligned",coreDirection:direction,regime5:regime5.direction};
+  }
+  if(regime15.direction!==direction){
+    return {ok:false,grade:"NO TRADE",reason:"completed 15m trend is not aligned",coreDirection:direction,regime15:regime15.direction};
   }
 
-  if((direction==="CALL"&&last<=sma1.fast)||(direction==="PUT"&&last>=sma1.fast)){
-    return {ok:false,reason:"price has not resumed beyond SMA(5)",coreDirection:direction,bars15:bars15.length};
+  // Structural failure is an absolute veto.
+  if(direction==="CALL"&&fr1.lastLow&&last<=Number(fr1.lastLow.price)){
+    return {ok:false,grade:"NO TRADE",reason:"Fractal(2) support failed",coreDirection:direction};
+  }
+  if(direction==="PUT"&&fr1.lastHigh&&last>=Number(fr1.lastHigh.price)){
+    return {ok:false,grade:"NO TRADE",reason:"Fractal(2) resistance failed",coreDirection:direction};
   }
 
-  if(direction==="CALL"&&fr1.lastLow&&last<=fr1.lastLow.price){
-    return {ok:false,reason:"Fractal(2) support failed",coreDirection:direction,bars15:bars15.length};
-  }
-  if(direction==="PUT"&&fr1.lastHigh&&last>=fr1.lastHigh.price){
-    return {ok:false,reason:"Fractal(2) resistance failed",coreDirection:direction,bars15:bars15.length};
-  }
-
-  // 5m context only hard-vetoes a strong opposite regime.
-  if(regime?.ready&&regime.direction!=="NEUTRAL"&&regime.direction!==direction&&regime.efficiency>=0.45){
-    return {ok:false,reason:"strong completed 5m regime opposes setup",coreDirection:direction,
-      regimeDirection:regime.direction,regimeEfficiency:regime.efficiency,bars15:bars15.length};
-  }
-
-  // Look for a practical pullback zone over the last 6 completed 1m bars.
-  // It can tag SMA(5) directly or come reasonably close in ATR terms.
-  const recent=bars1m.slice(-6);
-  if(recent.length<5){
-    return {ok:false,reason:"not enough recent 1m bars",coreDirection:direction,bars15:bars15.length};
-  }
+  // Pullback + continuation: price must have revisited the fast average recently, then resumed.
+  const recent=bars1m.slice(-7);
   const nearFast=recent.some(b=>{
-    if(direction==="CALL"){
-      const d=Math.abs(Number(b.l)-sma1.fast)/atr1.atr;
-      return Number(b.l)<=sma1.fast+0.45*atr1.atr || d<=0.45;
-    }else{
-      const d=Math.abs(Number(b.h)-sma1.fast)/atr1.atr;
-      return Number(b.h)>=sma1.fast-0.45*atr1.atr || d<=0.45;
-    }
+    if(direction==="CALL") return Number(b.l)<=sma1.fast+0.50*atr1.atr;
+    return Number(b.h)>=sma1.fast-0.50*atr1.atr;
   });
-  if(!nearFast){
-    return {ok:false,reason:"waiting for a usable pullback near SMA(5)",coreDirection:direction,bars15:bars15.length};
-  }
+  if(!nearFast)return {ok:false,grade:"NO TRADE",reason:"no recent pullback toward SMA(5)",coreDirection:direction};
 
   const distanceFast=Math.abs(last-sma1.fast)/atr1.atr;
-  if(distanceFast>1.05){
-    return {ok:false,reason:"entry is too extended from SMA(5)",distanceFastAtr:distanceFast,
-      coreDirection:direction,bars15:bars15.length};
+  if(distanceFast>1.00){
+    return {ok:false,grade:"NO TRADE",reason:"entry is already extended from SMA(5)",distanceFastAtr:distanceFast,coreDirection:direction};
+  }
+  if((direction==="CALL"&&last<=sma1.fast)||(direction==="PUT"&&last>=sma1.fast)){
+    return {ok:false,grade:"NO TRADE",reason:"pullback has not resumed beyond SMA(5)",coreDirection:direction};
   }
 
-  // Require continuation in at least one of the last two closed 1m bars.
   const last2=bars1m.slice(-2);
-  const continuationBars=last2.filter(b=>direction==="CALL"
+  const continuation=last2.some(b=>direction==="CALL"
     ? Number(b.c)>Number(b.o)&&Number(b.c)>=sma1.fast
-    : Number(b.c)<Number(b.o)&&Number(b.c)<=sma1.fast
-  ).length;
-  if(continuationBars<1){
-    return {ok:false,reason:"1m continuation has not appeared yet",coreDirection:direction,bars15:bars15.length};
-  }
-
-  let score=3.2, confirms=1;
-  const reasons=[`SMA(5/13) ${direction==="CALL"?"bullish":"bearish"}`];
-
-  if((direction==="CALL"&&sma1.slowSlope>=0)||(direction==="PUT"&&sma1.slowSlope<=0)){
-    score+=0.8;reasons.push("SMA(13) slope aligned");
-  }
-
-  const anchor=direction==="CALL"?fr1.lastLow:fr1.lastHigh;
-  if(anchor){
-    const age=(Date.now()-Number(anchor.t))/60000;
-    if(age<=25){score+=0.9;confirms++;reasons.push("recent Fractal(2) structure");}
-  }
+    : Number(b.c)<Number(b.o)&&Number(b.c)<=sma1.fast);
+  if(!continuation)return {ok:false,grade:"NO TRADE",reason:"no completed 1m continuation candle",coreDirection:direction};
 
   const macdAligned=direction==="CALL"
     ? (m1.macd>m1.signal&&m1.hist>0)
     : (m1.macd<m1.signal&&m1.hist<0);
-  if(macdAligned){score+=1.2;confirms++;reasons.push("1m MACD aligned");}
+  if(!macdAligned)return {ok:false,grade:"NO TRADE",reason:"1m MACD is not aligned",coreDirection:direction};
 
   const dmiAligned=direction==="CALL"
-    ? dmi.plusDI>dmi.minusDI+2
-    : dmi.minusDI>dmi.plusDI+2;
-  if(dmiAligned&&dmi.adx>=14){score+=1.0;confirms++;reasons.push("ADX/DMI aligned");}
+    ? dmi.plusDI>dmi.minusDI+3
+    : dmi.minusDI>dmi.plusDI+3;
+  if(!dmiAligned||dmi.adx<17){
+    return {ok:false,grade:"NO TRADE",reason:"ADX/DMI trend strength is insufficient",adx:dmi.adx,coreDirection:direction};
+  }
 
   const rsiAligned=direction==="CALL"
-    ? (rsi1.rsi>=48&&rsi1.rsi<=72)
-    : (rsi1.rsi<=52&&rsi1.rsi>=28);
-  if(rsiAligned){score+=0.8;confirms++;reasons.push("RSI(7) aligned");}
+    ? (rsi1.rsi>=49&&rsi1.rsi<=71)
+    : (rsi1.rsi<=51&&rsi1.rsi>=29);
+  if(!rsiAligned)return {ok:false,grade:"NO TRADE",reason:"RSI(7) is outside the A-grade continuation zone",rsi:rsi1.rsi};
 
   const aroonAligned=direction==="CALL"
-    ? ar1.up>ar1.down+10
-    : ar1.down>ar1.up+10;
-  if(aroonAligned){score+=0.8;confirms++;reasons.push("Aroon aligned");}
+    ? ar1.up>ar1.down+12
+    : ar1.down>ar1.up+12;
+  if(!aroonAligned)return {ok:false,grade:"NO TRADE",reason:"Aroon does not confirm direction",coreDirection:direction};
 
-  const pressureAligned=direction==="CALL"?pressure.bull>=2:pressure.bear>=2;
-  if(pressureAligned){score+=0.6;reasons.push("1m candle pressure aligned");}
-
-  if(regime?.ready&&regime.direction===direction){
-    score+=0.9;reasons.push("completed 5m regime aligned");
+  // Room-to-move veto: avoid CALL into nearby resistance or PUT into nearby support.
+  const room=roomToMoveSnapshot(bars1m,last,direction,atr1.atr);
+  if(!room.ready||room.roomAtr<1.10){
+    return {ok:false,grade:"NO TRADE",reason:"insufficient room to move before higher-timeframe support/resistance",roomAtr:room.roomAtr};
   }
 
-  if(score<6.0||confirms<3){
-    return {ok:false,reason:`pullback setup not strong enough (score ${score.toFixed(1)}, confirmations ${confirms})`,
-      coreDirection:direction,score,confirms,bars15:bars15.length};
-  }
-
-  // Fresh timing: two of three is enough, but strong opposing ticks still veto.
-  const m15=macdSnapshot(bars15,3,8,3);
+  // Live ticks are used only as a reversal veto, not as a 15-second trigger.
   const imp=tickImpulse(ticks);
-  const bullish=direction==="CALL";
-  const m15Aligned=m15.ready&&(bullish
-    ? (m15.macd>m15.signal&&m15.hist>0)
-    : (m15.macd<m15.signal&&m15.hist<0));
-  const impAligned=imp.ready&&(bullish
-    ? (imp.upRatio>=0.55&&imp.norm>0)
-    : (imp.downRatio>=0.55&&imp.norm<0));
-  const strongOppImpulse=imp.ready&&(bullish
-    ? (imp.downRatio>=0.70&&imp.norm<0)
-    : (imp.upRatio>=0.70&&imp.norm>0));
-  const b15=bars15.at(-1);
-  const candleAligned=b15
-    ? ((bullish&&Number(b15.c)>Number(b15.o))||(!bullish&&Number(b15.c)<Number(b15.o)))
-    : false;
-
-  if(strongOppImpulse){
-    return {ok:false,reason:"live tick impulse strongly opposes entry",coreDirection:direction,bars15:bars15.length};
+  if(imp.ready){
+    const strongOpp=direction==="CALL"
+      ? (imp.downRatio>=0.70&&imp.norm<0)
+      : (imp.upRatio>=0.70&&imp.norm>0);
+    if(strongOpp)return {ok:false,grade:"NO TRADE",reason:"live Tiingo ticks show a strong reversal against entry",coreDirection:direction};
   }
 
-  const timingCount=[m15Aligned,impAligned,candleAligned].filter(Boolean).length;
-  if(timingCount<2){
-    return {ok:false,reason:"waiting for fresh 15s/live entry confirmation",coreDirection:direction,
-      timingCount,bars15:bars15.length};
+  let score=8.0;
+  const reasons=[
+    "1m SMA(5/13) aligned",
+    "completed 5m trend aligned",
+    "completed 15m trend aligned",
+    "Fractal(2) structure intact",
+    "pullback + continuation confirmed",
+    "1m MACD aligned",
+    "ADX/DMI aligned",
+    "RSI(7) aligned",
+    "Aroon aligned",
+    "room-to-move passed"
+  ];
+  if((direction==="CALL"&&sma1.slowSlope>=0)||(direction==="PUT"&&sma1.slowSlope<=0)){score+=0.5;reasons.push("SMA(13) slope supportive");}
+  const pressureAligned=direction==="CALL"?pressure.bull>=2:pressure.bear>=2;
+  if(pressureAligned){score+=0.4;reasons.push("1m candle pressure aligned");}
+  if(imp.ready){
+    const tickAligned=direction==="CALL"?(imp.upRatio>=0.55&&imp.norm>0):(imp.downRatio>=0.55&&imp.norm<0);
+    if(tickAligned){score+=0.4;reasons.push("live tick flow aligned");}
   }
 
-  const timingScore=(m15Aligned?1.2:0)+(impAligned?1.3:0)+(candleAligned?0.6:0);
   const quality=clamp(
-    0.69 + Math.min(score-6.0,3.5)*0.035 +
-    Math.min(timingScore,3.1)*0.025 +
-    (regime?.ready&&regime.direction===direction?0.025:0),
-    0.69,0.92
+    0.82 + Math.min(score-8,1.3)*0.035 +
+    Math.min(regime5.efficiency,0.7)*0.025 +
+    Math.min(regime15.efficiency,0.7)*0.025 +
+    Math.min(dmi.adx,35)/35*0.025,
+    0.82,0.94
   );
+  if(quality<A_GRADE_MIN_QUALITY){
+    return {ok:false,grade:"NO TRADE",reason:`setup quality ${(quality*100).toFixed(1)}% is below A-grade threshold`,quality};
+  }
 
   return {
-    ok:true,direction,expirySeconds:EXPIRY_SECONDS,quality,
+    ok:true,grade:"A",direction,expirySeconds:EXPIRY_SECONDS,quality,
     callScore:direction==="CALL"?score:0,putScore:direction==="PUT"?score:0,
-    edge:score,coreMajor:confirms,microConfirmations:timingCount,microScore:timingScore,
-    regimeEfficiency:regime?.efficiency??null,spreadAtrRatio,atrRatio,rsi:rsi1.rsi,adx:dmi.adx,
+    edge:score,coreMajor:8,microConfirmations:0,microScore:0,
+    regime5:regime5.direction,regime15:regime15.direction,
+    regime5Efficiency:regime5.efficiency,regime15Efficiency:regime15.efficiency,
+    roomAtr:room.roomAtr,spreadAtrRatio,atrRatio,rsi:rsi1.rsi,adx:dmi.adx,
     smaFastPeriod:5,smaSlowPeriod:13,fractalPeriod:2,timeframe:"1min",expiryMinutes:5,
     smaFast:sma1.fast,smaSlow:sma1.slow,distanceFastAtr:distanceFast,
-    reasons:[...reasons,"pullback near SMA(5)","1m continuation",...(m15Aligned?["15s MACD aligned"]:[]),
-      ...(impAligned?["live tick impulse aligned"]:[]),...(candleAligned?["15s candle aligned"]:[])],
-    bars15:bars15.length,bars1m:bars1m.length,lastPrice:last
+    reasons,bars1m:bars1m.length,lastPrice:last
   };
 }
 
