@@ -1,10 +1,11 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.8.0-five-minute-trend";
+const VERSION = "11.8.1-five-minute-isolated-risk";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 300;
+const STRATEGY_ID = "5m-trend-v11.8";
 const GLOBAL_SIGNAL_COOLDOWN_MS = 6*60*1000;
 const PAIR_SIGNAL_COOLDOWN_MS = 10*60*1000;
 const LOSS_CIRCUIT_BREAKER_MS = 20*60*1000;
@@ -823,16 +824,24 @@ export class TickHub extends DurableObject {
       status:this.lastStatus,reconnectCount:this.reconnectCount,generatedAt:Date.now()};
   }
 
+  isCurrentStrategyRecord(record){
+    if(!record)return false;
+    if(record.strategyId)return record.strategyId===STRATEGY_ID;
+    const entry=Number(record.entryAt||0), expiry=Number(record.expiresAt||0);
+    const inferredSeconds=entry&&expiry?Math.round((expiry-entry)/1000):0;
+    return inferredSeconds===EXPIRY_SECONDS;
+  }
+
   getRiskGate(){
     const now=Date.now();
-    const pending=[...this.pendingSignals].sort((a,b)=>Number(b.entryAt)-Number(a.entryAt));
+    const pending=this.pendingSignals.filter(x=>this.isCurrentStrategyRecord(x)).sort((a,b)=>Number(b.entryAt)-Number(a.entryAt));
     if(pending.length){
       const latest=pending[0];
       const retryMs=Math.max(1000,Number(latest.expiresAt||now)-now+30000);
       return {ok:false,reason:"an existing signal is still being settled",retrySeconds:Math.ceil(retryMs/1000)};
     }
 
-    const hist=[...this.signalHistory].sort((a,b)=>Number(b.settledAt||b.entryAt)-Number(a.settledAt||a.entryAt));
+    const hist=this.signalHistory.filter(x=>this.isCurrentStrategyRecord(x)).sort((a,b)=>Number(b.settledAt||b.entryAt)-Number(a.settledAt||a.entryAt));
     const latest=hist[0];
     if(latest){
       const sinceEntry=now-Number(latest.entryAt||0);
@@ -865,7 +874,7 @@ export class TickHub extends DurableObject {
   pairCooldownSeconds(symbol){
     const now=Date.now();
     const all=[...this.pendingSignals,...this.signalHistory]
-      .filter(x=>x.symbol===symbol)
+      .filter(x=>x.symbol===symbol&&this.isCurrentStrategyRecord(x))
       .sort((a,b)=>Number(b.entryAt)-Number(a.entryAt));
     const latest=all[0];
     if(!latest)return 0;
@@ -911,7 +920,10 @@ export class TickHub extends DurableObject {
       direction,
       entryPrice,
       entryAt,
-      expiresAt:entryAt+EXPIRY_SECONDS*1000
+      expiresAt:entryAt+EXPIRY_SECONDS*1000,
+      expirySeconds:EXPIRY_SECONDS,
+      strategyId:STRATEGY_ID,
+      version:VERSION
     };
     this.pendingSignals.push(sig);
     await this.ctx.storage.put("pendingSignals",this.pendingSignals);
@@ -920,18 +932,26 @@ export class TickHub extends DurableObject {
   }
 
   async getTrackingStats(){
-    const resolved=(this.signalStats.wins||0)+(this.signalStats.losses||0);
-    const winRate=resolved>0?(this.signalStats.wins/resolved)*100:null;
+    const current=this.signalHistory.filter(x=>this.isCurrentStrategyRecord(x));
+    const wins=current.filter(x=>x.result==="WIN").length;
+    const losses=current.filter(x=>x.result==="LOSS").length;
+    const draws=current.filter(x=>x.result==="DRAW").length;
+    const voids=current.filter(x=>x.result==="VOID").length;
+    const resolved=wins+losses;
+    const winRate=resolved>0?(wins/resolved)*100:null;
+    const pending=this.pendingSignals.filter(x=>this.isCurrentStrategyRecord(x)).length;
     return {
       ok:true,
-      ...this.signalStats,
-      pending:this.pendingSignals.length,
-      winRate,
-      recent:this.signalHistory.slice(0,5)
+      strategyId:STRATEGY_ID,
+      expirySeconds:EXPIRY_SECONDS,
+      total:current.length,
+      wins,losses,draws,voids,pending,winRate,
+      recent:current.slice(0,5),
+      allTime:{...this.signalStats}
     };
   }
 
-  async fetch(req){
+    async fetch(req){
     const u=new URL(req.url), symbol=normalizeSymbol(u.searchParams.get("symbol")||"");
 
     if(u.pathname==="/reconnect"){
@@ -1097,7 +1117,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.8 five-minute trend six-pair scanner",{status:200});
+    if(request.method!=="POST")return new Response("V11.8.1 five-minute isolated-risk scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -1108,7 +1128,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V11.8 — 5-MINUTE TREND MODE. /signal scans all 6 pairs using 1m SMA(5), SMA(13), Fractal(2), MACD(5,13,4), Aroon(14), RSI(7), ADX/DMI(7) and a 5m regime layer. Short-term 15s/live-tick inputs are used mainly for entry timing rather than blocking every otherwise-valid setup."
+        "V11.8.1 — 5-MINUTE TREND MODE. Risk controls are now isolated to this 5-minute strategy, so losses/cooldowns from the old 1-minute system no longer block /signal. Core remains 1m SMA(5), SMA(13), Fractal(2) with MACD/Aroon/RSI/ADX-DMI and 5m regime confirmation."
       );
       return new Response("ok");
     }
@@ -1184,7 +1204,7 @@ export default {
         await tgSend(
           env,
           chatId,
-          `🛡️ PRECISION MODE PAUSED\n${risk.reason}.\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.`
+          `🛡️ 5-MINUTE MODE PAUSED\n${risk.reason}.\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.`
         );
         return new Response("ok");
       }
