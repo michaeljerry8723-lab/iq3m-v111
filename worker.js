@@ -1466,7 +1466,7 @@ export default {
           await tgSend(
             env,
             chatId,
-            `⏳ DATA LIMIT REACHED\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.\nThe bot will scan all 8 symbols again and will only issue a trade if a qualified setup is present.`
+            `⏳ DATA LIMIT REACHED\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.\nThe bot will scan all 8 symbols again and only issue Grade A.`
           );
           return new Response("ok");
         }
@@ -1477,47 +1477,26 @@ export default {
           await tgSend(
             env,
             chatId,
-            "⏳ LIVE FEED STARTING\nNo live Tiingo quote is available yet for the eight-symbol scan. Try /signal again in about 1 minute."
+            "⏳ LIVE FEEDS STARTING\nNo usable live Tiingo quote is available yet across the eight-symbol scan. Try /signal again in about 1 minute."
           );
           return new Response("ok");
         }
 
-        const reasons=(checked||[]).map(x=>x?.reason).filter(Boolean);
-        const top=reasons.length?reasons.sort((a,b)=>
-          reasons.filter(x=>x===b).length-reasons.filter(x=>x===a).length
+        const reasons=checked.map(x=>x?.reason).filter(Boolean);
+        const top=reasons.length?reasons.sort((x,y)=>
+          reasons.filter(z=>z===y).length-reasons.filter(z=>z===x).length
         )[0]:null;
         await tgSend(
           env,
           chatId,
-          `⏳ NO QUALIFIED 5-MINUTE SETUP RIGHT NOW\nFeeds are live across the scan.${top?"\nMain blocker: "+top:""}\nTry /signal again in about 1–2 minutes.`
+          `⏳ NO A-GRADE 5-MINUTE SETUP RIGHT NOW\nFeeds are live across the scan.${top?"\nMain blocker: "+top:""}\nAutomatic scanning remains active.`
         );
         return new Response("ok");
       }
 
       const issued=await issueAgradeSignal(env,[chatId],scan.best,`manual-${update.update_id}`,false);
       if(!issued.ok){
-        await tgSend(env,chatId,`⏳ ${issued.reason||"setup failed final validation"}\nRun /signal again.`);
-      }
-      return new Response("ok");
-      }
-
-      const arrow=result.direction==="CALL"?"⬆️":"⬇️";
-      const compact=String(env.BOT_COMPACT_MODE??"1")!=="0";
-      const sent=compact
-        ? await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 5 minutes\nTRACKING: ON`)
-        : await tgSend(env,chatId,`${arrow} ${symbol}\nEXPIRY: 5 minutes\nSETUP QUALITY: ${(Number(result.quality)*100).toFixed(1)}%\nCALL SCORE: ${Number(result.callScore).toFixed(1)}\nPUT SCORE: ${Number(result.putScore).toFixed(1)}\nENTRY CONFIRMATIONS: ${result.microConfirmations}\nTRACKING: ON`);
-
-      const quote=await hub(env,`/quote?symbol=${encodeURIComponent(symbol)}`);
-      if(quote.ok&&Number.isFinite(Number(quote.price))){
-        await hubPost(env,"/track",{
-          sourceUpdateId:update.update_id,
-          chatId,
-          symbol,
-          direction:result.direction,
-          entryPrice:Number(quote.price),
-          entryAt:Date.now(),
-          telegramMessageDate:sent?.date||null
-        });
+        await tgSend(env,chatId,`⏳ ${issued.reason||"setup failed final validation"}\nAutomatic scanning remains active.`);
       }
       return new Response("ok");
     }
