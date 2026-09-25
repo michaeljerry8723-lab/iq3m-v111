@@ -434,7 +434,7 @@ export class TickHub extends DurableObject {
     super(ctx,env);
     this.ctx=ctx; this.env=env; this.ws=null; this.cryptoWs=null; this.ticks=new Map(); this.symbols=new Set();
     this.lastStatus="starting"; this.lastSubscribeStatus=null; this.connecting=false; this.cryptoConnecting=false; this.provider="tiingo"; this.lastCryptoStatus="starting"; this.lastCryptoSubscribeStatus=null; this.lastCryptoWsMessageAt=0;
-    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map(); this.quotaBlockedUntil=0; this.pendingSignals=[]; this.signalStats={total:0,wins:0,losses:0,draws:0,voids:0}; this.signalHistory=[];
+    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map(); this.quotaBlockedUntil=0; this.pendingSignals=[]; this.signalStats={total:0,wins:0,losses:0,draws:0,voids:0}; this.signalHistory=[]; this.alertChats=[];
 
     this.ctx.blockConcurrencyWhile(async()=>{
       // V11.2: prefer the configured warm list over old persisted symbols so a Basic/trial
@@ -450,6 +450,7 @@ export class TickHub extends DurableObject {
       this.pendingSignals=(await this.ctx.storage.get("pendingSignals"))||[];
       this.signalStats=(await this.ctx.storage.get("signalStats"))||{total:0,wins:0,losses:0,draws:0,voids:0};
       this.signalHistory=(await this.ctx.storage.get("signalHistory"))||[];
+      this.alertChats=(await this.ctx.storage.get("alertChats"))||[];
       await this.ensureSocket();
       await this.ensureCryptoSocket();
       await this.scheduleAlarm();
@@ -1063,6 +1064,23 @@ export class TickHub extends DurableObject {
     return {ok:true,id:sig.id,expiresAt:sig.expiresAt};
   }
 
+  async registerAlertChat(req){
+    const body=await req.json();
+    const chatId=body?.chatId;
+    if(chatId==null)return {ok:false,error:"missing chatId"};
+    const id=String(chatId);
+    if(!this.alertChats.includes(id)){
+      this.alertChats.push(id);
+      this.alertChats=this.alertChats.slice(-10);
+      await this.ctx.storage.put("alertChats",this.alertChats);
+    }
+    return {ok:true,chatId:id,count:this.alertChats.length};
+  }
+
+  async getAlertChats(){
+    return {ok:true,chats:[...this.alertChats]};
+  }
+
   async getTrackingStats(){
     const current=this.signalHistory.filter(x=>this.isCurrentStrategyRecord(x));
     const wins=current.filter(x=>x.result==="WIN").length;
@@ -1112,6 +1130,8 @@ export class TickHub extends DurableObject {
       });
     }
     if(u.pathname==="/risk")return json(this.getRiskGate());
+    if(u.pathname==="/register-chat"&&req.method==="POST")return json(await this.registerAlertChat(req));
+    if(u.pathname==="/chats")return json(await this.getAlertChats());
     if(u.pathname==="/track"&&req.method==="POST")return json(await this.trackSignal(req));
     if(u.pathname==="/stats")return json(await this.getTrackingStats());
 
