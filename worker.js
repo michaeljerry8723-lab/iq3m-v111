@@ -510,8 +510,9 @@ export class TickHub extends DurableObject {
         settled.push(rec);
         this.signalStats.total++;
         this.signalStats.voids++;
-        await this.sendTrackedResult(
-          sig.chatId,
+        const chats=Array.isArray(sig.chatIds)&&sig.chatIds.length?sig.chatIds:[sig.chatId];
+        for(const chat of chats) if(chat!=null) await this.sendTrackedResult(
+          chat,
           `RESULT — ${sig.symbol}\n${sig.direction==="CALL"?"⬆️ CALL":"⬇️ PUT"} • 5 minutes\n⚪ VOID — no fresh Tiingo tick was available at expiry`
         );
         continue;
@@ -533,8 +534,9 @@ export class TickHub extends DurableObject {
       else this.signalStats.draws++;
 
       const mark=result==="WIN"?"✅":result==="LOSS"?"❌":"➖";
-      await this.sendTrackedResult(
-        sig.chatId,
+      const chats=Array.isArray(sig.chatIds)&&sig.chatIds.length?sig.chatIds:[sig.chatId];
+      for(const chat of chats) if(chat!=null) await this.sendTrackedResult(
+        chat,
         `RESULT — ${sig.symbol}\n${sig.direction==="CALL"?"⬆️ CALL":"⬇️ PUT"} • 5 minutes\nENTRY: ${formatFxPrice(sig.symbol,entry)}\nEXIT: ${formatFxPrice(sig.symbol,exit)}\n${mark} ${result}\nTRACKING: Tiingo feed`
       );
     }
@@ -1032,12 +1034,13 @@ export class TickHub extends DurableObject {
     const direction=String(body?.direction||"").toUpperCase();
     const entryPrice=Number(body?.entryPrice);
     const chatId=body?.chatId;
+    const chatIds=Array.isArray(body?.chatIds)?body.chatIds.map(String).filter(Boolean):[];
     const sourceUpdateId=String(body?.sourceUpdateId??"");
     const entryAt=Number(body?.entryAt)||Date.now();
 
     if(!symbol||!FIXED_UNIVERSE.includes(symbol))return {ok:false,error:"invalid symbol"};
     if(!["CALL","PUT"].includes(direction))return {ok:false,error:"invalid direction"};
-    if(!Number.isFinite(entryPrice)||!chatId)return {ok:false,error:"invalid tracking payload"};
+    if(!Number.isFinite(entryPrice)||(chatId==null&&!chatIds.length))return {ok:false,error:"invalid tracking payload"};
 
     if(sourceUpdateId){
       const duplicate=this.pendingSignals.find(x=>String(x.sourceUpdateId)===sourceUpdateId)||
@@ -1048,7 +1051,8 @@ export class TickHub extends DurableObject {
     const sig={
       id:crypto.randomUUID(),
       sourceUpdateId,
-      chatId,
+      chatId:chatId==null?(chatIds[0]||null):chatId,
+      chatIds:chatIds.length?chatIds:undefined,
       symbol,
       direction,
       entryPrice,
