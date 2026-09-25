@@ -1224,7 +1224,7 @@ async function hubPost(env,path,body){
 }
 
 
-async function scanSixPairUniverse(env){
+async function scanUniverse(env){
   const checked=[];
   for(const symbol of FIXED_UNIVERSE){
     try{
@@ -1244,7 +1244,7 @@ async function scanSixPairUniverse(env){
     }
   }
 
-  const qualified=checked.filter(x=>x?.ok&&x?.direction&&Number.isFinite(Number(x.quality)));
+  const qualified=checked.filter(x=>x?.ok&&x?.grade==="A"&&x?.direction&&Number(x.quality)>=A_GRADE_MIN_QUALITY);
   qualified.sort((a,b)=>
     Number(b.quality||0)-Number(a.quality||0) ||
     Number(b.edge||0)-Number(a.edge||0) ||
@@ -1252,9 +1252,67 @@ async function scanSixPairUniverse(env){
   );
 
   if(!qualified.length){
-    return {ok:false,checked,reason:"No qualified 5-minute entry across the fixed six-pair universe."};
+    return {ok:false,checked,reason:"No A-grade 5-minute entry across the eight-symbol universe."};
   }
   return {ok:true,best:qualified[0],checked};
+}
+
+
+async function issueAgradeSignal(env,chatIds,candidate,sourceUpdateId="auto",automatic=false){
+  const chats=(chatIds||[]).map(String).filter(Boolean);
+  if(!chats.length)return {ok:false,reason:"no alert chat registered"};
+
+  const symbol=candidate.symbol;
+  const result=await hub(env,`/signal?symbol=${encodeURIComponent(symbol)}`);
+  if(!result.ok||result.grade!=="A"||result.direction!==candidate.direction||Number(result.quality)<A_GRADE_MIN_QUALITY){
+    return {ok:false,reason:"setup changed during final check"};
+  }
+
+  const quoteBefore=await hub(env,`/quote?symbol=${encodeURIComponent(symbol)}`);
+  if(!quoteBefore.ok||!Number.isFinite(Number(quoteBefore.price))||Number(quoteBefore.receiveAgeSeconds)>12){
+    return {ok:false,reason:"fresh entry quote unavailable"};
+  }
+
+  const arrow=result.direction==="CALL"?"⬆️":"⬇️";
+  const label=automatic?"AUTO A-GRADE SIGNAL":"A-GRADE SIGNAL";
+  const textMsg=`${arrow} ${symbol}\n${label}\nEXPIRY: 5 minutes\nGRADE: A\nQUALITY: ${(Number(result.quality)*100).toFixed(1)}%\nTRACKING: ON`;
+
+  let sentAt=null;
+  for(const chat of chats){
+    const sent=await tgSend(env,chat,textMsg);
+    if(sent?.date&&!sentAt)sentAt=sent.date;
+  }
+
+  const quoteAfter=await hub(env,`/quote?symbol=${encodeURIComponent(symbol)}`);
+  const entryPrice=quoteAfter.ok&&Number.isFinite(Number(quoteAfter.price))
+    ? Number(quoteAfter.price)
+    : Number(quoteBefore.price);
+
+  await hubPost(env,"/track",{
+    sourceUpdateId:String(sourceUpdateId),
+    chatIds:chats,
+    symbol,
+    direction:result.direction,
+    entryPrice,
+    entryAt:Date.now(),
+    telegramMessageDate:sentAt
+  });
+  return {ok:true,symbol,direction:result.direction,quality:result.quality};
+}
+
+async function autoScanAndAlert(env){
+  const chatState=await hub(env,"/chats");
+  const chats=Array.isArray(chatState?.chats)?chatState.chats:[];
+  if(!chats.length)return {ok:false,reason:"no registered chat"};
+
+  const risk=await hub(env,"/risk");
+  if(!risk.ok)return {ok:false,reason:risk.reason||"risk gate"};
+
+  const scan=await scanUniverse(env);
+  if(!scan.ok)return {ok:false,reason:scan.reason||"no A-grade setup"};
+
+  const minuteKey=Math.floor(Date.now()/60000);
+  return await issueAgradeSignal(env,chats,scan.best,`auto-${minuteKey}-${scan.best.symbol}`,true);
 }
 
 
@@ -1308,18 +1366,19 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.10.1 balanced pullback five-minute scanner",{status:200});
+    if(request.method!=="POST")return new Response("V12 A-grade automatic five-minute scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
     const update=await request.json(); const msg=update.message||update.edited_message; if(!msg?.chat?.id)return new Response("ok");
     const chatId=msg.chat.id, text=String(msg.text||"").trim();
+    await hubPost(env,"/register-chat",{chatId});
     if(/^\/version$/i.test(text)){await tgSend(env,chatId,VERSION);return new Response("ok");}
     if(/^\/start$/i.test(text)){
       await tgSend(
         env,
         chatId,
-        "V11.10.1 — BALANCED PULLBACK MODE. Keeps SMA(5/13), Fractal(2), pullback-and-continuation structure and 5-minute expiry, but secondary indicators are weighted instead of all mandatory. A strong opposite 5m regime or live tick impulse still vetoes the trade."
+        "V12 — A-GRADE AUTO MODE. Eight symbols: six FX majors + XAU/USD + BTC/USD. The bot scans automatically every minute and only alerts when the 1m entry, completed 5m and 15m trend, pullback/continuation, momentum, volatility and room-to-move vetoes all qualify as Grade A. /signal remains available for an immediate scan."
       );
       return new Response("ok");
     }
@@ -1335,7 +1394,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        `SIX-PAIR FEED HEALTH\nLIVE: ${liveCount}/${FIXED_UNIVERSE.length}\n\n${lines.join("\n\n")}`
+        `EIGHT-SYMBOL FEED HEALTH\nLIVE: ${liveCount}/${FIXED_UNIVERSE.length}\n\n${lines.join("\n\n")}`
       );
       return new Response("ok");
     }
@@ -1400,14 +1459,14 @@ export default {
         return new Response("ok");
       }
 
-      const scan=await scanSixPairUniverse(env);
+      const scan=await scanUniverse(env);
       if(!scan.ok){
         if(scan.quotaExceeded){
           const mins=Math.max(1,Number(scan.retryAfterMinutes)||1);
           await tgSend(
             env,
             chatId,
-            `⏳ DATA LIMIT REACHED\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.\nThe bot will scan all 6 pairs again and will only issue a trade if a qualified setup is present.`
+            `⏳ DATA LIMIT REACHED\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.\nThe bot will scan all 8 symbols again and will only issue a trade if a qualified setup is present.`
           );
           return new Response("ok");
         }
@@ -1418,7 +1477,7 @@ export default {
           await tgSend(
             env,
             chatId,
-            "⏳ LIVE FEED STARTING\nNo live Tiingo quote is available yet for the six-pair scan. Try /signal again in about 1 minute."
+            "⏳ LIVE FEED STARTING\nNo live Tiingo quote is available yet for the eight-symbol scan. Try /signal again in about 1 minute."
           );
           return new Response("ok");
         }
@@ -1435,15 +1494,11 @@ export default {
         return new Response("ok");
       }
 
-      const candidate=scan.best, symbol=candidate.symbol;
-      const result=await hub(env,`/signal?symbol=${encodeURIComponent(symbol)}`);
-      if(!result.ok||result.direction!==candidate.direction){
-        await tgSend(
-          env,
-          chatId,
-          "⏳ SETUP CHANGED DURING FINAL CHECK\nThe best candidate no longer meets the 5-minute entry rules. Run /signal again."
-        );
-        return new Response("ok");
+      const issued=await issueAgradeSignal(env,[chatId],scan.best,`manual-${update.update_id}`,false);
+      if(!issued.ok){
+        await tgSend(env,chatId,`⏳ ${issued.reason||"setup failed final validation"}\nRun /signal again.`);
+      }
+      return new Response("ok");
       }
 
       const arrow=result.direction==="CALL"?"⬆️":"⬇️";
@@ -1468,10 +1523,15 @@ export default {
     }
 
     if(/^\/signal\b/i.test(text)){
-      await tgSend(env,chatId,"Use /signal by itself. The bot scans all 6 pairs automatically and returns the strongest qualified 5-minute setup.");
+      await tgSend(env,chatId,"Use /signal by itself. The bot scans all 8 symbols and returns only the strongest A-grade 5-minute setup. Automatic scans also run every minute.");
       return new Response("ok");
     }
 
     return new Response("ok");
+  },
+
+  async scheduled(controller,env,ctx){
+    ctx.waitUntil(autoScanAndAlert(env).catch(()=>{}));
   }
+
 };
