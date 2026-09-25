@@ -1,7 +1,7 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "11.8.1-five-minute-isolated-risk";
+const VERSION = "11.8.2-five-minute-no-warm-lock";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const EXPIRY_SECONDS = 300;
@@ -236,11 +236,9 @@ function candlePressure(bars,n=3){
 
 function score5m(ticks,bars1m){
   const bars15=buildBars(ticks,15);
-  if(bars15.length<6){
-    return {ok:false,reason:"entry timing layer warming",bars15:bars15.length};
-  }
 
   // 5-minute expiry: use a slower, more stable 1m trend core.
+  // Do not block the whole strategy while the short-term tick layer is still accumulating.
   const sma1=smaTrendSnapshot(bars1m,5,13);
   const fr1=fractalSnapshot(bars1m,2);
   const m1=macdSnapshot(bars1m,5,13,4);
@@ -358,12 +356,8 @@ function score5m(ticks,bars1m){
 
   const m15=macdSnapshot(bars15,3,8,3);
   const imp=tickImpulse(ticks);
-  if(!m15.ready||!imp.ready){
-    return {ok:false,reason:"entry timing confirmation not ready",bars15:bars15.length};
-  }
-
   const bullish=direction==="CALL";
-  const m15Aligned=bullish?(m15.macd>m15.signal&&m15.hist>0):(m15.macd<m15.signal&&m15.hist<0);
+  const m15Aligned=m15.ready&&(bullish?(m15.macd>m15.signal&&m15.hist>0):(m15.macd<m15.signal&&m15.hist<0));
   const impAligned=imp.ready&&(bullish?(imp.upRatio>=0.54&&imp.norm>0):(imp.downRatio>=0.54&&imp.norm<0));
   const strongOppImpulse=imp.ready&&(bullish?(imp.downRatio>=0.72&&imp.norm<0):(imp.upRatio>=0.72&&imp.norm>0));
   const b15=bars15.at(-1);
@@ -373,13 +367,15 @@ function score5m(ticks,bars1m){
     return {ok:false,reason:"live tick impulse strongly opposes entry",coreDirection:direction,bars15:bars15.length};
   }
 
-  // For a 5m expiry, only one short-term timing confirmation is required.
+  // Short-term timing improves ranking, but a strong 1m/5m trend setup is not blocked
+  // merely because a fresh 15s indicator window has not accumulated yet.
   const timingCount=[m15Aligned,impAligned,candleAligned].filter(Boolean).length;
-  if(timingCount<1){
-    return {ok:false,reason:"waiting for a clean entry moment",coreDirection:direction,bars15:bars15.length};
-  }
-
   const timingScore=(m15Aligned?1.2:0)+(impAligned?1.2:0)+(candleAligned?0.6:0);
+
+  if(timingCount===0&&score<7.0){
+    return {ok:false,reason:"5m setup exists but entry timing is not clean yet",coreDirection:direction,
+      score,bars15:bars15.length};
+  }
   const quality=clamp(
     0.65 + Math.min(score-6.0,4)*0.035 + Math.min(timingScore,3)*0.025 +
     (regime?.ready&&regime.direction===direction?0.03:0),
@@ -793,9 +789,9 @@ export class TickHub extends DurableObject {
     const bars15=buildBars(arr,15).length;
 
     const bars5=buildBars(arr,5).length;
-    if(bars15<6){
-      return {ok:false,warming:true,symbol,ticks:arr.length,bars15,bars5,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
-        status:this.lastStatus,reason:`feed warming: ${bars15}/6 x 15s bars ready`};
+    if(!arr.length){
+      return {ok:false,warming:true,symbol,ticks:0,bars15:0,bars5:0,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
+        status:this.lastStatus,reason:"waiting for first live Tiingo quote"};
     }
     if(receiveAge>8){
       return {ok:false,symbol,ticks:arr.length,bars15,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
@@ -1117,7 +1113,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V11.8.1 five-minute isolated-risk scanner",{status:200});
+    if(request.method!=="POST")return new Response("V11.8.2 five-minute no-warm-lock scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -1128,7 +1124,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V11.8.1 — 5-MINUTE TREND MODE. Risk controls are now isolated to this 5-minute strategy, so losses/cooldowns from the old 1-minute system no longer block /signal. Core remains 1m SMA(5), SMA(13), Fractal(2) with MACD/Aroon/RSI/ADX-DMI and 5m regime confirmation."
+        "V11.8.2 — 5-MINUTE TREND MODE. The 15-second warm-up lock has been removed. Core decisions use 1m SMA(5), SMA(13), Fractal(2), MACD/Aroon/RSI/ADX-DMI and 5m regime context; live 15s/tick data improves entry timing but no longer blocks a strong setup just because the short-term buffer is still filling."
       );
       return new Response("ok");
     }
@@ -1221,14 +1217,13 @@ export default {
           return new Response("ok");
         }
 
-        const warming=(scan.checked||[]).filter(x=>x?.warming);
-        if(warming.length){
-          const need15=Math.max(...warming.map(x=>Math.max(0,6-Number(x.bars15||0))));
-          const retry=Math.max(1,Math.ceil((need15*15)/60));
+        const checked=scan.checked||[];
+        const warming=checked.filter(x=>x?.warming);
+        if(checked.length&&warming.length===checked.length){
           await tgSend(
             env,
             chatId,
-            `⏳ MARKET DATA WARMING\nTry /signal again in about ${retry} minute${retry===1?"":"s"}.\nThe bot will scan all 6 pairs and only return a qualified setup.`
+            "⏳ LIVE FEED STARTING\nNo live Tiingo quote is available yet for the six-pair scan. Try /signal again in about 1 minute."
           );
           return new Response("ok");
         }
@@ -1236,7 +1231,7 @@ export default {
         await tgSend(
           env,
           chatId,
-          "⏳ NO QUALIFIED 5-MINUTE SETUP RIGHT NOW\nTry /signal again in about 2 minutes. The bot will scan all 6 pairs again."
+          "⏳ NO QUALIFIED 5-MINUTE SETUP RIGHT NOW\nThe live feeds are active, but none of the 6 pairs currently meets the 5-minute entry rules. Try /signal again in about 2 minutes."
         );
         return new Response("ok");
       }
