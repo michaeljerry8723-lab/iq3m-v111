@@ -548,12 +548,22 @@ export class TickHub extends DurableObject {
   async alarm(){
     try{
       await this.ensureSocket();
+      await this.ensureCryptoSocket();
 
       if(this.ws&&this.ws.readyState===1){
         const msgAge=this.lastWsMessageAt?((Date.now()-this.lastWsMessageAt)/1000):Infinity;
-        if(msgAge>45) await this.forceReconnect("no websocket messages for >45s");
+        if(msgAge>45) await this.forceReconnect("no FX websocket messages for >45s");
       }else{
-        await this.forceReconnect("socket not open");
+        await this.forceReconnect("FX socket not open");
+      }
+
+      if([...this.symbols].some(isCryptoSymbol)){
+        if(this.cryptoWs&&this.cryptoWs.readyState===1){
+          const msgAge=this.lastCryptoWsMessageAt?((Date.now()-this.lastCryptoWsMessageAt)/1000):Infinity;
+          if(msgAge>45) await this.forceCryptoReconnect("no crypto websocket messages for >45s");
+        }else{
+          await this.forceCryptoReconnect("crypto socket not open");
+        }
       }
 
       await this.settlePendingSignals();
@@ -566,15 +576,21 @@ export class TickHub extends DurableObject {
   async forceReconnect(reason="manual reconnect"){
     this.reconnectCount++;
     this.lastStatus=`reconnecting: ${reason}`;
-    try{
-      if(this.ws){
-        try{ this.ws.close(1000,"reconnect"); }catch(_){}
-      }
-    }catch(_){}
+    try{ if(this.ws){ try{this.ws.close(1000,"reconnect");}catch(_){} } }catch(_){}
     this.ws=null;
     this.connecting=false;
     await sleep(150);
     await this.ensureSocket(true);
+  }
+
+  async forceCryptoReconnect(reason="manual reconnect"){
+    this.reconnectCount++;
+    this.lastCryptoStatus=`reconnecting: ${reason}`;
+    try{ if(this.cryptoWs){ try{this.cryptoWs.close(1000,"reconnect");}catch(_){} } }catch(_){}
+    this.cryptoWs=null;
+    this.cryptoConnecting=false;
+    await sleep(150);
+    await this.ensureCryptoSocket(true);
   }
 
   async ensureSocket(force=false){
@@ -741,19 +757,42 @@ export class TickHub extends DurableObject {
 
   async refreshIfStale(symbol){
     const receiveAge=this.latestReceivedAge(symbol);
-    const msgAge=this.lastWsMessageAt?Math.max(0,(Date.now()-this.lastWsMessageAt)/1000):Infinity;
+    const crypto=isCryptoSymbol(symbol);
+    const msgAge=crypto
+      ? (this.lastCryptoWsMessageAt?Math.max(0,(Date.now()-this.lastCryptoWsMessageAt)/1000):Infinity)
+      : (this.lastWsMessageAt?Math.max(0,(Date.now()-this.lastWsMessageAt)/1000):Infinity);
 
-    // A never-seen symbol may simply be unsupported by the current Tiingo plan.
-    // Do not tear down the healthy socket for the other five symbols just because this pair has no ticks yet.
     if(!Number.isFinite(receiveAge)){
-      await this.ensureSocket();
+      if(crypto) await this.ensureCryptoSocket();
+      else await this.ensureSocket();
       return;
     }
 
-    if(receiveAge>15 || msgAge>45 || !(this.ws&&this.ws.readyState===1)){
-      await this.forceReconnect(`stale ${symbol} feed`);
+    const open=crypto
+      ? Boolean(this.cryptoWs&&this.cryptoWs.readyState===1)
+      : Boolean(this.ws&&this.ws.readyState===1);
+
+    if(receiveAge>15||msgAge>45||!open){
+      if(crypto) await this.forceCryptoReconnect(`stale ${symbol} feed`);
+      else await this.forceReconnect(`stale ${symbol} feed`);
       await sleep(1800);
     }
+  }
+
+  async subscribe(symbol){
+    symbol=normalizeSymbol(symbol);
+    if(!symbol||!FIXED_UNIVERSE.includes(symbol))return false;
+
+    if(!this.symbols.has(symbol)){
+      this.symbols.add(symbol);
+      await this.ctx.storage.put("symbols",[...this.symbols]);
+      if(isCryptoSymbol(symbol)) await this.forceCryptoReconnect("ticker universe changed");
+      else await this.forceReconnect("ticker universe changed");
+    }else{
+      if(isCryptoSymbol(symbol)) await this.ensureCryptoSocket();
+      else await this.ensureSocket();
+    }
+    return true;
   }
 
   async persistOneMinuteCache(){
