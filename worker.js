@@ -451,6 +451,14 @@ export class TickHub extends DurableObject {
       this.signalStats=(await this.ctx.storage.get("signalStats"))||{total:0,wins:0,losses:0,draws:0,voids:0};
       this.signalHistory=(await this.ctx.storage.get("signalHistory"))||[];
       this.alertChats=(await this.ctx.storage.get("alertChats"))||[];
+      if(!this.alertChats.length){
+        const recovered=[...this.pendingSignals,...this.signalHistory]
+          .flatMap(x=>Array.isArray(x.chatIds)?x.chatIds:[x.chatId])
+          .filter(x=>x!=null)
+          .map(String);
+        this.alertChats=[...new Set(recovered)].slice(-10);
+        if(this.alertChats.length)await this.ctx.storage.put("alertChats",this.alertChats);
+      }
       await this.ensureSocket();
       await this.ensureCryptoSocket();
       await this.scheduleAlarm();
@@ -662,7 +670,7 @@ export class TickHub extends DurableObject {
         ws.send(JSON.stringify({
           eventName:"subscribe",
           authorization:key,
-          eventData:{thresholdLevel:5,tickers}
+          eventData:{thresholdLevel:2,tickers}
         }));
       });
 
@@ -1326,8 +1334,8 @@ async function checkAllFeeds(env){
 
       let health="NO DATA";
       if(st.connected && ticks>0 && Number.isFinite(received) && Number.isFinite(provider)){
-        if(received<=8 && provider<=10) health="LIVE";
-        else if(received<=20 && provider<=30) health="WARMING";
+        if(received<=12 && provider<=20) health="LIVE";
+        else if(received<=30 && provider<=45) health="WARMING";
         else health="STALE";
       }else if(st.connected){
         health="WARMING";
@@ -1413,17 +1421,17 @@ export default {
       for(const symbol of FIXED_UNIVERSE){
         try{
           const r=await hub(env,`/signal?symbol=${encodeURIComponent(symbol)}`);
-          rows.push(`${symbol}: ${r.ok?"QUALIFIED":(r.reason||"not ready")}`);
+          rows.push(`${symbol}: ${r.ok&&r.grade==="A"?"A-GRADE":(r.reason||"not ready")}`);
         }catch(e){
           rows.push(`${symbol}: error`);
         }
       }
-      await tgSend(env,chatId,`SIGNAL DIAGNOSIS\n\n${rows.join("\n")}`);
+      await tgSend(env,chatId,`V12 A-GRADE DIAGNOSIS\n\n${rows.join("\n")}`);
       return new Response("ok");
     }
     if(/^\/reconnect$/i.test(text)){
       const st=await hub(env,"/reconnect");
-      await tgSend(env,chatId,`FEED RECONNECT REQUESTED\nSTATUS: ${st.status||"n/a"}\nRECONNECTS: ${st.reconnectCount||0}`);
+      await tgSend(env,chatId,`FEED RECONNECT REQUESTED\nFX: ${st.fxStatus||"n/a"}\nCRYPTO: ${st.cryptoStatus||"n/a"}\nRECONNECTS: ${st.reconnectCount||0}`);
       return new Response("ok");
     }
     if(/^\/feed/i.test(text)){
@@ -1434,8 +1442,7 @@ export default {
         `PROVIDER: ${st.provider||"tiingo"}\n`+
         `CONNECTED: ${st.connected?"YES":"NO"}\n`+
         `TICKS: ${st.ticks||0}\n`+
-        `5s BARS: ${st.bars5||0}\n`+
-        `15s BARS: ${st.bars15||0}\n`+
+        `1m LIVE BARS: ${st.bars60||0}\n`+
         `RECEIVED TICK AGE: ${st.lastTickAgeSeconds??"n/a"}s\n`+
         `PROVIDER TICK AGE: ${st.providerTickAgeSeconds??"n/a"}s\n`+
         `WS MESSAGE AGE: ${st.lastWsMessageAgeSeconds??"n/a"}s\n`+
