@@ -718,13 +718,52 @@ export class TickHub extends DurableObject {
 
   async scheduleAlarm(){
     const now=Date.now();
-    let next=now+10000;
+    if(!this.pendingSignals.length){
+      try{await this.ctx.storage.deleteAlarm();}catch(_){}
+      return;
+    }
+    let next=Infinity;
     for(const p of this.pendingSignals){
       const exp=Number(p.expiresAt||0);
       if(exp>now) next=Math.min(next,exp);
-      else next=Math.min(next,now+1000);
+      else next=Math.min(next,now+250);
     }
-    await this.ctx.storage.setAlarm(Math.max(now+250,next));
+    await this.ctx.storage.setAlarm(Math.max(now+250,Number.isFinite(next)?next:now+1000));
+  }
+
+  async fetchTopSnapshots(symbols=[]){
+    const fx=[...new Set(symbols.map(normalizeSymbol).filter(s=>s&&!isCryptoSymbol(s)))];
+    if(!fx.length)return 0;
+    const key=String(this.env.TIINGO_API_TOKEN||"").trim();
+    if(!key)throw new Error("missing TIINGO_API_TOKEN");
+    const tickers=fx.map(toTiingoSymbol).filter(Boolean);
+    if(!tickers.length)return 0;
+    const url=new URL("https://api.tiingo.com/tiingo/fx/top");
+    url.searchParams.set("tickers",tickers.join(","));
+    const res=await fetch(url.toString(),{headers:{accept:"application/json",authorization:`Token ${key}`}});
+    const data=await res.json().catch(()=>null);
+    if(!res.ok||!Array.isArray(data))throw new Error(String(data?.detail||data?.message||`Tiingo top request failed (${res.status})`));
+    let pushed=0;
+    for(const q of data){
+      const symbol=fromTiingoSymbol(q?.ticker);
+      const t=Date.parse(String(q?.quoteTimestamp||q?.timestamp||""));
+      const bid=Number(q?.bidPrice), ask=Number(q?.askPrice), mid=Number(q?.midPrice);
+      const p=Number.isFinite(mid)?mid:(Number.isFinite(bid)&&Number.isFinite(ask)?(bid+ask)/2:NaN);
+      if(symbol&&Number.isFinite(t)&&Number.isFinite(p)){
+        this.pushTick(symbol,t,p,bid,ask);
+        pushed++;
+      }
+    }
+    return pushed;
+  }
+
+  async closeFeeds(reason="free-tier sleep"){
+    try{if(this.ws){try{this.ws.close(1000,reason);}catch(_){}}}catch(_){}
+    try{if(this.cryptoWs){try{this.cryptoWs.close(1000,reason);}catch(_){}}}catch(_){}
+    this.ws=null; this.cryptoWs=null; this.connecting=false; this.cryptoConnecting=false;
+    this.lastStatus="sleeping";
+    this.lastCryptoStatus="sleeping";
+    return {ok:true,status:"sleeping"};
   }
 
   async sendTrackedResult(chatId,text){
@@ -800,30 +839,16 @@ export class TickHub extends DurableObject {
 
   async alarm(){
     try{
-      await this.ensureSocket();
-      await this.ensureCryptoSocket();
-
-      if(this.ws&&this.ws.readyState===1){
-        const msgAge=this.lastWsMessageAt?((Date.now()-this.lastWsMessageAt)/1000):Infinity;
-        if(msgAge>45) await this.forceReconnect("no FX websocket messages for >45s");
-      }else{
-        await this.forceReconnect("FX socket not open");
-      }
-
-      if([...this.symbols].some(isCryptoSymbol)){
-        if(this.cryptoWs&&this.cryptoWs.readyState===1){
-          const msgAge=this.lastCryptoWsMessageAt?((Date.now()-this.lastCryptoWsMessageAt)/1000):Infinity;
-          if(msgAge>45) await this.forceCryptoReconnect("no crypto websocket messages for >45s");
-        }else{
-          await this.forceCryptoReconnect("crypto socket not open");
-        }
-      }
-
+      const now=Date.now();
+      const due=this.pendingSignals.filter(x=>Number(x.expiresAt||0)<=now+2000).map(x=>x.symbol);
+      if(due.length)await this.fetchTopSnapshots(due);
       await this.settlePendingSignals();
     }catch(e){
       this.lastStatus=`alarm error: ${String(e?.message||e)}`;
+    }finally{
+      await this.closeFeeds("alarm complete");
+      await this.scheduleAlarm();
     }
-    await this.scheduleAlarm();
   }
 
   async forceReconnect(reason="manual reconnect"){
@@ -1627,6 +1652,8 @@ export class TickHub extends DurableObject {
     async fetch(req){
     const u=new URL(req.url), symbol=normalizeSymbol(u.searchParams.get("symbol")||"");
 
+    if(u.pathname==="/sleep")return json(await this.closeFeeds("request complete"));
+
     if(u.pathname==="/reconnect"){
       await this.forceReconnect("requested");
       await this.forceCryptoReconnect("requested");
@@ -1910,37 +1937,39 @@ async function issueAgradeSignal(env,chatIds,candidate,sourceUpdateId="auto",aut
 }
 
 async function autoScanAndAlert(env){
-  const chatState=await hub(env,"/chats");
-  const chats=Array.isArray(chatState?.chats)?chatState.chats:[];
-  if(!chats.length)return {ok:false,reason:"no registered chat"};
+  try{
+    const chatState=await hub(env,"/chats");
+    const chats=Array.isArray(chatState?.chats)?chatState.chats:[];
+    if(!chats.length)return {ok:false,reason:"no registered chat"};
 
-  const risk=await hub(env,"/risk");
-  if(!risk.ok)return {ok:false,reason:risk.reason||"risk gate"};
+    const risk=await hub(env,"/risk");
+    if(!risk.ok)return {ok:false,reason:risk.reason||"risk gate"};
 
-  const scan=await scanUniverse(env);
+    const scan=await scanUniverse(env);
 
-  // READY warnings are always delivered before any final signal from this scan.
-  // Process every newly-qualified PREPARE setup; Durable-Object claims prevent
-  // duplicate warnings across cron retries.
-  const readySent=[];
-  if(Array.isArray(scan.preAlerts)&&scan.preAlerts.length){
-    for(const candidate of scan.preAlerts){
-      const ready=await issueReadyAlert(env,chats,candidate);
-      if(ready.ok)readySent.push(ready);
+    // READY warnings are always delivered before any final signal from this scan.
+    const readySent=[];
+    if(Array.isArray(scan.preAlerts)&&scan.preAlerts.length){
+      for(const candidate of scan.preAlerts){
+        const ready=await issueReadyAlert(env,chats,candidate);
+        if(ready.ok)readySent.push(ready);
+      }
     }
-  }
 
-  if(scan.ok){
-    const minuteKey=Math.floor(Date.now()/60000);
-    const signal=await issueAgradeSignal(env,chats,scan.best,`auto-${minuteKey}-${scan.best.symbol}`,true);
-    return {...signal,readyAlertsSent:readySent.length};
-  }
+    if(scan.ok){
+      const minuteKey=Math.floor(Date.now()/60000);
+      const signal=await issueAgradeSignal(env,chats,scan.best,`auto-${minuteKey}-${scan.best.symbol}`,true);
+      return {...signal,readyAlertsSent:readySent.length};
+    }
 
-  if(readySent.length){
-    return {ok:true,ready:true,readyAlertsSent:readySent.length,symbols:readySent.map(x=>x.symbol)};
-  }
+    if(readySent.length){
+      return {ok:true,ready:true,readyAlertsSent:readySent.length,symbols:readySent.map(x=>x.symbol)};
+    }
 
-  return {ok:false,reason:scan.reason||"no fully qualified setup"};
+    return {ok:false,reason:scan.reason||"no fully qualified setup"};
+  }finally{
+    try{await hub(env,"/sleep");}catch(_){}
+  }
 }
 
 
@@ -2196,6 +2225,8 @@ export default {
         try{
           await tgSend(env,chatId,`BOT RUNTIME ERROR\n${String(e?.message||e).slice(0,350)}\n\nThe webhook itself acknowledged this update, so Telegram will not remain blocked.`);
         }catch(_){}
+      }finally{
+        try{await hub(env,"/sleep");}catch(_){}
       }
     })());
     return new Response("ok");
