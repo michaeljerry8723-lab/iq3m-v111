@@ -1,6 +1,6 @@
 {
-  "name": "iq3m-predictor-v13-ready-alert",
-  "version": "13.0.1",
+  "name": "iq3m-predictor-v13-1-ready-alert",
+  "version": "13.1.0-two-minute-ready-alert",
   "private": true,
   "type": "module",
   "scripts": {
