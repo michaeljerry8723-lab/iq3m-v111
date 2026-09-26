@@ -1,13 +1,13 @@
 // V13.1 — two-minute automatic sniper with persistent READY pre-alerts
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "13.1.0-two-minute-ready-alert";
+const VERSION = "13.1.1-ready-guarantee";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set();
 const A_GRADE_MIN_QUALITY = 0.90;
 const EXPIRY_SECONDS = 120;
-const STRATEGY_ID = "v13.1-two-minute-ready-alert";
+const STRATEGY_ID = "v13.1.1-two-minute-ready-guarantee";
 const PREPARE_TTL_MS = 5*60*1000;
 const GLOBAL_SIGNAL_COOLDOWN_MS = 0;
 const PAIR_SIGNAL_COOLDOWN_MS = 8*60*1000;
@@ -1322,9 +1322,35 @@ export class TickHub extends DurableObject {
       }
 
       const final=score2m(arr,bars1m,symbol);
+
+      // Hard READY-before-signal guarantee. A setup may satisfy the final filters
+      // while its warning is still waiting to be delivered. Keep it in PREPARE
+      // until /claim-ready has persisted readyAlertAt.
+      if(!phase.readyAlertAt){
+        return {
+          ...final,
+          ok:false,
+          grade:"NO TRADE",
+          symbol,
+          setupStage:"PREPARE",
+          setupDirection:phase.direction,
+          setupCandleT:phase.setupCandleT,
+          readyKey:phase.readyKey,
+          preAlert:true,
+          preScore:pre.preScore,
+          ticks:arr.length,
+          receiveAgeSeconds:receiveAge,
+          marketAgeSeconds:marketAge,
+          status,
+          reason:final.ok
+            ? "final conditions met — READY alert must be delivered before entry"
+            : (final.reason||"waiting for final continuation/timing confirmation")
+        };
+      }
+
       if(!final.ok){
         return {...final,symbol,setupStage:"PREPARE",setupDirection:phase.direction,
-          setupCandleT:phase.setupCandleT,readyKey:phase.readyKey,preAlert:!phase.readyAlertAt,
+          setupCandleT:phase.setupCandleT,readyKey:phase.readyKey,preAlert:false,
           preScore:pre.preScore,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status};
       }
       phase=await this.setSetupStage(symbol,{...phase,stage:"READY",readyBarT:Number(bars1m.at(-1)?.t||0),updatedAt:Date.now()});
@@ -1366,7 +1392,8 @@ export class TickHub extends DurableObject {
       };
     }
 
-    return {...x,symbol,setupStage:phase.stage,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
+    return {...x,symbol,setupStage:phase.stage,readyAlertAt:Number(phase.readyAlertAt||0),
+      ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,
       status,reconnectCount:this.reconnectCount,generatedAt:Date.now()};
   }
 
@@ -1751,8 +1778,25 @@ async function issueReadyAlert(env,chatIds,candidate){
     `${candidate.symbol} setup developing\n`+
     `Prepare for a possible 2-minute signal.`;
 
-  for(const chat of chats) await tgSend(env,chat,msg);
-  return {ok:true,symbol:candidate.symbol,preScore:candidate.preScore};
+  let delivered=0;
+  for(const chat of chats){
+    try{
+      await tgSend(env,chat,msg);
+      delivered++;
+    }catch(e){
+      console.error("READY alert delivery failed",candidate.symbol,String(e?.message||e));
+    }
+  }
+
+  // The claim is written before Telegram delivery to prevent duplicate warnings.
+  // If delivery failed everywhere, cancel the setup so no unseen READY can ever
+  // be followed by a final trading signal.
+  if(!delivered){
+    await hubPost(env,"/ready-outcome",{symbol:candidate.symbol,outcome:"CANCELLED"});
+    return {ok:false,reason:"READY alert could not be delivered; setup cancelled"};
+  }
+
+  return {ok:true,symbol:candidate.symbol,preScore:candidate.preScore,delivered};
 }
 
 
@@ -1765,6 +1809,10 @@ async function issueAgradeSignal(env,chatIds,candidate,sourceUpdateId="auto",aut
   if(!result.ok||result.grade!=="A"||result.direction!==candidate.direction||Number(result.quality)<A_GRADE_MIN_QUALITY){
     await hubPost(env,"/ready-outcome",{symbol,outcome:"CANCELLED"});
     return {ok:false,reason:"setup changed during final check"};
+  }
+  if(!(Number(result.readyAlertAt)>0)){
+    await hubPost(env,"/ready-outcome",{symbol,outcome:"CANCELLED"});
+    return {ok:false,reason:"READY warning was not confirmed before final signal"};
   }
 
   const quoteBefore=await hub(env,`/quote?symbol=${encodeURIComponent(symbol)}`);
@@ -1833,17 +1881,25 @@ async function autoScanAndAlert(env){
 
   const scan=await scanUniverse(env);
 
-  // A finalized signal takes priority over any preliminary warning.
-  if(scan.ok){
-    const minuteKey=Math.floor(Date.now()/60000);
-    return await issueAgradeSignal(env,chats,scan.best,`auto-${minuteKey}-${scan.best.symbol}`,true);
+  // READY warnings are always delivered before any final signal from this scan.
+  // Process every newly-qualified PREPARE setup; Durable-Object claims prevent
+  // duplicate warnings across cron retries.
+  const readySent=[];
+  if(Array.isArray(scan.preAlerts)&&scan.preAlerts.length){
+    for(const candidate of scan.preAlerts){
+      const ready=await issueReadyAlert(env,chats,candidate);
+      if(ready.ok)readySent.push(ready);
+    }
   }
 
-  // Otherwise warn the user once when the strongest setup has reached the
-  // pullback stage and passes the preliminary quality checks.
-  if(Array.isArray(scan.preAlerts)&&scan.preAlerts.length){
-    const ready=await issueReadyAlert(env,chats,scan.preAlerts[0]);
-    if(ready.ok)return {ok:true,ready:true,...ready};
+  if(scan.ok){
+    const minuteKey=Math.floor(Date.now()/60000);
+    const signal=await issueAgradeSignal(env,chats,scan.best,`auto-${minuteKey}-${scan.best.symbol}`,true);
+    return {...signal,readyAlertsSent:readySent.length};
+  }
+
+  if(readySent.length){
+    return {ok:true,ready:true,readyAlertsSent:readySent.length,symbols:readySent.map(x=>x.symbol)};
   }
 
   return {ok:false,reason:scan.reason||"no fully qualified setup"};
@@ -1900,7 +1956,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V13.1.0 two-minute auto sniper with READY pre-alert",{status:200});
+    if(request.method!=="POST")return new Response("V13.1.1 two-minute auto sniper with guaranteed READY-before-signal flow",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -1912,7 +1968,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V13.1.0 — TWO-MINUTE AUTO SNIPER. Automatic scanning runs every minute. A structurally valid pullback enters PREPARE and sends one READY 🔥🔥 warning. No trade should be taken from that warning. The normal 2-minute signal is sent only if fresh 1m continuation, 30-second timing, live-tick flow and every final filter subsequently pass."
+        "V13.1.1 — TWO-MINUTE AUTO SNIPER. Automatic scanning runs every minute. A structurally valid pullback enters PREPARE and must successfully deliver one READY 🔥🔥 warning before it can advance to a final entry. No trade should be taken from READY alone. The normal 2-minute signal is sent only if the later 1m continuation, 30-second timing, live-tick flow and every final filter pass."
       );
       return new Response("ok");
     }
