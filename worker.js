@@ -2000,8 +2000,11 @@ export default {
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
     const update=await request.json(); const msg=update.message||update.edited_message; if(!msg?.chat?.id)return new Response("ok");
     const chatId=msg.chat.id, text=String(msg.text||"").trim();
-    await hubPost(env,"/register-chat",{chatId});
+    // Lightweight commands must not enter the Durable Object. This keeps Telegram
+    // responsive even when the market-feed object has exhausted its free-tier duration.
     if(/^\/version$/i.test(text)){await tgSend(env,chatId,VERSION);return new Response("ok");}
+    if(/^\/ping$/i.test(text)){await tgSend(env,chatId,"PONG — webhook and Telegram delivery are healthy.");return new Response("ok");}
+    await hubPost(env,"/register-chat",{chatId});
     if(/^\/start$/i.test(text)){
       await tgSend(
         env,
