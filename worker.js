@@ -1,7 +1,7 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "13.0.0-two-minute-auto-sniper";
+const VERSION = "13.0.1-ready-alert";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set();
@@ -567,12 +567,86 @@ function score2m(ticks,bars1m,symbol){
   };
 }
 
+function preAlert2m(ticks,bars1m,symbol,direction){
+  if(!["CALL","PUT"].includes(direction))return {ok:false};
+
+  const sma=smaTrendSnapshot(bars1m,5,13);
+  const atr=atrSnapshot(bars1m,14);
+  const macd=macdSnapshot(bars1m,5,13,4);
+  const rsi=rsiSnapshot(bars1m,7);
+  const dmi=dmiAdxSnapshot(bars1m,7);
+  const b15=completedAggregate(bars1m,900);
+  const reg15=trendRegime(b15,3,8,0.18);
+
+  if(!sma.ready||!atr.ready||!macd.ready||!rsi.ready||!dmi.ready)return {ok:false};
+
+  const last=Number(ticks.at(-1)?.p);
+  if(!Number.isFinite(last)||!(atr.atr>0))return {ok:false};
+
+  const spread=spreadQualitySnapshot(symbol,ticks,last,atr.atr);
+  if(spread.abnormal)return {ok:false};
+
+  if(reg15.ready&&reg15.direction!=="NEUTRAL"&&reg15.direction!==direction&&reg15.efficiency>=0.30){
+    return {ok:false};
+  }
+
+  const stack=direction==="CALL"?sma.fast>sma.slow:sma.fast<sma.slow;
+  const slope=direction==="CALL"?sma.fastSlope>=0:sma.fastSlope<=0;
+  if(!stack||!slope)return {ok:false};
+
+  const dmiGap=Math.abs(Number(dmi.plusDI)-Number(dmi.minusDI));
+  const dmiAligned=direction==="CALL"?dmi.plusDI>dmi.minusDI:dmi.minusDI>dmi.plusDI;
+  if(!dmiAligned||dmi.adx<17||dmiGap<3)return {ok:false};
+
+  const macdAligned=direction==="CALL"
+    ? macd.macd>macd.signal
+    : macd.macd<macd.signal;
+  if(!macdAligned)return {ok:false};
+
+  const rsiOkay=direction==="CALL"
+    ? (rsi.rsi>=48&&rsi.rsi<=72)
+    : (rsi.rsi>=28&&rsi.rsi<=52);
+  if(!rsiOkay)return {ok:false};
+
+  const distanceFast=Math.abs(last-sma.fast)/atr.atr;
+  if(distanceFast>0.85)return {ok:false};
+
+  const room=roomToMoveSnapshot(bars1m,last,direction,atr.atr);
+  if(!room.ready||room.roomAtr<0.85)return {ok:false};
+
+  const imp=tickImpulse(ticks);
+  if(imp.ready){
+    const strongOpp=direction==="CALL"
+      ? (imp.downRatio>=0.68&&imp.norm<0)
+      : (imp.upRatio>=0.68&&imp.norm>0);
+    if(strongOpp)return {ok:false};
+  }
+
+  const preScore=clamp(
+    0.82 +
+    Math.min(Math.max(dmi.adx-17,0),15)/15*0.035 +
+    Math.min(Math.max(room.roomAtr-0.85,0),0.75)/0.75*0.025 +
+    (reg15.ready&&reg15.direction===direction?0.020:0) +
+    (distanceFast<=0.55?0.015:0),
+    0.82,0.92
+  );
+
+  return {
+    ok:preScore>=0.86,
+    preScore,
+    direction,
+    adx:dmi.adx,
+    roomAtr:room.roomAtr,
+    distanceFastAtr:distanceFast
+  };
+}
+
 export class TickHub extends DurableObject {
   constructor(ctx,env){
     super(ctx,env);
     this.ctx=ctx; this.env=env; this.ws=null; this.cryptoWs=null; this.ticks=new Map(); this.symbols=new Set();
     this.lastStatus="starting"; this.lastSubscribeStatus=null; this.connecting=false; this.cryptoConnecting=false; this.provider="tiingo"; this.lastCryptoStatus="starting"; this.lastCryptoSubscribeStatus=null; this.lastCryptoWsMessageAt=0;
-    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map(); this.quotaBlockedUntil=0; this.pendingSignals=[]; this.signalStats={total:0,wins:0,losses:0,draws:0,voids:0}; this.signalHistory=[]; this.alertChats=[]; this.setupStates={};
+    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map(); this.quotaBlockedUntil=0; this.pendingSignals=[]; this.signalStats={total:0,wins:0,losses:0,draws:0,voids:0}; this.signalHistory=[]; this.alertChats=[]; this.setupStates={}; this.readyAlertClaims={};
 
     this.ctx.blockConcurrencyWhile(async()=>{
       // V11.2: prefer the configured warm list over old persisted symbols so a Basic/trial
@@ -590,10 +664,13 @@ export class TickHub extends DurableObject {
       this.signalHistory=(await this.ctx.storage.get("signalHistory"))||[];
       this.alertChats=(await this.ctx.storage.get("alertChats"))||[];
       this.setupStates=(await this.ctx.storage.get("setupStates"))||{};
+      this.readyAlertClaims=(await this.ctx.storage.get("readyAlertClaims"))||{};
       const setupStateStrategyId=String((await this.ctx.storage.get("setupStateStrategyId"))||"");
       if(setupStateStrategyId!==STRATEGY_ID){
         this.setupStates={};
+        this.readyAlertClaims={};
         await this.ctx.storage.put("setupStates",this.setupStates);
+        await this.ctx.storage.put("readyAlertClaims",this.readyAlertClaims);
         await this.ctx.storage.put("setupStateStrategyId",STRATEGY_ID);
       }
       if(!this.alertChats.length){
@@ -1185,8 +1262,15 @@ export class TickHub extends DurableObject {
         : phase.stage==="ARMED"
           ? "trend armed — waiting for the next pullback into the SMA zone"
           : "pullback recorded — waiting for a fresh 1m continuation";
+
+      let pre=null;
+      if(phase.stage==="PULLBACK"){
+        pre=preAlert2m(arr,bars1m,symbol,phase.direction);
+      }
+
       return {
         ok:false,grade:"NO TRADE",symbol,setupStage:phase.stage,setupDirection:phase.direction,
+        preAlert:Boolean(pre?.ok),preScore:pre?.preScore??null,
         ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status,
         reason:phaseReason
       };
@@ -1335,6 +1419,29 @@ export class TickHub extends DurableObject {
     return {ok:true,chats:[...this.alertChats]};
   }
 
+  async claimReadyAlert(req){
+    const body=await req.json();
+    const symbol=normalizeSymbol(body?.symbol);
+    const direction=String(body?.direction||"").toUpperCase();
+    if(!symbol||!["CALL","PUT"].includes(direction))return {ok:false,error:"invalid ready-alert claim"};
+
+    const now=Date.now();
+    const ttl=10*60*1000;
+    for(const [k,v] of Object.entries(this.readyAlertClaims||{})){
+      if(now-Number(v||0)>ttl)delete this.readyAlertClaims[k];
+    }
+
+    const key=`${symbol}|${direction}`;
+    const last=Number(this.readyAlertClaims[key]||0);
+    if(last&&now-last<ttl){
+      return {ok:true,claimed:false,retrySeconds:Math.ceil((ttl-(now-last))/1000)};
+    }
+
+    this.readyAlertClaims[key]=now;
+    await this.ctx.storage.put("readyAlertClaims",this.readyAlertClaims);
+    return {ok:true,claimed:true,key};
+  }
+
   async getTrackingStats(){
     const current=this.signalHistory.filter(x=>this.isCurrentStrategyRecord(x));
     const wins=current.filter(x=>x.result==="WIN").length;
@@ -1391,6 +1498,7 @@ export class TickHub extends DurableObject {
     }
     if(u.pathname==="/risk")return json(this.getRiskGate());
     if(u.pathname==="/register-chat"&&req.method==="POST")return json(await this.registerAlertChat(req));
+    if(u.pathname==="/claim-ready"&&req.method==="POST")return json(await this.claimReadyAlert(req));
     if(u.pathname==="/chats")return json(await this.getAlertChats());
     if(u.pathname==="/track"&&req.method==="POST")return json(await this.trackSignal(req));
     if(u.pathname==="/stats")return json(await this.getTrackingStats());
