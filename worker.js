@@ -1,13 +1,14 @@
-// V11.1 — 15-second tick sniper with Cloudflare Durable Object
+// V13.1 — two-minute automatic sniper with persistent READY pre-alerts
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "13.0.1-ready-alert";
+const VERSION = "13.1.0-two-minute-ready-alert";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set();
 const A_GRADE_MIN_QUALITY = 0.90;
 const EXPIRY_SECONDS = 120;
-const STRATEGY_ID = "v13-two-minute-auto-sniper";
+const STRATEGY_ID = "v13.1-two-minute-ready-alert";
+const PREPARE_TTL_MS = 5*60*1000;
 const GLOBAL_SIGNAL_COOLDOWN_MS = 0;
 const PAIR_SIGNAL_COOLDOWN_MS = 8*60*1000;
 const LOSS_CIRCUIT_BREAKER_MS = 20*60*1000;
@@ -570,21 +571,37 @@ function score2m(ticks,bars1m,symbol){
 function preAlert2m(ticks,bars1m,symbol,direction){
   if(!["CALL","PUT"].includes(direction))return {ok:false};
 
+  const sequence=setupSequenceSnapshot(bars1m);
+  if(!sequence.ready||sequence.direction!==direction||!sequence.structureOk||!sequence.pullbackSeen){
+    return {ok:false,reason:"valid SMA-zone pullback is no longer present"};
+  }
+
   const sma=smaTrendSnapshot(bars1m,5,13);
   const atr=atrSnapshot(bars1m,14);
-  const macd=macdSnapshot(bars1m,5,13,4);
-  const rsi=rsiSnapshot(bars1m,7);
   const dmi=dmiAdxSnapshot(bars1m,7);
+  const fr=fractalSnapshot(bars1m,2);
+  const b5=completedAggregate(bars1m,300);
+  const reg5=trendRegime(b5,5,13,0.20);
   const b15=completedAggregate(bars1m,900);
   const reg15=trendRegime(b15,3,8,0.18);
 
-  if(!sma.ready||!atr.ready||!macd.ready||!rsi.ready||!dmi.ready)return {ok:false};
+  if(!sma.ready||!atr.ready||!fr.ready||!dmi.ready||!reg5.ready)return {ok:false,reason:"prepare context is still building"};
 
   const last=Number(ticks.at(-1)?.p);
-  if(!Number.isFinite(last)||!(atr.atr>0))return {ok:false};
+  if(!Number.isFinite(last)||!(atr.atr>0))return {ok:false,reason:"invalid live price or volatility"};
+
+  const atrRatio=atr.atr/last;
+  if(atrRatio<0.000008||atrRatio>0.0028)return {ok:false,reason:"volatility left the acceptable range"};
+  if(reg5.direction!==direction)return {ok:false,reason:"completed 5m direction changed"};
+  const structureOk=direction==="CALL"
+    ? (!fr.lastLow||last>Number(fr.lastLow.price))
+    : (!fr.lastHigh||last<Number(fr.lastHigh.price));
+  if(!structureOk)return {ok:false,reason:"Fractal structure failed"};
 
   const spread=spreadQualitySnapshot(symbol,ticks,last,atr.atr);
-  if(spread.abnormal)return {ok:false};
+  if(!spread.ready||spread.abnormal||(Number.isFinite(spread.spreadAtrRatio)&&spread.spreadAtrRatio>0.35&&Number(spread.spreadBps)>0.80)){
+    return {ok:false,reason:"spread became abnormal"};
+  }
 
   if(reg15.ready&&reg15.direction!=="NEUTRAL"&&reg15.direction!==direction&&reg15.efficiency>=0.30){
     return {ok:false};
@@ -592,43 +609,33 @@ function preAlert2m(ticks,bars1m,symbol,direction){
 
   const stack=direction==="CALL"?sma.fast>sma.slow:sma.fast<sma.slow;
   const slope=direction==="CALL"?sma.fastSlope>=0:sma.fastSlope<=0;
-  if(!stack||!slope)return {ok:false};
+  if(!stack||!slope)return {ok:false,reason:"SMA structure lost"};
 
   const dmiGap=Math.abs(Number(dmi.plusDI)-Number(dmi.minusDI));
   const dmiAligned=direction==="CALL"?dmi.plusDI>dmi.minusDI:dmi.minusDI>dmi.plusDI;
-  if(!dmiAligned||dmi.adx<17||dmiGap<3)return {ok:false};
-
-  const macdAligned=direction==="CALL"
-    ? macd.macd>macd.signal
-    : macd.macd<macd.signal;
-  if(!macdAligned)return {ok:false};
-
-  const rsiOkay=direction==="CALL"
-    ? (rsi.rsi>=48&&rsi.rsi<=72)
-    : (rsi.rsi>=28&&rsi.rsi<=52);
-  if(!rsiOkay)return {ok:false};
+  if(!dmiAligned||dmi.adx<20||dmiGap<4)return {ok:false,reason:"ADX/DMI strength faded"};
 
   const distanceFast=Math.abs(last-sma.fast)/atr.atr;
-  if(distanceFast>0.85)return {ok:false};
+  if(distanceFast>0.68)return {ok:false,reason:"price left the SMA 5/13 setup zone"};
 
   const room=roomToMoveSnapshot(bars1m,last,direction,atr.atr);
-  if(!room.ready||room.roomAtr<0.85)return {ok:false};
+  if(!room.ready||room.roomAtr<0.85)return {ok:false,reason:"room-to-move is no longer adequate"};
 
   const imp=tickImpulse(ticks);
   if(imp.ready){
     const strongOpp=direction==="CALL"
       ? (imp.downRatio>=0.68&&imp.norm<0)
       : (imp.upRatio>=0.68&&imp.norm>0);
-    if(strongOpp)return {ok:false};
+    if(strongOpp)return {ok:false,reason:"live ticks reversed against the setup"};
   }
 
   const preScore=clamp(
-    0.82 +
-    Math.min(Math.max(dmi.adx-17,0),15)/15*0.035 +
+    0.84 +
+    Math.min(Math.max(dmi.adx-20,0),15)/15*0.035 +
     Math.min(Math.max(room.roomAtr-0.85,0),0.75)/0.75*0.025 +
     (reg15.ready&&reg15.direction===direction?0.020:0) +
     (distanceFast<=0.55?0.015:0),
-    0.82,0.92
+    0.84,0.94
   );
 
   return {
@@ -637,7 +644,10 @@ function preAlert2m(ticks,bars1m,symbol,direction){
     direction,
     adx:dmi.adx,
     roomAtr:room.roomAtr,
-    distanceFastAtr:distanceFast
+    distanceFastAtr:distanceFast,
+    atrRatio,
+    spreadAtrRatio:spread.spreadAtrRatio,
+    spreadBps:spread.spreadBps
   };
 }
 
@@ -646,7 +656,7 @@ export class TickHub extends DurableObject {
     super(ctx,env);
     this.ctx=ctx; this.env=env; this.ws=null; this.cryptoWs=null; this.ticks=new Map(); this.symbols=new Set();
     this.lastStatus="starting"; this.lastSubscribeStatus=null; this.connecting=false; this.cryptoConnecting=false; this.provider="tiingo"; this.lastCryptoStatus="starting"; this.lastCryptoSubscribeStatus=null; this.lastCryptoWsMessageAt=0;
-    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map(); this.quotaBlockedUntil=0; this.pendingSignals=[]; this.signalStats={total:0,wins:0,losses:0,draws:0,voids:0}; this.signalHistory=[]; this.alertChats=[]; this.setupStates={}; this.readyAlertClaims={};
+    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map(); this.quotaBlockedUntil=0; this.pendingSignals=[]; this.signalStats={total:0,wins:0,losses:0,draws:0,voids:0}; this.signalHistory=[]; this.alertChats=[]; this.setupStates={}; this.readyAlertClaims={}; this.readyAudit=[];
 
     this.ctx.blockConcurrencyWhile(async()=>{
       // V11.2: prefer the configured warm list over old persisted symbols so a Basic/trial
@@ -665,12 +675,15 @@ export class TickHub extends DurableObject {
       this.alertChats=(await this.ctx.storage.get("alertChats"))||[];
       this.setupStates=(await this.ctx.storage.get("setupStates"))||{};
       this.readyAlertClaims=(await this.ctx.storage.get("readyAlertClaims"))||{};
+      this.readyAudit=(await this.ctx.storage.get("readyAudit"))||[];
       const setupStateStrategyId=String((await this.ctx.storage.get("setupStateStrategyId"))||"");
       if(setupStateStrategyId!==STRATEGY_ID){
         this.setupStates={};
         this.readyAlertClaims={};
         await this.ctx.storage.put("setupStates",this.setupStates);
         await this.ctx.storage.put("readyAlertClaims",this.readyAlertClaims);
+        this.readyAudit=[];
+        await this.ctx.storage.put("readyAudit",this.readyAudit);
         await this.ctx.storage.put("setupStateStrategyId",STRATEGY_ID);
       }
       if(!this.alertChats.length){
@@ -1156,12 +1169,23 @@ export class TickHub extends DurableObject {
     };
 
     if(!snap.ready||snap.direction==="NEUTRAL"||!snap.structureOk){
+      if(st.stage==="PREPARE"||st.stage==="READY")await this.finishReadyAudit(st.readyKey,snap.ready?"CANCELLED":"EXPIRED",now);
       const next={stage:"SEEK",direction:null,lastBarT:Number(snap.barT||0),updatedAt:now};
       if(st.stage!=="SEEK"||st.direction||Number(st.lastBarT)!==Number(next.lastBarT))await save(next);
       return {...next,snapshot:snap};
     }
 
     if(st.direction!==snap.direction||now-Number(st.updatedAt||0)>35*60*1000){
+      if(st.stage==="PREPARE"||st.stage==="READY")await this.finishReadyAudit(st.readyKey,st.direction!==snap.direction?"CANCELLED":"EXPIRED",now);
+      const next={stage:"ARMED",direction:snap.direction,lastBarT:snap.barT,updatedAt:now};
+      await save(next);
+      return {...next,snapshot:snap};
+    }
+
+    // Expiry is wall-clock based, so a stalled/repeated completed candle cannot
+    // keep a warned setup alive indefinitely.
+    if((st.stage==="PREPARE"||st.stage==="READY")&&now-Number(st.prepareAt||st.updatedAt||0)>PREPARE_TTL_MS){
+      await this.finishReadyAudit(st.readyKey,"EXPIRED",now);
       const next={stage:"ARMED",direction:snap.direction,lastBarT:snap.barT,updatedAt:now};
       await save(next);
       return {...next,snapshot:snap};
@@ -1176,23 +1200,38 @@ export class TickHub extends DurableObject {
     let next={...st,lastBarT:snap.barT,updatedAt:now};
     if(st.stage==="SEEK"){
       next={stage:"ARMED",direction:snap.direction,lastBarT:snap.barT,updatedAt:now};
-    }else if(st.stage==="ARMED"&&snap.pullbackBeforeLast&&snap.resumed){
-      // The pullback occurred on an earlier completed candle and the newest candle
-      // has already resumed. That is a valid sequence, so do not wait an extra minute.
-      next={stage:"READY",direction:snap.direction,lastBarT:snap.barT,readyBarT:snap.barT,updatedAt:now};
     }else if(st.stage==="ARMED"&&snap.pullbackSeen){
       next={stage:"PULLBACK",direction:snap.direction,lastBarT:snap.barT,updatedAt:now};
-    }else if(st.stage==="PULLBACK"&&snap.resumed){
-      next={stage:"READY",direction:snap.direction,lastBarT:snap.barT,readyBarT:snap.barT,updatedAt:now};
     }else if(st.stage==="READY"){
       const ageBars=Math.max(0,(Number(snap.barT)-Number(st.readyBarT||st.lastBarT))/60000);
       if(ageBars>1){
+        await this.finishReadyAudit(st.readyKey,"EXPIRED",now);
         next={stage:"ARMED",direction:snap.direction,lastBarT:snap.barT,updatedAt:now};
       }
     }
 
     if(JSON.stringify(next)!==JSON.stringify(st))await save(next);
     return {...next,snapshot:snap};
+  }
+
+  async setSetupStage(symbol,next){
+    this.setupStates[symbol]=next;
+    await this.ctx.storage.put("setupStates",this.setupStates);
+    return next;
+  }
+
+  async finishReadyAudit(key,outcome,at=Date.now()){
+    if(!key)return;
+    const row=this.readyAudit.find(x=>x.key===key&&!x.outcome);
+    if(!row)return;
+    row.outcome=outcome;
+    row.eventualState=outcome;
+    row.outcomeAt=at;
+    row.signalAt=outcome==="SIGNALLED"?at:null;
+    row.timeToSignalMs=outcome==="SIGNALLED"?Math.max(0,at-Number(row.readyAlertAt||at)):null;
+    row.timeToSignalSeconds=Number.isFinite(row.timeToSignalMs)?row.timeToSignalMs/1000:null;
+    await this.ctx.storage.put("readyAudit",this.readyAudit);
+    console.log(JSON.stringify({event:"ready-alert-outcome",...row}));
   }
 
   exposureConflict(symbol,direction){
@@ -1255,7 +1294,42 @@ export class TickHub extends DurableObject {
         status,reason:`1m context unavailable: ${String(e?.message||e)}`};
     }
 
-    const phase=await this.advanceSetupState(symbol,bars1m);
+    let phase=await this.advanceSetupState(symbol,bars1m);
+    if(phase.stage==="PULLBACK"){
+      const pre=preAlert2m(arr,bars1m,symbol,phase.direction);
+      if(pre.ok){
+        const readyKey=`${symbol}|${phase.direction}|${Number(phase.lastBarT)}`;
+        phase=await this.setSetupStage(symbol,{
+          stage:"PREPARE",direction:phase.direction,lastBarT:phase.lastBarT,
+          setupCandleT:Number(phase.lastBarT),prepareAt:Date.now(),readyKey,updatedAt:Date.now()
+        });
+        return {
+          ok:false,grade:"NO TRADE",symbol,setupStage:"PREPARE",setupDirection:phase.direction,
+          setupCandleT:phase.setupCandleT,readyKey,preAlert:true,preScore:pre.preScore,
+          ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status,
+          reason:"setup qualified for PREPARE — waiting only for final continuation/timing confirmation"
+        };
+      }
+    }
+
+    if(phase.stage==="PREPARE"){
+      const pre=preAlert2m(arr,bars1m,symbol,phase.direction);
+      if(!pre.ok){
+        await this.finishReadyAudit(phase.readyKey,"CANCELLED");
+        phase=await this.setSetupStage(symbol,{stage:"SEEK",direction:null,lastBarT:Number(phase.lastBarT||0),updatedAt:Date.now()});
+        return {ok:false,grade:"NO TRADE",symbol,setupStage:"SEEK",ticks:arr.length,
+          receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status,reason:pre.reason||"PREPARE setup cancelled"};
+      }
+
+      const final=score2m(arr,bars1m,symbol);
+      if(!final.ok){
+        return {...final,symbol,setupStage:"PREPARE",setupDirection:phase.direction,
+          setupCandleT:phase.setupCandleT,readyKey:phase.readyKey,preAlert:!phase.readyAlertAt,
+          preScore:pre.preScore,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status};
+      }
+      phase=await this.setSetupStage(symbol,{...phase,stage:"READY",readyBarT:Number(bars1m.at(-1)?.t||0),updatedAt:Date.now()});
+    }
+
     if(phase.stage!=="READY"){
       const phaseReason=phase.stage==="SEEK"
         ? "waiting for a clean completed 5m trend"
@@ -1263,24 +1337,27 @@ export class TickHub extends DurableObject {
           ? "trend armed — waiting for the next pullback into the SMA zone"
           : "pullback recorded — waiting for a fresh 1m continuation";
 
-      let pre=null;
-      if(phase.stage==="PULLBACK"){
-        pre=preAlert2m(arr,bars1m,symbol,phase.direction);
-      }
-
       return {
         ok:false,grade:"NO TRADE",symbol,setupStage:phase.stage,setupDirection:phase.direction,
-        preAlert:Boolean(pre?.ok),preScore:pre?.preScore??null,
+        preAlert:false,preScore:null,
         ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status,
         reason:phaseReason
       };
     }
 
     const x=score2m(arr,bars1m,symbol);
-    if(!x.ok)return {...x,symbol,setupStage:phase.stage,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status};
+    if(!x.ok){
+      if(phase.stage==="READY"){
+        await this.finishReadyAudit(phase.readyKey,"CANCELLED");
+        await this.setSetupStage(symbol,{stage:"SEEK",direction:null,lastBarT:Number(phase.lastBarT||0),updatedAt:Date.now()});
+      }
+      return {...x,symbol,setupStage:phase.stage,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status};
+    }
 
     const conflict=this.exposureConflict(symbol,x.direction);
     if(conflict){
+      await this.finishReadyAudit(phase.readyKey,"CANCELLED");
+      await this.setSetupStage(symbol,{stage:"SEEK",direction:null,lastBarT:Number(phase.lastBarT||0),updatedAt:Date.now()});
       return {
         ok:false,grade:"NO TRADE",symbol,setupStage:phase.stage,
         reason:`correlated ${conflict.side==="USD_LONG"?"USD-long":"USD-short"} exposure already active on ${conflict.withSymbol}`,
@@ -1396,6 +1473,8 @@ export class TickHub extends DurableObject {
     };
     this.pendingSignals.push(sig);
     await this.ctx.storage.put("pendingSignals",this.pendingSignals);
+    const setup=this.setupStates[symbol];
+    if(setup?.readyKey)await this.finishReadyAudit(setup.readyKey,"SIGNALLED",entryAt);
     this.setupStates[symbol]={stage:"SEEK",direction:null,lastBarT:0,updatedAt:Date.now()};
     await this.ctx.storage.put("setupStates",this.setupStates);
     await this.scheduleAlarm();
@@ -1423,15 +1502,21 @@ export class TickHub extends DurableObject {
     const body=await req.json();
     const symbol=normalizeSymbol(body?.symbol);
     const direction=String(body?.direction||"").toUpperCase();
-    if(!symbol||!["CALL","PUT"].includes(direction))return {ok:false,error:"invalid ready-alert claim"};
+    const setupCandleT=Number(body?.setupCandleT);
+    const requestedKey=String(body?.readyKey||"");
+    if(!symbol||!["CALL","PUT"].includes(direction)||!Number.isFinite(setupCandleT))return {ok:false,error:"invalid ready-alert claim"};
 
     const now=Date.now();
-    const ttl=10*60*1000;
+    const ttl=PREPARE_TTL_MS;
     for(const [k,v] of Object.entries(this.readyAlertClaims||{})){
       if(now-Number(v||0)>ttl)delete this.readyAlertClaims[k];
     }
 
-    const key=`${symbol}|${direction}`;
+    const key=`${symbol}|${direction}|${setupCandleT}`;
+    const setup=this.setupStates[symbol];
+    if(key!==requestedKey||setup?.stage!=="PREPARE"||setup.readyKey!==key){
+      return {ok:false,claimed:false,error:"setup is no longer in PREPARE"};
+    }
     const last=Number(this.readyAlertClaims[key]||0);
     if(last&&now-last<ttl){
       return {ok:true,claimed:false,retrySeconds:Math.ceil((ttl-(now-last))/1000)};
@@ -1439,7 +1524,28 @@ export class TickHub extends DurableObject {
 
     this.readyAlertClaims[key]=now;
     await this.ctx.storage.put("readyAlertClaims",this.readyAlertClaims);
+    setup.readyAlertAt=now;
+    setup.updatedAt=now;
+    await this.setSetupStage(symbol,setup);
+    const audit={
+      key,setupId:key,setupCandleT,readyAlertAt:now,symbol,direction,setupStage:"PREPARE",
+      outcome:null,eventualState:null,outcomeAt:null,signalAt:null,timeToSignalMs:null,timeToSignalSeconds:null
+    };
+    this.readyAudit=[audit,...this.readyAudit.filter(x=>x.key!==key)].slice(0,200);
+    await this.ctx.storage.put("readyAudit",this.readyAudit);
+    console.log(JSON.stringify({event:"ready-alert",...audit}));
     return {ok:true,claimed:true,key};
+  }
+
+  async finishReadySetup(req){
+    const body=await req.json();
+    const symbol=normalizeSymbol(body?.symbol);
+    const outcome=String(body?.outcome||"").toUpperCase();
+    if(!symbol||!["CANCELLED","EXPIRED"].includes(outcome))return {ok:false,error:"invalid READY outcome"};
+    const setup=this.setupStates[symbol];
+    if(setup?.readyKey)await this.finishReadyAudit(setup.readyKey,outcome);
+    await this.setSetupStage(symbol,{stage:"SEEK",direction:null,lastBarT:Number(setup?.lastBarT||0),updatedAt:Date.now()});
+    return {ok:true};
   }
 
   async getTrackingStats(){
@@ -1458,6 +1564,7 @@ export class TickHub extends DurableObject {
       total:current.length,
       wins,losses,draws,voids,pending,winRate,
       recent:current.slice(0,5),
+      readyAudit:this.readyAudit.slice(0,20),
       allTime:{...this.signalStats}
     };
   }
@@ -1499,6 +1606,7 @@ export class TickHub extends DurableObject {
     if(u.pathname==="/risk")return json(this.getRiskGate());
     if(u.pathname==="/register-chat"&&req.method==="POST")return json(await this.registerAlertChat(req));
     if(u.pathname==="/claim-ready"&&req.method==="POST")return json(await this.claimReadyAlert(req));
+    if(u.pathname==="/ready-outcome"&&req.method==="POST")return json(await this.finishReadySetup(req));
     if(u.pathname==="/chats")return json(await this.getAlertChats());
     if(u.pathname==="/track"&&req.method==="POST")return json(await this.trackSignal(req));
     if(u.pathname==="/stats")return json(await this.getTrackingStats());
@@ -1632,15 +1740,16 @@ async function issueReadyAlert(env,chatIds,candidate){
 
   const claim=await hubPost(env,"/claim-ready",{
     symbol:candidate.symbol,
-    direction:candidate.setupDirection
+    direction:candidate.setupDirection,
+    setupCandleT:candidate.setupCandleT,
+    readyKey:candidate.readyKey
   });
   if(!claim?.claimed)return {ok:false,duplicate:true,reason:"ready alert already sent for this setup"};
 
   const msg=
     `READY 🔥🔥\n`+
-    `${candidate.symbol} setup is forming.\n`+
-    `Stand by — the final 2-minute signal may drop within the next 1–2 minutes if every confirmation completes.\n`+
-    `DO NOT ENTER YET.`;
+    `${candidate.symbol} setup developing\n`+
+    `Prepare for a possible 2-minute signal.`;
 
   for(const chat of chats) await tgSend(env,chat,msg);
   return {ok:true,symbol:candidate.symbol,preScore:candidate.preScore};
@@ -1654,17 +1763,20 @@ async function issueAgradeSignal(env,chatIds,candidate,sourceUpdateId="auto",aut
   const symbol=candidate.symbol;
   const result=await hub(env,`/signal?symbol=${encodeURIComponent(symbol)}`);
   if(!result.ok||result.grade!=="A"||result.direction!==candidate.direction||Number(result.quality)<A_GRADE_MIN_QUALITY){
+    await hubPost(env,"/ready-outcome",{symbol,outcome:"CANCELLED"});
     return {ok:false,reason:"setup changed during final check"};
   }
 
   const quoteBefore=await hub(env,`/quote?symbol=${encodeURIComponent(symbol)}`);
   if(!quoteBefore.ok||!Number.isFinite(Number(quoteBefore.price))||Number(quoteBefore.receiveAgeSeconds)>8){
+    await hubPost(env,"/ready-outcome",{symbol,outcome:"CANCELLED"});
     return {ok:false,reason:"fresh entry quote unavailable"};
   }
   const driftAtr=Number(result.atr)>0
     ? Math.abs(Number(quoteBefore.price)-Number(result.lastPrice))/Number(result.atr)
     : Infinity;
   if(!Number.isFinite(driftAtr)||driftAtr>0.20){
+    await hubPost(env,"/ready-outcome",{symbol,outcome:"CANCELLED"});
     return {ok:false,reason:"price moved too far during final 2-minute entry check"};
   }
 
@@ -1788,7 +1900,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V13.0.1 two-minute auto sniper with Ready pre-alert",{status:200});
+    if(request.method!=="POST")return new Response("V13.1.0 two-minute auto sniper with READY pre-alert",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -1800,7 +1912,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V13.0.1 — TWO-MINUTE AUTO SNIPER. Automatic scanning runs every minute. When a strong setup reaches the pullback stage, the bot first sends READY 🔥🔥 so you can prepare. No trade should be taken from that warning. If the setup then passes fresh 1m continuation, 30-second timing, live-tick flow and all final filters, the actual 2-minute signal is sent automatically."
+        "V13.1.0 — TWO-MINUTE AUTO SNIPER. Automatic scanning runs every minute. A structurally valid pullback enters PREPARE and sends one READY 🔥🔥 warning. No trade should be taken from that warning. The normal 2-minute signal is sent only if fresh 1m continuation, 30-second timing, live-tick flow and every final filter subsequently pass."
       );
       return new Response("ok");
     }
