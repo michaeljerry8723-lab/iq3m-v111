@@ -1594,6 +1594,7 @@ async function scanUniverse(env){
           quotaExceeded:true,
           retryAfterMinutes:Number(r.retryAfterMinutes)||1,
           checked,
+          preAlerts:[],
           reason:"Tiingo hourly request quota is temporarily exhausted."
         };
       }
@@ -1609,10 +1610,40 @@ async function scanUniverse(env){
     Number(b.microConfirmations||0)-Number(a.microConfirmations||0)
   );
 
+  const preAlerts=checked
+    .filter(x=>x?.preAlert&&x?.setupDirection&&Number(x.preScore)>=0.86)
+    .sort((a,b)=>Number(b.preScore||0)-Number(a.preScore||0));
+
   if(!qualified.length){
-    return {ok:false,checked,reason:"No A-grade 2-minute entry across the six-pair FX universe."};
+    return {
+      ok:false,
+      checked,
+      preAlerts,
+      reason:"No fully qualified 2-minute entry across the six-pair FX universe."
+    };
   }
-  return {ok:true,best:qualified[0],checked};
+  return {ok:true,best:qualified[0],checked,preAlerts};
+}
+
+
+async function issueReadyAlert(env,chatIds,candidate){
+  const chats=(chatIds||[]).map(String).filter(Boolean);
+  if(!chats.length||!candidate?.symbol||!candidate?.setupDirection)return {ok:false,reason:"invalid ready alert"};
+
+  const claim=await hubPost(env,"/claim-ready",{
+    symbol:candidate.symbol,
+    direction:candidate.setupDirection
+  });
+  if(!claim?.claimed)return {ok:false,duplicate:true,reason:"ready alert already sent for this setup"};
+
+  const msg=
+    `READY 🔥🔥\n`+
+    `${candidate.symbol} setup is forming.\n`+
+    `Stand by — the final 2-minute signal may drop within the next 1–2 minutes if every confirmation completes.\n`+
+    `DO NOT ENTER YET.`;
+
+  for(const chat of chats) await tgSend(env,chat,msg);
+  return {ok:true,symbol:candidate.symbol,preScore:candidate.preScore};
 }
 
 
@@ -1689,10 +1720,21 @@ async function autoScanAndAlert(env){
   if(!risk.ok)return {ok:false,reason:risk.reason||"risk gate"};
 
   const scan=await scanUniverse(env);
-  if(!scan.ok)return {ok:false,reason:scan.reason||"no A-grade setup"};
 
-  const minuteKey=Math.floor(Date.now()/60000);
-  return await issueAgradeSignal(env,chats,scan.best,`auto-${minuteKey}-${scan.best.symbol}`,true);
+  // A finalized signal takes priority over any preliminary warning.
+  if(scan.ok){
+    const minuteKey=Math.floor(Date.now()/60000);
+    return await issueAgradeSignal(env,chats,scan.best,`auto-${minuteKey}-${scan.best.symbol}`,true);
+  }
+
+  // Otherwise warn the user once when the strongest setup has reached the
+  // pullback stage and passes the preliminary quality checks.
+  if(Array.isArray(scan.preAlerts)&&scan.preAlerts.length){
+    const ready=await issueReadyAlert(env,chats,scan.preAlerts[0]);
+    if(ready.ok)return {ok:true,ready:true,...ready};
+  }
+
+  return {ok:false,reason:scan.reason||"no fully qualified setup"};
 }
 
 
@@ -1746,7 +1788,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V13 two-minute automatic sniper scanner",{status:200});
+    if(request.method!=="POST")return new Response("V13.0.1 two-minute auto sniper with Ready pre-alert",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -1758,7 +1800,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V13 — TWO-MINUTE AUTO SNIPER. You no longer need to keep sending /signal. The Worker scans the six FX pairs automatically every minute and only sends an alert after the stateful 5m trend → pullback → fresh 1m continuation sequence also passes strict SMA(5/13), MACD, ADX/DMI, RSI, Aroon, spread/volatility, room-to-move, 30-second timing and live-tick confirmation. Expiry: 2 minutes."
+        "V13.0.1 — TWO-MINUTE AUTO SNIPER. Automatic scanning runs every minute. When a strong setup reaches the pullback stage, the bot first sends READY 🔥🔥 so you can prepare. No trade should be taken from that warning. If the setup then passes fresh 1m continuation, 30-second timing, live-tick flow and all final filters, the actual 2-minute signal is sent automatically."
       );
       return new Response("ok");
     }
