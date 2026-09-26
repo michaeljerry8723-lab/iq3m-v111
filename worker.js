@@ -697,8 +697,8 @@ export class TickHub extends DurableObject {
         this.alertChats=[...new Set(recovered)].slice(-10);
         if(this.alertChats.length)await this.ctx.storage.put("alertChats",this.alertChats);
       }
-      await this.ensureSocket();
-      await this.ensureCryptoSocket();
+      // Keep Durable Object startup lightweight. Network connections are opened lazily
+      // by market-data routes/alarm so Telegram commands are never blocked by feed startup.
       await this.scheduleAlarm();
     });
   }
