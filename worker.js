@@ -660,7 +660,7 @@ export class TickHub extends DurableObject {
         const chats=Array.isArray(sig.chatIds)&&sig.chatIds.length?sig.chatIds:[sig.chatId];
         for(const chat of chats) if(chat!=null) await this.sendTrackedResult(
           chat,
-          `RESULT — ${sig.symbol}\n${sig.direction==="CALL"?"⬆️ CALL":"⬇️ PUT"} • 5 minutes\n⚪ VOID — no fresh Tiingo tick was available at expiry`
+          `RESULT — ${sig.symbol}\n${sig.direction==="CALL"?"⬆️ CALL":"⬇️ PUT"} • 2 minutes\n⚪ VOID — no fresh Tiingo tick was available at expiry`
         );
         continue;
       }
@@ -684,7 +684,7 @@ export class TickHub extends DurableObject {
       const chats=Array.isArray(sig.chatIds)&&sig.chatIds.length?sig.chatIds:[sig.chatId];
       for(const chat of chats) if(chat!=null) await this.sendTrackedResult(
         chat,
-        `RESULT — ${sig.symbol}\n${sig.direction==="CALL"?"⬆️ CALL":"⬇️ PUT"} • 5 minutes\nENTRY: ${formatFxPrice(sig.symbol,entry)}\nEXIT: ${formatFxPrice(sig.symbol,exit)}\n${mark} ${result}\nTRACKING: Tiingo feed`
+        `RESULT — ${sig.symbol}\n${sig.direction==="CALL"?"⬆️ CALL":"⬇️ PUT"} • 2 minutes\nENTRY: ${formatFxPrice(sig.symbol,entry)}\nEXIT: ${formatFxPrice(sig.symbol,exit)}\n${mark} ${result}\nTRACKING: Tiingo feed`
       );
     }
 
@@ -1103,7 +1103,7 @@ export class TickHub extends DurableObject {
       next={stage:"READY",direction:snap.direction,lastBarT:snap.barT,readyBarT:snap.barT,updatedAt:now};
     }else if(st.stage==="READY"){
       const ageBars=Math.max(0,(Number(snap.barT)-Number(st.readyBarT||st.lastBarT))/60000);
-      if(ageBars>2){
+      if(ageBars>1){
         next={stage:"ARMED",direction:snap.direction,lastBarT:snap.barT,updatedAt:now};
       }
     }
@@ -1213,7 +1213,7 @@ export class TickHub extends DurableObject {
 
   getRiskGate(){
     const now=Date.now();
-    // Do not globally block /signal while another 5-minute trade is still pending.
+    // Do not globally block /signal while another 2-minute trade is still pending.
     // pairCooldownSeconds() already excludes the active pair, so the remaining pairs
     // can still be scanned for independent qualified opportunities.
 
@@ -1495,7 +1495,7 @@ async function scanUniverse(env){
   );
 
   if(!qualified.length){
-    return {ok:false,checked,reason:"No A-grade 5-minute entry across the six-pair FX universe."};
+    return {ok:false,checked,reason:"No A-grade 2-minute entry across the six-pair FX universe."};
   }
   return {ok:true,best:qualified[0],checked};
 }
@@ -1512,13 +1512,19 @@ async function issueAgradeSignal(env,chatIds,candidate,sourceUpdateId="auto",aut
   }
 
   const quoteBefore=await hub(env,`/quote?symbol=${encodeURIComponent(symbol)}`);
-  if(!quoteBefore.ok||!Number.isFinite(Number(quoteBefore.price))||Number(quoteBefore.receiveAgeSeconds)>12){
+  if(!quoteBefore.ok||!Number.isFinite(Number(quoteBefore.price))||Number(quoteBefore.receiveAgeSeconds)>8){
     return {ok:false,reason:"fresh entry quote unavailable"};
+  }
+  const driftAtr=Number(result.atr)>0
+    ? Math.abs(Number(quoteBefore.price)-Number(result.lastPrice))/Number(result.atr)
+    : Infinity;
+  if(!Number.isFinite(driftAtr)||driftAtr>0.20){
+    return {ok:false,reason:"price moved too far during final 2-minute entry check"};
   }
 
   const arrow=result.direction==="CALL"?"⬆️":"⬇️";
   const label=automatic?"AUTO A-GRADE SIGNAL":"A-GRADE SIGNAL";
-  const textMsg=`${arrow} ${symbol}\n${label}\nEXPIRY: 5 minutes\nGRADE: A\nA-GRADE SCORE: ${Math.round(Number(result.quality)*100)}/100\nTRACKING: ON`;
+  const textMsg=`${arrow} ${symbol}\n${label}\nEXPIRY: 2 minutes\nGRADE: A\nA-GRADE SCORE: ${Math.round(Number(result.quality)*100)}/100\nTRACKING: ON`;
 
   let sentAt=null;
   for(const chat of chats){
@@ -1609,7 +1615,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V12.1.1 six-FX stateful A-grade scanner",{status:200});
+    if(request.method!=="POST")return new Response("V13 two-minute automatic sniper scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -1621,7 +1627,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V12.1.1 — SIX-FX STATEFUL ENTRY MODE. BTC/USD and XAU/USD have been removed. The bot scans EUR/USD, USD/JPY, GBP/USD, USD/CAD, AUD/USD and USD/CHF through the stateful sequence: completed 5m trend → armed → pullback → fresh 1m continuation → final A-grade validation."
+        "V13 — TWO-MINUTE AUTO SNIPER. You no longer need to keep sending /signal. The Worker scans the six FX pairs automatically every minute and only sends an alert after the stateful 5m trend → pullback → fresh 1m continuation sequence also passes strict SMA(5/13), MACD, ADX/DMI, RSI, Aroon, spread/volatility, room-to-move, 30-second timing and live-tick confirmation. Expiry: 2 minutes."
       );
       return new Response("ok");
     }
@@ -1661,7 +1667,7 @@ export default {
           rows.push(`${symbol}: error`);
         }
       }
-      await tgSend(env,chatId,`V12 A-GRADE DIAGNOSIS\n\n${rows.join("\n")}`);
+      await tgSend(env,chatId,`V13 TWO-MINUTE SNIPER DIAGNOSIS\n\n${rows.join("\n")}`);
       return new Response("ok");
     }
     if(/^\/reconnect$/i.test(text)){
@@ -1682,7 +1688,7 @@ export default {
         `PROVIDER TICK AGE: ${st.providerTickAgeSeconds??"n/a"}s\n`+
         `WS MESSAGE AGE: ${st.lastWsMessageAgeSeconds??"n/a"}s\n`+
         `RECONNECTS: ${st.reconnectCount||0}\n`+
-        `EXPIRY: 300s\n`+
+        `EXPIRY: 120s\n`+
         `STATUS: ${st.status||"n/a"}\n`+
         `SUBSCRIBE: ${st.subscribeStatus?.response?.message||st.subscribeStatus?.status||"n/a"}`
       );
@@ -1696,7 +1702,7 @@ export default {
         await tgSend(
           env,
           chatId,
-          `🛡️ 5-MINUTE MODE PAUSED\n${risk.reason}.\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.`
+          `🛡️ 2-MINUTE MODE PAUSED\n${risk.reason}.\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.`
         );
         return new Response("ok");
       }
@@ -1708,7 +1714,7 @@ export default {
           await tgSend(
             env,
             chatId,
-            `⏳ DATA LIMIT REACHED\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.\nThe bot will scan all 6 FX pairs again and only issue Grade A.`
+            `⏳ DATA LIMIT REACHED\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.\nThe bot will scan all 6 FX pairs again and only issue an ultra-selective 2-minute setup.`
           );
           return new Response("ok");
         }
@@ -1731,7 +1737,7 @@ export default {
         await tgSend(
           env,
           chatId,
-          `⏳ NO A-GRADE 5-MINUTE SETUP RIGHT NOW\nFeeds are live across the scan.${top?"\nMain blocker: "+top:""}\nAutomatic scanning remains active.`
+          `⏳ NO ULTRA-HIGH-CONFIDENCE 2-MINUTE SETUP RIGHT NOW\nFeeds are live across the scan.${top?"\nMain blocker: "+top:""}\nAutomatic scanning remains active.`
         );
         return new Response("ok");
       }
@@ -1744,7 +1750,7 @@ export default {
     }
 
     if(/^\/signal\b/i.test(text)){
-      await tgSend(env,chatId,"Use /signal by itself. The bot scans all 6 FX pairs and returns only the strongest A-grade 5-minute setup. Automatic scans also run every minute.");
+      await tgSend(env,chatId,"You do not need /signal for normal use: automatic scans run every minute. /signal is optional for an immediate six-pair scan and still returns only a fully qualified 2-minute setup.");
       return new Response("ok");
     }
 
