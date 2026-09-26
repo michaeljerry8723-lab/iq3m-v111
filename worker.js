@@ -1664,7 +1664,8 @@ export class TickHub extends DurableObject {
     if(u.pathname==="/ready-outcome"&&req.method==="POST")return json(await this.finishReadySetup(req));
     if(u.pathname==="/chats")return json(await this.getAlertChats());
     if(u.pathname==="/track"&&req.method==="POST")return json(await this.trackSignal(req));
-    if(u.pathname==="/stats")return json(await this.getTrackingStats());\n    if(u.pathname==="/forwardstats")return json(await this.getForwardStats());
+    if(u.pathname==="/stats")return json(await this.getTrackingStats());
+    if(u.pathname==="/forwardstats")return json(await this.getForwardStats());
 
     if(u.pathname==="/status"){
       if(symbol) await this.subscribe(symbol);
