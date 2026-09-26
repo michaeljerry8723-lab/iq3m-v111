@@ -2039,8 +2039,13 @@ export default {
     // responsive even when the market-feed object has exhausted its free-tier duration.
     if(/^\/version$/i.test(text)){await tgSend(env,chatId,VERSION);return new Response("ok");}
     if(/^\/ping$/i.test(text)){await tgSend(env,chatId,"PONG — webhook and Telegram delivery are healthy.");return new Response("ok");}
-    await hubPost(env,"/register-chat",{chatId});
-    if(/^\/start$/i.test(text)){
+    // Acknowledge Telegram immediately so one failing Durable Object call cannot
+    // block the entire Telegram update queue. Command work continues in waitUntil().
+    ctx.waitUntil((async()=>{
+      try{
+        try{await hubPost(env,"/register-chat",{chatId});}
+        catch(e){console.error("register-chat failed",String(e?.stack||e?.message||e));}
+        if(/^\/start$/i.test(text)){
       await tgSend(
         env,
         chatId,
@@ -2185,6 +2190,14 @@ export default {
       return new Response("ok");
     }
 
+    return new Response("ok");
+      }catch(e){
+        console.error("telegram command failed",String(e?.stack||e?.message||e));
+        try{
+          await tgSend(env,chatId,`BOT RUNTIME ERROR\n${String(e?.message||e).slice(0,350)}\n\nThe webhook itself acknowledged this update, so Telegram will not remain blocked.`);
+        }catch(_){}
+      }
+    })());
     return new Response("ok");
   },
 
