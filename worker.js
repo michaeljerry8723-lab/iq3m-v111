@@ -1,13 +1,13 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "12.1.0-stateful-entry";
-const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF,XAU/USD,BTC/USD";
+const VERSION = "12.1.1-six-fx-only";
+const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
-const CRYPTO_SYMBOLS = new Set(["BTC/USD"]);
+const CRYPTO_SYMBOLS = new Set();
 const A_GRADE_MIN_QUALITY = 0.82;
 const EXPIRY_SECONDS = 300;
-const STRATEGY_ID = "v12.1-stateful-entry";
+const STRATEGY_ID = "v12.1.1-six-fx-only";
 const GLOBAL_SIGNAL_COOLDOWN_MS = 0;
 const PAIR_SIGNAL_COOLDOWN_MS = 10*60*1000;
 const LOSS_CIRCUIT_BREAKER_MS = 20*60*1000;
@@ -35,8 +35,6 @@ function formatFxPrice(symbol,p){
   const n=Number(p);
   if(!Number.isFinite(n))return "n/a";
   const s=String(symbol||"");
-  if(s==="BTC/USD")return n.toFixed(2);
-  if(s==="XAU/USD")return n.toFixed(2);
   return n.toFixed(s.endsWith("/JPY")?3:5);
 }
 function isCryptoSymbol(symbol){ return CRYPTO_SYMBOLS.has(normalizeSymbol(symbol)); }
@@ -70,8 +68,6 @@ function spreadQualitySnapshot(symbol,ticks,last,atr){
   // Spread is therefore a sanity veto only for clearly abnormal conditions,
   // not a hard filter on ordinary quote differences.
   let maxBps=3.5, softBps=1.0, maxAtr=0.65;
-  if(s==="XAU/USD"){maxBps=5.0;softBps=1.5;maxAtr=0.75;}
-  if(s==="BTC/USD"){maxBps=12.0;softBps=2.5;maxAtr=0.90;}
 
   const extremeAbsolute=spreadBps>maxBps;
   const extremeRelative=Number.isFinite(spreadAtrRatio)&&spreadAtrRatio>maxAtr&&spreadBps>softBps;
@@ -318,7 +314,7 @@ function usdExposureSide(symbol,direction){
   const d=String(direction||"").toUpperCase();
   if(!s||!["CALL","PUT"].includes(d))return null;
   const usdBase=new Set(["USD/JPY","USD/CAD","USD/CHF"]);
-  const usdQuote=new Set(["EUR/USD","GBP/USD","AUD/USD","XAU/USD","BTC/USD"]);
+  const usdQuote=new Set(["EUR/USD","GBP/USD","AUD/USD"]);
   if(usdBase.has(s))return d==="CALL"?"USD_LONG":"USD_SHORT";
   if(usdQuote.has(s))return d==="CALL"?"USD_SHORT":"USD_LONG";
   return null;
@@ -447,7 +443,7 @@ function score5m(ticks,bars1m,symbol){
   }
 
   // From here on, use consensus instead of making every valid entry feature a hard gate.
-  // This avoids one lagging indicator blocking all eight symbols for long periods.
+  // This avoids one lagging indicator blocking all six FX pairs for long periods.
   const recent=bars1m.slice(-8);
   const pullbackNear=recent.some(b=>direction==="CALL"
     ? Number(b.l)<=sma1.fast+0.80*atr1.atr
@@ -1477,7 +1473,7 @@ async function scanUniverse(env){
   );
 
   if(!qualified.length){
-    return {ok:false,checked,reason:"No A-grade 5-minute entry across the eight-symbol universe."};
+    return {ok:false,checked,reason:"No A-grade 5-minute entry across the six-pair FX universe."};
   }
   return {ok:true,best:qualified[0],checked};
 }
@@ -1591,7 +1587,7 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
-    if(request.method!=="POST")return new Response("V12.1 stateful A-grade scanner",{status:200});
+    if(request.method!=="POST")return new Response("V12.1.1 six-FX stateful A-grade scanner",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -1603,7 +1599,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V12.1 — STATEFUL ENTRY MODE. The bot now tracks each symbol through a real sequence: completed 5m trend → armed → pullback into the SMA zone → fresh 1m continuation → final A-grade validation. Repeated /signal calls cannot advance the sequence inside the same candle. Same-direction USD exposure is also locked while an existing correlated signal is active."
+        "V12.1.1 — SIX-FX STATEFUL ENTRY MODE. BTC/USD and XAU/USD have been removed. The bot scans EUR/USD, USD/JPY, GBP/USD, USD/CAD, AUD/USD and USD/CHF through the stateful sequence: completed 5m trend → armed → pullback → fresh 1m continuation → final A-grade validation."
       );
       return new Response("ok");
     }
@@ -1619,7 +1615,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        `EIGHT-SYMBOL FEED HEALTH\nLIVE: ${liveCount}/${FIXED_UNIVERSE.length}\n\n${lines.join("\n\n")}`
+        `SIX-PAIR FX FEED HEALTH\nLIVE: ${liveCount}/${FIXED_UNIVERSE.length}\n\n${lines.join("\n\n")}`
       );
       return new Response("ok");
     }
@@ -1690,7 +1686,7 @@ export default {
           await tgSend(
             env,
             chatId,
-            `⏳ DATA LIMIT REACHED\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.\nThe bot will scan all 8 symbols again and only issue Grade A.`
+            `⏳ DATA LIMIT REACHED\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.\nThe bot will scan all 6 FX pairs again and only issue Grade A.`
           );
           return new Response("ok");
         }
@@ -1701,7 +1697,7 @@ export default {
           await tgSend(
             env,
             chatId,
-            "⏳ LIVE FEEDS STARTING\nNo usable live Tiingo quote is available yet across the eight-symbol scan. Try /signal again in about 1 minute."
+            "⏳ LIVE FEEDS STARTING\nNo usable live Tiingo quote is available yet across the six-pair FX scan. Try /signal again in about 1 minute."
           );
           return new Response("ok");
         }
@@ -1726,7 +1722,7 @@ export default {
     }
 
     if(/^\/signal\b/i.test(text)){
-      await tgSend(env,chatId,"Use /signal by itself. The bot scans all 8 symbols and returns only the strongest A-grade 5-minute setup. Automatic scans also run every minute.");
+      await tgSend(env,chatId,"Use /signal by itself. The bot scans all 6 FX pairs and returns only the strongest A-grade 5-minute setup. Automatic scans also run every minute.");
       return new Response("ok");
     }
 
