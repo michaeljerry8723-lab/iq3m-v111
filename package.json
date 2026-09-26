@@ -1,6 +1,6 @@
 {
-  "name": "iq3m-predictor-v12-1-1",
-  "version": "12.1.1",
+  "name": "iq3m-predictor-v13",
+  "version": "13.0.0",
   "private": true,
   "type": "module",
   "scripts": {
