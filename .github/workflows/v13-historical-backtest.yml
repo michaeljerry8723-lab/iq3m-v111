@@ -93,12 +93,16 @@ jobs:
           node --check backtest/metrics.js
           node --check backtest/fetch-tiingo.js
           node --check backtest/backtest.js
+          node --check backtest/research-v13.2.js
 
       - name: Download genuine 1-minute FX history
         run: npm run backtest:fetch
 
       - name: Run chronological V13.1.1 backtest
         run: npm run backtest
+
+      - name: Run V13.2 research diagnostics
+        run: npm run research:v13.2
 
       - name: Add headline results to job summary
         if: success()
@@ -138,6 +142,8 @@ jobs:
           retention-days: 30
           path: |
             backtest/BACKTEST_REPORT.md
+            backtest/V13_2_RESEARCH.md
+            backtest/results/v13.2-research.json
             backtest/results/results.json
             backtest/results/signals.csv
             backtest/results/prepare-setups.csv
