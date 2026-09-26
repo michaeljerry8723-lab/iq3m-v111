@@ -13,6 +13,9 @@ const GLOBAL_SIGNAL_COOLDOWN_MS = 0;
 const PAIR_SIGNAL_COOLDOWN_MS = 8*60*1000;
 const LOSS_CIRCUIT_BREAKER_MS = 20*60*1000;
 
+// V13.4 shadow validation only. This rule is logged and cannot admit or reject a signal.
+const V13_4_SHADOW = Object.freeze({id:"v13.4-frozen-dmi-adx",dmiGapMin:20.930996673679135,adxMax:76.22584098021053});
+
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 function clamp(x,a,b){ return Math.max(a,Math.min(b,Number(x)||0)); }
 function mean(xs){ return xs.length ? xs.reduce((a,b)=>a+Number(b),0)/xs.length : NaN; }
@@ -1865,7 +1868,16 @@ async function issueAgradeSignal(env,chatIds,candidate,sourceUpdateId="auto",aut
       spreadAtrRatio:result.spreadAtrRatio,
       spreadBps:result.spreadBps,
       atrRatio:result.atrRatio,
-      reasons:result.reasons
+      reasons:result.reasons,
+      v13_4Shadow:{
+        id:V13_4_SHADOW.id,
+        eligible:Number(result.dmiGap)>=V13_4_SHADOW.dmiGapMin && Number(result.adx)<=V13_4_SHADOW.adxMax,
+        dmiGapMin:V13_4_SHADOW.dmiGapMin,
+        adxMax:V13_4_SHADOW.adxMax,
+        observedDmiGap:Number(result.dmiGap),
+        observedAdx:Number(result.adx),
+        capturedAt:Date.now()
+      }
     }
   });
   return {ok:true,symbol,direction:result.direction,quality:result.quality};
