@@ -1999,6 +1999,32 @@ export default {
       tickHubBound:Boolean(env.TICK_HUB),
       service:"iq3m-predictor diagnostic"
     });
+    if(u.pathname==="/telegram-check"){
+      const token=String(env.TELEGRAM_BOT_TOKEN||"").trim();
+      if(!token)return json({ok:false,error:"TELEGRAM_BOT_TOKEN missing"},500);
+      try{
+        const [meResp,whResp]=await Promise.all([
+          fetch(`https://api.telegram.org/bot${token}/getMe`),
+          fetch(`https://api.telegram.org/bot${token}/getWebhookInfo`)
+        ]);
+        const me=await meResp.json().catch(()=>null);
+        const wh=await whResp.json().catch(()=>null);
+        return json({
+          ok:Boolean(meResp.ok&&me?.ok&&whResp.ok&&wh?.ok),
+          getMeHttp:meResp.status,
+          botOk:Boolean(me?.ok),
+          botUsername:me?.result?.username||null,
+          webhookHttp:whResp.status,
+          webhookOk:Boolean(wh?.ok),
+          webhookUrl:wh?.result?.url||null,
+          pendingUpdateCount:Number(wh?.result?.pending_update_count||0),
+          lastErrorDate:wh?.result?.last_error_date||null,
+          lastErrorMessage:wh?.result?.last_error_message||null
+        });
+      }catch(e){
+        return json({ok:false,error:String(e?.message||e)},500);
+      }
+    }
     if(u.pathname==="/feed"){
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
