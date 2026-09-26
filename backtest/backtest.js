@@ -157,7 +157,7 @@ export async function replay({write=true}={}){
   const months=monthsInPeriod(manifest),split=splitSamples(months),period=manifest.period;
   const report={
     status:"complete",version:VERSION,strategyId:STRATEGY_ID,generatedAt:new Date().toISOString(),
-    provider:"Tiingo FX 1-minute OHLC",
+    provider:manifest.provider||"Historical FX 1-minute OHLC",
     modeA:{
       available:true,
       spreadFilter:"UNAVAILABLE unless genuine bid/ask fields exist; no spread was fabricated",
@@ -210,7 +210,7 @@ Mode A evaluates only truthfully reproducible 1-minute historical-core rules. It
 ${section("Development sample",r.development)}${section("Holdout sample",r.holdout)}${section("Overall diagnostic",r.overall)}
 ## Interpretation limits
 
-These are historical-core candidates, not full-fidelity live V13.1.1 signals. Settlement uses the closest legitimate 1-minute close at or after 120 seconds. Tiingo is the reference feed; results do not reproduce Pocket Option execution or settlement prices.
+These are historical-core candidates, not full-fidelity live V13.1.1 signals. Settlement uses the closest legitimate 1-minute close at or after 120 seconds. The provider shown above is the reference feed for this run; results do not reproduce Pocket Option execution or settlement prices.
 `;
 }
 
