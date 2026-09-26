@@ -3,8 +3,17 @@ name: V13.1.1 Historical Backtest
 on:
   workflow_dispatch:
     inputs:
+      provider:
+        description: "Historical data provider"
+        required: true
+        default: "TWELVE_DATA"
+        type: choice
+        options:
+          - "TWELVE_DATA"
+          - "AUTO"
+          - "TIINGO"
       months:
-        description: "Months of Tiingo 1-minute history to test"
+        description: "Months of 1-minute FX history to test"
         required: true
         default: "6"
         type: choice
@@ -30,10 +39,12 @@ jobs:
   backtest:
     name: Six-pair V13.1.1 historical test
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 150
 
     env:
       TIINGO_API_TOKEN: ${{ secrets.TIINGO_API_TOKEN }}
+      TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+      BACKTEST_PROVIDER: ${{ inputs.provider || 'TWELVE_DATA' }}
       BACKTEST_MONTHS: ${{ inputs.months || '6' }}
       BACKTEST_END: ${{ inputs.end_date || '' }}
 
@@ -46,13 +57,35 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Verify Tiingo secret exists
+      - name: Verify selected provider secret
         shell: bash
         run: |
-          if [ -z "$TIINGO_API_TOKEN" ]; then
-            echo "::error::TIINGO_API_TOKEN repository secret is missing."
-            exit 1
-          fi
+          case "$BACKTEST_PROVIDER" in
+            TWELVE_DATA)
+              if [ -z "$TWELVE_DATA_API_KEY" ]; then
+                echo "::error::TWELVE_DATA_API_KEY repository secret is missing."
+                exit 1
+              fi
+              ;;
+            TIINGO)
+              if [ -z "$TIINGO_API_TOKEN" ]; then
+                echo "::error::TIINGO_API_TOKEN repository secret is missing."
+                exit 1
+              fi
+              ;;
+            AUTO)
+              if [ -z "$TIINGO_API_TOKEN" ] && [ -z "$TWELVE_DATA_API_KEY" ]; then
+                echo "::error::AUTO requires TIINGO_API_TOKEN or TWELVE_DATA_API_KEY."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::Unknown BACKTEST_PROVIDER: $BACKTEST_PROVIDER"
+              exit 1
+              ;;
+          esac
+          echo "Provider: $BACKTEST_PROVIDER"
+          echo "Months: $BACKTEST_MONTHS"
 
       - name: Syntax-check backtest files
         run: |
@@ -61,7 +94,7 @@ jobs:
           node --check backtest/fetch-tiingo.js
           node --check backtest/backtest.js
 
-      - name: Download genuine Tiingo 1-minute history
+      - name: Download genuine 1-minute FX history
         run: npm run backtest:fetch
 
       - name: Run chronological V13.1.1 backtest
@@ -79,6 +112,8 @@ jobs:
           const lines = [
             "# V13.1.1 Historical Backtest",
             "",
+            `**Reference feed:** ${r.provider}`,
+            "",
             "**Important:** Mode A tests the reproducible 1-minute historical core. It does not fabricate 30-second ticks, live tick impulse, exact entry spread, Telegram latency, or Pocket Option settlement prices.",
             "",
             "| Sample | PREPARE | Signals | W | L | D | Win rate (W/L) | Signals/day |",
@@ -94,11 +129,11 @@ jobs:
           fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
           NODE
 
-      - name: Upload backtest report and download diagnostics
+      - name: Upload backtest report and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v13-1-1-historical-backtest
+          name: v13-1-1-historical-backtest-${{ inputs.provider || 'TWELVE_DATA' }}
           if-no-files-found: warn
           retention-days: 30
           path: |
