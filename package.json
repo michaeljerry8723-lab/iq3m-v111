@@ -8,7 +8,8 @@
     "dev": "wrangler dev",
     "backtest:fetch": "node backtest/fetch-tiingo.js",
     "backtest": "node backtest/backtest.js",
-    "research:v13.2": "node backtest/research-v13.2.js"
+    "research:v13.2": "node backtest/research-v13.2.js",
+    "validate:v13.3": "node backtest/validate-v13.3.js"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"
