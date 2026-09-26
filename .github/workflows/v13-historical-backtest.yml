@@ -1,0 +1,115 @@
+name: V13.1.1 Historical Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      months:
+        description: "Months of Tiingo 1-minute history to test"
+        required: true
+        default: "6"
+        type: choice
+        options:
+          - "3"
+          - "6"
+          - "9"
+          - "12"
+      end_date:
+        description: "Optional end date (YYYY-MM-DD). Leave blank to use yesterday UTC."
+        required: false
+        default: ""
+        type: string
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/v13-historical-backtest.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v13-historical-backtest
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    name: Six-pair V13.1.1 historical test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      TIINGO_API_TOKEN: ${{ secrets.TIINGO_API_TOKEN }}
+      BACKTEST_MONTHS: ${{ inputs.months || '6' }}
+      BACKTEST_END: ${{ inputs.end_date || '' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Verify Tiingo secret exists
+        shell: bash
+        run: |
+          if [ -z "$TIINGO_API_TOKEN" ]; then
+            echo "::error::TIINGO_API_TOKEN repository secret is missing."
+            exit 1
+          fi
+
+      - name: Syntax-check backtest files
+        run: |
+          node --check backtest/strategy-v13.1.1.js
+          node --check backtest/metrics.js
+          node --check backtest/fetch-tiingo.js
+          node --check backtest/backtest.js
+
+      - name: Download genuine Tiingo 1-minute history
+        run: npm run backtest:fetch
+
+      - name: Run chronological V13.1.1 backtest
+        run: npm run backtest
+
+      - name: Add headline results to job summary
+        if: success()
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const r = JSON.parse(fs.readFileSync("backtest/results/results.json","utf8"));
+          const pct = x => x == null ? "n/a" : (x*100).toFixed(2) + "%";
+          const n = x => x == null ? "n/a" : x;
+          const lines = [
+            "# V13.1.1 Historical Backtest",
+            "",
+            "**Important:** Mode A tests the reproducible 1-minute historical core. It does not fabricate 30-second ticks, live tick impulse, exact entry spread, Telegram latency, or Pocket Option settlement prices.",
+            "",
+            "| Sample | PREPARE | Signals | W | L | D | Win rate (W/L) | Signals/day |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+            `| Development | ${n(r.development.totalPrepareSetups)} | ${n(r.development.totalTestableSignals)} | ${n(r.development.wins)} | ${n(r.development.losses)} | ${n(r.development.draws)} | ${pct(r.development.winRateExcludingDraws)} | ${r.development.signalsPerDay == null ? "n/a" : r.development.signalsPerDay.toFixed(3)} |`,
+            `| Holdout | ${n(r.holdout.totalPrepareSetups)} | ${n(r.holdout.totalTestableSignals)} | ${n(r.holdout.wins)} | ${n(r.holdout.losses)} | ${n(r.holdout.draws)} | ${pct(r.holdout.winRateExcludingDraws)} | ${r.holdout.signalsPerDay == null ? "n/a" : r.holdout.signalsPerDay.toFixed(3)} |`,
+            `| Overall | ${n(r.overall.totalPrepareSetups)} | ${n(r.overall.totalTestableSignals)} | ${n(r.overall.wins)} | ${n(r.overall.losses)} | ${n(r.overall.draws)} | ${pct(r.overall.winRateExcludingDraws)} | ${r.overall.signalsPerDay == null ? "n/a" : r.overall.signalsPerDay.toFixed(3)} |`,
+            "",
+            `Period: ${r.overall.period.start} to ${r.overall.period.endExclusive} (end exclusive).`,
+            "",
+            "Full CSV/JSON/Markdown results are attached as the workflow artifact."
+          ];
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
+          NODE
+
+      - name: Upload backtest report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v13-1-1-historical-backtest
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            backtest/BACKTEST_REPORT.md
+            backtest/results/results.json
+            backtest/results/signals.csv
+            backtest/results/prepare-setups.csv
+            backtest/results/filter-rejections.csv
+            backtest/data/manifest.json
