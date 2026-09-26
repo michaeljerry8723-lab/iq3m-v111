@@ -94,6 +94,7 @@ jobs:
           node --check backtest/fetch-tiingo.js
           node --check backtest/backtest.js
           node --check backtest/research-v13.2.js
+          node --check backtest/validate-v13.3.js
 
       - name: Download genuine 1-minute FX history
         run: npm run backtest:fetch
@@ -103,6 +104,9 @@ jobs:
 
       - name: Run V13.2 research diagnostics
         run: npm run research:v13.2
+
+      - name: Run V13.3 frozen rolling validation
+        run: npm run validate:v13.3
 
       - name: Add headline results to job summary
         if: success()
@@ -143,6 +147,8 @@ jobs:
           path: |
             backtest/BACKTEST_REPORT.md
             backtest/V13_2_RESEARCH.md
+            backtest/V13_3_VALIDATION.md
+            backtest/results/v13.3-validation.json
             backtest/results/v13.2-research.json
             backtest/results/results.json
             backtest/results/signals.csv
