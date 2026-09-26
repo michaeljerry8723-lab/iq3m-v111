@@ -590,6 +590,12 @@ export class TickHub extends DurableObject {
       this.signalHistory=(await this.ctx.storage.get("signalHistory"))||[];
       this.alertChats=(await this.ctx.storage.get("alertChats"))||[];
       this.setupStates=(await this.ctx.storage.get("setupStates"))||{};
+      const setupStateStrategyId=String((await this.ctx.storage.get("setupStateStrategyId"))||"");
+      if(setupStateStrategyId!==STRATEGY_ID){
+        this.setupStates={};
+        await this.ctx.storage.put("setupStates",this.setupStates);
+        await this.ctx.storage.put("setupStateStrategyId",STRATEGY_ID);
+      }
       if(!this.alertChats.length){
         const recovered=[...this.pendingSignals,...this.signalHistory]
           .flatMap(x=>Array.isArray(x.chatIds)?x.chatIds:[x.chatId])
@@ -1213,7 +1219,7 @@ export class TickHub extends DurableObject {
 
   getRiskGate(){
     const now=Date.now();
-    // Do not globally block /signal while another 2-minute trade is still pending.
+    // Do not globally block scans while another 2-minute trade is still pending.
     // pairCooldownSeconds() already excludes the active pair, so the remaining pairs
     // can still be scanned for independent qualified opportunities.
 
@@ -1301,7 +1307,8 @@ export class TickHub extends DurableObject {
       expiresAt:entryAt+EXPIRY_SECONDS*1000,
       expirySeconds:EXPIRY_SECONDS,
       strategyId:STRATEGY_ID,
-      version:VERSION
+      version:VERSION,
+      features:body?.features||null
     };
     this.pendingSignals.push(sig);
     await this.ctx.storage.put("pendingSignals",this.pendingSignals);
@@ -1523,8 +1530,8 @@ async function issueAgradeSignal(env,chatIds,candidate,sourceUpdateId="auto",aut
   }
 
   const arrow=result.direction==="CALL"?"⬆️":"⬇️";
-  const label=automatic?"AUTO A-GRADE SIGNAL":"A-GRADE SIGNAL";
-  const textMsg=`${arrow} ${symbol}\n${label}\nEXPIRY: 2 minutes\nGRADE: A\nA-GRADE SCORE: ${Math.round(Number(result.quality)*100)}/100\nTRACKING: ON`;
+  const label=automatic?"AUTO 2-MINUTE SNIPER":"2-MINUTE SNIPER";
+  const textMsg=`${arrow} ${symbol}\n${label}\nEXPIRY: 2 minutes\nGRADE: A\nSETUP SCORE: ${Math.round(Number(result.quality)*100)}/100\nTRACKING: ON`;
 
   let sentAt=null;
   for(const chat of chats){
@@ -1544,7 +1551,23 @@ async function issueAgradeSignal(env,chatIds,candidate,sourceUpdateId="auto",aut
     direction:result.direction,
     entryPrice,
     entryAt:Date.now(),
-    telegramMessageDate:sentAt
+    telegramMessageDate:sentAt,
+    features:{
+      quality:result.quality,
+      adx:result.adx,
+      dmiGap:result.dmiGap,
+      rsi:result.rsi,
+      roomAtr:result.roomAtr,
+      distanceFastAtr:result.distanceFastAtr,
+      regime5:result.regime5,
+      regime15:result.regime15,
+      regime5Efficiency:result.regime5Efficiency,
+      regime15Efficiency:result.regime15Efficiency,
+      spreadAtrRatio:result.spreadAtrRatio,
+      spreadBps:result.spreadBps,
+      atrRatio:result.atrRatio,
+      reasons:result.reasons
+    }
   });
   return {ok:true,symbol,direction:result.direction,quality:result.quality};
 }
