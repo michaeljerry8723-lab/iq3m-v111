@@ -1,15 +1,15 @@
 // V11.1 — 15-second tick sniper with Cloudflare Durable Object
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "12.1.1-six-fx-only";
+const VERSION = "13.0.0-two-minute-auto-sniper";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set();
-const A_GRADE_MIN_QUALITY = 0.82;
-const EXPIRY_SECONDS = 300;
-const STRATEGY_ID = "v12.1.1-six-fx-only";
+const A_GRADE_MIN_QUALITY = 0.90;
+const EXPIRY_SECONDS = 120;
+const STRATEGY_ID = "v13-two-minute-auto-sniper";
 const GLOBAL_SIGNAL_COOLDOWN_MS = 0;
-const PAIR_SIGNAL_COOLDOWN_MS = 10*60*1000;
+const PAIR_SIGNAL_COOLDOWN_MS = 8*60*1000;
 const LOSS_CIRCUIT_BREAKER_MS = 20*60*1000;
 
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
@@ -325,7 +325,7 @@ function setupSequenceSnapshot(bars1m){
   const fr=fractalSnapshot(bars1m,2);
   const atr=atrSnapshot(bars1m,14);
   const b5=completedAggregate(bars1m,300);
-  const reg5=trendRegime(b5,5,13,0.16);
+  const reg5=trendRegime(b5,5,13,0.20);
   if(!sma.ready||!fr.ready||!atr.ready||!reg5.ready){
     return {ready:false,direction:"NEUTRAL"};
   }
@@ -341,16 +341,16 @@ function setupSequenceSnapshot(bars1m){
     ? (!fr.lastLow||last>Number(fr.lastLow.price))
     : (!fr.lastHigh||last<Number(fr.lastHigh.price));
 
-  const zoneLow=Math.min(sma.fast,sma.slow)-0.30*atr.atr;
-  const zoneHigh=Math.max(sma.fast,sma.slow)+0.30*atr.atr;
+  // V13: the pullback must actually visit the 5/13 SMA zone, not merely approach it.
+  const zoneLow=Math.min(sma.fast,sma.slow)-0.18*atr.atr;
+  const zoneHigh=Math.max(sma.fast,sma.slow)+0.18*atr.atr;
   const recent=bars1m.slice(-4);
   const pullbackSeen=recent.some(b=>Number(b.l)<=zoneHigh&&Number(b.h)>=zoneLow);
   const pullbackBeforeLast=bars1m.slice(-4,-1).some(b=>Number(b.l)<=zoneHigh&&Number(b.h)>=zoneLow);
 
-  const last2=bars1m.slice(-2);
-  const resumed=last2.some(b=>direction==="CALL"
-    ? Number(b.c)>Number(b.o)&&Number(b.c)>sma.fast
-    : Number(b.c)<Number(b.o)&&Number(b.c)<sma.fast);
+  const lastCandleBull=Number(lastBar.c)>Number(lastBar.o)&&Number(lastBar.c)>sma.fast;
+  const lastCandleBear=Number(lastBar.c)<Number(lastBar.o)&&Number(lastBar.c)<sma.fast;
+  const resumed=direction==="CALL"?lastCandleBull:lastCandleBear;
 
   return {
     ready:true,direction,barT:Number(lastBar.t),structureOk,pullbackSeen,pullbackBeforeLast,resumed,
@@ -358,7 +358,13 @@ function setupSequenceSnapshot(bars1m){
   };
 }
 
-function score5m(ticks,bars1m,symbol){
+function completedTickBars(ticks,seconds){
+  const span=seconds*1000;
+  const current=Math.floor(Date.now()/span)*span;
+  return buildBars(ticks,seconds).filter(b=>Number(b.t)<current);
+}
+
+function score2m(ticks,bars1m,symbol){
   const sma1=smaTrendSnapshot(bars1m,5,13);
   const fr1=fractalSnapshot(bars1m,2);
   const m1=macdSnapshot(bars1m,5,13,4);
@@ -367,13 +373,18 @@ function score5m(ticks,bars1m,symbol){
   const rsi1=rsiSnapshot(bars1m,7);
   const dmi=dmiAdxSnapshot(bars1m,7);
   const pressure=candlePressure(bars1m,3);
+
   const b5=completedAggregate(bars1m,300);
   const b15=completedAggregate(bars1m,900);
-  const regime5=trendRegime(b5,5,13,0.18);
-  const regime15=trendRegime(b15,3,8,0.16);
+  const regime5=trendRegime(b5,5,13,0.20);
+  const regime15=trendRegime(b15,3,8,0.18);
 
-  if(!sma1.ready||!fr1.ready||!m1.ready||!ar1.ready||!atr1.ready||!rsi1.ready||!dmi.ready||!pressure.ready||!regime5.ready){
-    return {ok:false,grade:"NO TRADE",reason:"A-grade context is still building"};
+  const b30=completedTickBars(ticks,30);
+  const m30=macdSnapshot(b30,3,8,3);
+
+  if(!sma1.ready||!fr1.ready||!m1.ready||!ar1.ready||!atr1.ready||!rsi1.ready||
+     !dmi.ready||!pressure.ready||!regime5.ready){
+    return {ok:false,grade:"NO TRADE",reason:"2-minute sniper context is still building"};
   }
 
   const last=Number(ticks.at(-1)?.p);
@@ -384,12 +395,14 @@ function score5m(ticks,bars1m,symbol){
   const spreadBps=spreadInfo.spreadBps;
   const atrRatio=last>0?atr1.atr/last:0;
 
-  if(spreadInfo.abnormal){
-    return {ok:false,grade:"NO TRADE",reason:"spread is abnormally wide",
-      spreadAtrRatio,spreadBps,spreadSamples:spreadInfo.samples};
+  // Two-minute trades are highly sensitive to spread and abnormal volatility.
+  if(spreadInfo.abnormal||
+     (Number.isFinite(spreadAtrRatio)&&spreadAtrRatio>0.35&&Number(spreadBps)>0.80)){
+    return {ok:false,grade:"NO TRADE",reason:"spread is too large for a 2-minute entry",
+      spreadAtrRatio,spreadBps};
   }
-  if(atrRatio<0.000004||atrRatio>0.0050){
-    return {ok:false,grade:"NO TRADE",reason:"volatility is outside the usable 5-minute range",atrRatio};
+  if(atrRatio<0.000008||atrRatio>0.0028){
+    return {ok:false,grade:"NO TRADE",reason:"volatility is outside the 2-minute sniper range",atrRatio};
   }
 
   const direction=regime5.direction;
@@ -397,13 +410,20 @@ function score5m(ticks,bars1m,symbol){
     return {ok:false,grade:"NO TRADE",reason:"completed 5m trend is neutral"};
   }
 
-  // Only a clearly opposing 15m trend is a hard higher-timeframe veto.
-  if(regime15.ready&&regime15.direction!=="NEUTRAL"&&regime15.direction!==direction&&regime15.efficiency>=0.38){
-    return {ok:false,grade:"NO TRADE",reason:"strong completed 15m trend opposes the setup",
-      coreDirection:direction,regime15:regime15.direction,regime15Efficiency:regime15.efficiency};
+  // A strong opposite 15m trend vetoes the short-expiry setup.
+  if(regime15.ready&&regime15.direction!=="NEUTRAL"&&regime15.direction!==direction&&regime15.efficiency>=0.30){
+    return {ok:false,grade:"NO TRADE",reason:"15m trend opposes the 2-minute setup",
+      coreDirection:direction,regime15:regime15.direction};
   }
 
-  // Structural invalidation stays hard.
+  // The 1m fast/slow stack must agree with the 5m direction.
+  const smaStack=direction==="CALL"?sma1.fast>sma1.slow:sma1.fast<sma1.slow;
+  const fastSlopeAligned=direction==="CALL"?sma1.fastSlope>0:sma1.fastSlope<0;
+  const slowSlopeAligned=direction==="CALL"?sma1.slowSlope>=0:sma1.slowSlope<=0;
+  if(!smaStack||!fastSlopeAligned||!slowSlopeAligned){
+    return {ok:false,grade:"NO TRADE",reason:"1m SMA(5/13) structure is not fully aligned",coreDirection:direction};
+  }
+
   if(direction==="CALL"&&fr1.lastLow&&last<=Number(fr1.lastLow.price)){
     return {ok:false,grade:"NO TRADE",reason:"Fractal(2) support failed",coreDirection:direction};
   }
@@ -411,137 +431,139 @@ function score5m(ticks,bars1m,symbol){
     return {ok:false,grade:"NO TRADE",reason:"Fractal(2) resistance failed",coreDirection:direction};
   }
 
+  // No chasing: a 2-minute trade must begin near the resumption point.
   const distanceFast=Math.abs(last-sma1.fast)/atr1.atr;
-  if(distanceFast>1.45){
-    return {ok:false,grade:"NO TRADE",reason:"entry is too extended from SMA(5)",
+  if(distanceFast>0.68){
+    return {ok:false,grade:"NO TRADE",reason:"entry is too extended for 2-minute expiry",
       distanceFastAtr:distanceFast,coreDirection:direction};
   }
 
   const room=roomToMoveSnapshot(bars1m,last,direction,atr1.atr);
-  if(!room.ready||room.roomAtr<0.60){
-    return {ok:false,grade:"NO TRADE",reason:"not enough room before higher-timeframe support/resistance",
+  if(!room.ready||room.roomAtr<0.85){
+    return {ok:false,grade:"NO TRADE",reason:"insufficient room before support/resistance for 2-minute expiry",
       roomAtr:room.roomAtr};
   }
 
+  const dmiGap=Math.abs(Number(dmi.plusDI)-Number(dmi.minusDI));
   const dmiAligned=direction==="CALL"
     ? dmi.plusDI>dmi.minusDI
     : dmi.minusDI>dmi.plusDI;
-  if(!dmiAligned||dmi.adx<12){
-    return {ok:false,grade:"NO TRADE",reason:"trend strength is too weak",
-      adx:dmi.adx,coreDirection:direction};
+  if(!dmiAligned||dmi.adx<20||dmiGap<4){
+    return {ok:false,grade:"NO TRADE",reason:"ADX/DMI is not strong enough for the 2-minute setup",
+      adx:dmi.adx,dmiGap,coreDirection:direction};
   }
-
-  const imp=tickImpulse(ticks);
-  if(imp.ready){
-    const strongOpp=direction==="CALL"
-      ? (imp.downRatio>=0.74&&imp.norm<0)
-      : (imp.upRatio>=0.74&&imp.norm>0);
-    if(strongOpp){
-      return {ok:false,grade:"NO TRADE",reason:"live Tiingo ticks show a strong reversal against entry",
-        coreDirection:direction};
-    }
-  }
-
-  // From here on, use consensus instead of making every valid entry feature a hard gate.
-  // This avoids one lagging indicator blocking all six FX pairs for long periods.
-  const recent=bars1m.slice(-8);
-  const pullbackNear=recent.some(b=>direction==="CALL"
-    ? Number(b.l)<=sma1.fast+0.80*atr1.atr
-    : Number(b.h)>=sma1.fast-0.80*atr1.atr);
-
-  const last3=bars1m.slice(-3);
-  const continuationCount=last3.filter(b=>direction==="CALL"
-    ? Number(b.c)>Number(b.o)&&Number(b.c)>=sma1.fast
-    : Number(b.c)<Number(b.o)&&Number(b.c)<=sma1.fast
-  ).length;
-  const continuation=continuationCount>=1;
-
-  const priceResumed=direction==="CALL"?last>sma1.fast:last<sma1.fast;
-  const smaStack=direction==="CALL"?sma1.fast>sma1.slow:sma1.fast<sma1.slow;
-  const fastSlopeAligned=direction==="CALL"?sma1.fastSlope>=0:sma1.fastSlope<=0;
 
   const macdAligned=direction==="CALL"
-    ? (m1.macd>m1.signal&&m1.hist>0)
-    : (m1.macd<m1.signal&&m1.hist<0);
+    ? (m1.macd>m1.signal&&m1.hist>0&&m1.hist>=m1.prevHist)
+    : (m1.macd<m1.signal&&m1.hist<0&&m1.hist<=m1.prevHist);
+  if(!macdAligned){
+    return {ok:false,grade:"NO TRADE",reason:"1m MACD has not resumed strongly enough",coreDirection:direction};
+  }
+
   const rsiAligned=direction==="CALL"
-    ? (rsi1.rsi>=46&&rsi1.rsi<=74)
-    : (rsi1.rsi<=54&&rsi1.rsi>=26);
+    ? (rsi1.rsi>=52&&rsi1.rsi<=69)
+    : (rsi1.rsi<=48&&rsi1.rsi>=31);
+  if(!rsiAligned){
+    return {ok:false,grade:"NO TRADE",reason:"RSI(7) is outside the 2-minute continuation zone",rsi:rsi1.rsi};
+  }
+
   const aroonAligned=direction==="CALL"
-    ? ar1.up>ar1.down+5
-    : ar1.down>ar1.up+5;
+    ? ar1.up>ar1.down+15
+    : ar1.down>ar1.up+15;
+  if(!aroonAligned){
+    return {ok:false,grade:"NO TRADE",reason:"Aroon does not confirm the short-expiry direction"};
+  }
+
+  const last1=bars1m.at(-1);
+  const continuation=last1&&(direction==="CALL"
+    ? Number(last1.c)>Number(last1.o)&&Number(last1.c)>sma1.fast
+    : Number(last1.c)<Number(last1.o)&&Number(last1.c)<sma1.fast);
+  if(!continuation){
+    return {ok:false,grade:"NO TRADE",reason:"fresh completed 1m continuation candle is missing"};
+  }
+
+  // The 30-second layer confirms timing only after the 1m/5m setup is already valid.
+  if(!m30.ready||b30.length<12){
+    return {ok:false,grade:"NO TRADE",reason:"30-second timing layer is still warming"};
+  }
+  const microMacd=direction==="CALL"
+    ? (m30.macd>m30.signal&&m30.hist>0)
+    : (m30.macd<m30.signal&&m30.hist<0);
+  const microLast=b30.at(-1);
+  const microCandle=direction==="CALL"
+    ? Number(microLast.c)>Number(microLast.o)
+    : Number(microLast.c)<Number(microLast.o);
+
+  const imp=tickImpulse(ticks);
+  if(!imp.ready){
+    return {ok:false,grade:"NO TRADE",reason:"live tick confirmation is not ready"};
+  }
+  const tickAligned=direction==="CALL"
+    ? (imp.upRatio>=0.60&&imp.norm>0)
+    : (imp.downRatio>=0.60&&imp.norm<0);
+  const strongOpp=direction==="CALL"
+    ? (imp.downRatio>=0.68&&imp.norm<0)
+    : (imp.upRatio>=0.68&&imp.norm>0);
+  if(strongOpp){
+    return {ok:false,grade:"NO TRADE",reason:"live tick flow is reversing against the setup"};
+  }
+  if(!microMacd||!microCandle||!tickAligned){
+    return {ok:false,grade:"NO TRADE",reason:"30s/live timing is not fully aligned"};
+  }
+
   const pressureAligned=direction==="CALL"?pressure.bull>=2:pressure.bear>=2;
-  const tickAligned=imp.ready&&(direction==="CALL"
-    ? (imp.upRatio>=0.53&&imp.norm>0)
-    : (imp.downRatio>=0.53&&imp.norm<0));
-
-  const votes=[
-    ["price resumed beyond SMA(5)",priceResumed,1.3],
-    ["SMA(5/13) stack aligned",smaStack,1.0],
-    ["SMA(5) slope turned with trend",fastSlopeAligned,0.7],
-    ["recent pullback near SMA(5)",pullbackNear,1.0],
-    ["completed 1m continuation candle",continuation,1.1],
-    ["1m MACD aligned",macdAligned,1.0],
-    ["RSI(7) aligned",rsiAligned,0.7],
-    ["Aroon aligned",aroonAligned,0.7],
-    ["1m candle pressure aligned",pressureAligned,0.6],
-    ["live tick flow aligned",tickAligned,0.7]
-  ];
-  const passed=votes.filter(x=>x[1]);
-  const voteCount=passed.length;
-  const voteWeight=passed.reduce((a,x)=>a+x[2],0);
-
-  // A fresh entry still needs price resumption or a completed continuation candle.
-  if(!priceResumed&&!continuation){
-    return {ok:false,grade:"NO TRADE",reason:"waiting for 1m continuation to resume",
-      voteCount,voteWeight,coreDirection:direction};
-  }
-  if(voteCount<5||voteWeight<4.8){
-    return {ok:false,grade:"NO TRADE",reason:`entry consensus is only ${voteCount}/10`,
-      voteCount,voteWeight,coreDirection:direction};
+  if(!pressureAligned){
+    return {ok:false,grade:"NO TRADE",reason:"1m candle pressure is not aligned"};
   }
 
-  let score=7.0 + Math.min(voteWeight,8.8)*0.22;
-  const reasons=[
-    "completed 5m trend aligned",
-    "Fractal(2) structure intact",
-    "ADX/DMI trend strength passed",
-    "room-to-move passed",
-    ...passed.map(x=>x[0])
-  ];
-
-  if(regime15.ready&&regime15.direction===direction){
-    score+=0.6;
-    reasons.push("completed 15m trend aligned");
-  }else if(!regime15.ready||regime15.direction==="NEUTRAL"){
-    score+=0.2;
-    reasons.push("15m context non-opposing");
-  }
+  let score=9.0;
+  if(regime15.ready&&regime15.direction===direction)score+=0.5;
+  if(regime5.efficiency>=0.35)score+=0.3;
+  if(dmi.adx>=25)score+=0.3;
+  if(distanceFast<=0.45)score+=0.3;
+  if(room.roomAtr>=1.20)score+=0.3;
+  if(imp.upRatio>=0.65||imp.downRatio>=0.65)score+=0.2;
 
   const quality=clamp(
-    0.78 +
-    Math.min(voteWeight,8.8)/8.8*0.055 +
-    Math.min(regime5.efficiency,0.7)*0.03 +
-    Math.min(dmi.adx,35)/35*0.03 +
-    (regime15.ready&&regime15.direction===direction?0.018:0),
-    0.78,0.93
+    0.895 +
+    (regime15.ready&&regime15.direction===direction?0.012:0) +
+    Math.min(Math.max(dmi.adx-20,0),15)/15*0.018 +
+    Math.min(Math.max(room.roomAtr-0.85,0),0.75)/0.75*0.014 +
+    (distanceFast<=0.45?0.010:0) +
+    (Math.max(imp.upRatio,imp.downRatio)>=0.65?0.008:0),
+    0.895,0.965
   );
 
   if(quality<A_GRADE_MIN_QUALITY){
     return {ok:false,grade:"NO TRADE",
-      reason:`A-grade score ${Math.round(quality*100)}/100 is below threshold`,
-      quality,voteCount,voteWeight};
+      reason:`2-minute sniper score ${Math.round(quality*100)}/100 is below threshold`,
+      quality};
   }
 
   return {
     ok:true,grade:"A",direction,expirySeconds:EXPIRY_SECONDS,quality,
     callScore:direction==="CALL"?score:0,putScore:direction==="PUT"?score:0,
-    edge:score,coreMajor:voteCount,microConfirmations:0,microScore:0,
+    edge:score,coreMajor:10,microConfirmations:3,microScore:3,
     regime5:regime5.direction,regime15:regime15.ready?regime15.direction:"NOT_READY",
     regime5Efficiency:regime5.efficiency,regime15Efficiency:regime15.ready?regime15.efficiency:null,
     roomAtr:room.roomAtr,spreadAtrRatio,spreadBps,atrRatio,rsi:rsi1.rsi,adx:dmi.adx,
-    voteCount,voteWeight,smaFastPeriod:5,smaSlowPeriod:13,fractalPeriod:2,
-    timeframe:"1min",expiryMinutes:5,smaFast:sma1.fast,smaSlow:sma1.slow,
-    distanceFastAtr:distanceFast,reasons,bars1m:bars1m.length,lastPrice:last
+    dmiGap,smaFastPeriod:5,smaSlowPeriod:13,fractalPeriod:2,
+    timeframe:"1min",expiryMinutes:2,smaFast:sma1.fast,smaSlow:sma1.slow,
+    distanceFastAtr:distanceFast,atr:atr1.atr,
+    reasons:[
+      "completed 5m trend aligned",
+      "1m SMA(5/13) stack and slopes aligned",
+      "Fractal(2) structure intact",
+      "fresh completed 1m continuation",
+      "1m MACD strengthening",
+      "ADX/DMI strong",
+      "RSI(7) continuation zone",
+      "Aroon aligned",
+      "room-to-move passed",
+      "30s MACD + candle aligned",
+      "live tick flow aligned"
+    ],
+    bars1m:bars1m.length,bars30:b30.length,lastPrice:last
   };
 }
 
@@ -1164,7 +1186,7 @@ export class TickHub extends DurableObject {
       };
     }
 
-    const x=score5m(arr,bars1m,symbol);
+    const x=score2m(arr,bars1m,symbol);
     if(!x.ok)return {...x,symbol,setupStage:phase.stage,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status};
 
     const conflict=this.exposureConflict(symbol,x.direction);
