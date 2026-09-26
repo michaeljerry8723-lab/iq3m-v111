@@ -15,6 +15,7 @@ const LOSS_CIRCUIT_BREAKER_MS = 20*60*1000;
 
 // V13.4 shadow validation only. This rule is logged and cannot admit or reject a signal.
 const V13_4_SHADOW = Object.freeze({id:"v13.4-frozen-dmi-adx",dmiGapMin:20.930996673679135,adxMax:76.22584098021053});
+const PRIMARY_WORKER_URL = "https://iq3m-predictor.michaeljerry8723.workers.dev";
 
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 function clamp(x,a,b){ return Math.max(a,Math.min(b,Number(x)||0)); }
@@ -1654,6 +1655,14 @@ export class TickHub extends DurableObject {
 
     if(u.pathname==="/sleep")return json(await this.closeFeeds("request complete"));
 
+    if(u.pathname==="/claim-cron"&&req.method==="POST"){
+      const minute=Math.floor(Date.now()/60000);
+      const last=Number((await this.ctx.storage.get("lastCronMinute"))??-1);
+      if(last===minute)return json({ok:true,claimed:false,minute});
+      await this.ctx.storage.put("lastCronMinute",minute);
+      return json({ok:true,claimed:true,minute});
+    }
+
     if(u.pathname==="/reconnect"){
       await this.forceReconnect("requested");
       await this.forceCryptoReconnect("requested");
@@ -2058,6 +2067,20 @@ export default {
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
     }
+    if(u.pathname==="/cron-scan"&&request.method==="POST"){
+      const expected=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
+      const supplied=String(request.headers.get("X-IQ3M-Cron-Secret")||"");
+      if(!expected||supplied!==expected)return new Response("forbidden",{status:403});
+      try{
+        const claim=await hubPost(env,"/claim-cron",{});
+        if(!claim?.claimed)return json({ok:true,skipped:true,reason:"minute already claimed"});
+        const result=await autoScanAndAlert(env);
+        return json({ok:true,claimed:true,result});
+      }catch(e){
+        console.error("cron-scan failed",String(e?.stack||e?.message||e));
+        return json({ok:false,error:String(e?.message||e)},500);
+      }
+    }
     if(request.method!=="POST")return new Response("V13.1.1 two-minute auto sniper with guaranteed READY-before-signal flow",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
@@ -2233,7 +2256,18 @@ export default {
   },
 
   async scheduled(controller,env,ctx){
-    ctx.waitUntil(autoScanAndAlert(env).catch(()=>{}));
+    ctx.waitUntil((async()=>{
+      try{
+        const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
+        if(!secret)return;
+        await fetch(`${PRIMARY_WORKER_URL}/cron-scan`,{
+          method:"POST",
+          headers:{"X-IQ3M-Cron-Secret":secret}
+        });
+      }catch(e){
+        console.error("scheduled primary dispatch failed",String(e?.message||e));
+      }
+    })());
   }
 
 };
