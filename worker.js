@@ -1578,6 +1578,31 @@ export class TickHub extends DurableObject {
     return {ok:true};
   }
 
+  async getForwardStats(){
+    const current=this.signalHistory.filter(x=>this.isCurrentStrategyRecord(x));
+    const shadow=current.filter(x=>x?.features?.v13_4Shadow?.eligible===true);
+    const rejected=current.filter(x=>x?.features?.v13_4Shadow&&x.features.v13_4Shadow.eligible===false);
+    const summarize=xs=>{
+      const wins=xs.filter(x=>x.result==="WIN").length;
+      const losses=xs.filter(x=>x.result==="LOSS").length;
+      const draws=xs.filter(x=>x.result==="DRAW").length;
+      const voids=xs.filter(x=>x.result==="VOID").length;
+      const wl=wins+losses;
+      return {total:xs.length,wins,losses,draws,voids,wl,winRate:wl?(wins/wl)*100:null};
+    };
+    const pending=this.pendingSignals.filter(x=>this.isCurrentStrategyRecord(x)&&x?.features?.v13_4Shadow?.eligible===true).length;
+    return {
+      ok:true,
+      shadowId:V13_4_SHADOW.id,
+      frozenRule:{dmiGapMin:V13_4_SHADOW.dmiGapMin,adxMax:V13_4_SHADOW.adxMax},
+      eligible:summarize(shadow),
+      nonEligible:summarize(rejected),
+      pendingEligible:pending,
+      targetMinimum:50,
+      targetPreferred:100
+    };
+  }
+
   async getTrackingStats(){
     const current=this.signalHistory.filter(x=>this.isCurrentStrategyRecord(x));
     const wins=current.filter(x=>x.result==="WIN").length;
@@ -1639,7 +1664,7 @@ export class TickHub extends DurableObject {
     if(u.pathname==="/ready-outcome"&&req.method==="POST")return json(await this.finishReadySetup(req));
     if(u.pathname==="/chats")return json(await this.getAlertChats());
     if(u.pathname==="/track"&&req.method==="POST")return json(await this.trackSignal(req));
-    if(u.pathname==="/stats")return json(await this.getTrackingStats());
+    if(u.pathname==="/stats")return json(await this.getTrackingStats());\n    if(u.pathname==="/forwardstats")return json(await this.getForwardStats());
 
     if(u.pathname==="/status"){
       if(symbol) await this.subscribe(symbol);
@@ -2007,6 +2032,18 @@ export default {
         env,
         chatId,
         `TRACKED SIGNAL STATS\nTotal settled: ${st.total||0}\nWins: ${st.wins||0}\nLosses: ${st.losses||0}\nDraws: ${st.draws||0}\nVoids: ${st.voids||0}\nPending: ${st.pending||0}\nWin rate (W/L only): ${wr}\n\nResults are measured from Tiingo prices, not Pocket Option settlement prices.`
+      );
+      return new Response("ok");
+    }
+    if(/^\/forwardstats$/i.test(text)){
+      const st=await hub(env,"/forwardstats");
+      const e=st.eligible||{}, n=st.nonEligible||{};
+      const ewr=e.winRate==null?"n/a":Number(e.winRate).toFixed(1)+"%";
+      const nwr=n.winRate==null?"n/a":Number(n.winRate).toFixed(1)+"%";
+      await tgSend(
+        env,
+        chatId,
+        `V13.4 FORWARD SHADOW STATS\nFrozen rule: DMI gap >= ${Number(st.frozenRule?.dmiGapMin).toFixed(2)} + ADX <= ${Number(st.frozenRule?.adxMax).toFixed(2)}\n\nSHADOW-ELIGIBLE\nSettled: ${e.total||0}\nWins: ${e.wins||0}\nLosses: ${e.losses||0}\nDraws: ${e.draws||0}\nVoids: ${e.voids||0}\nPending: ${st.pendingEligible||0}\nW/L win rate: ${ewr}\n\nNON-ELIGIBLE COMPARISON\nSettled: ${n.total||0}\nWins: ${n.wins||0}\nLosses: ${n.losses||0}\nW/L win rate: ${nwr}\n\nEvidence target: 50 minimum, 100 preferred eligible settled signals.\nTracking uses Tiingo prices, not Pocket Option settlement prices.`
       );
       return new Response("ok");
     }
