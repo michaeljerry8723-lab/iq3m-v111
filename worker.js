@@ -2037,15 +2037,17 @@ export default {
       return new Response("ok");
     }
     if(/^\/forwardstats$/i.test(text)){
-      const st=await hub(env,"/forwardstats");
-      const e=st.eligible||{}, n=st.nonEligible||{};
-      const ewr=e.winRate==null?"n/a":Number(e.winRate).toFixed(1)+"%";
-      const nwr=n.winRate==null?"n/a":Number(n.winRate).toFixed(1)+"%";
-      await tgSend(
-        env,
-        chatId,
-        `V13.4 FORWARD SHADOW STATS\nFrozen rule: DMI gap >= ${Number(st.frozenRule?.dmiGapMin).toFixed(2)} + ADX <= ${Number(st.frozenRule?.adxMax).toFixed(2)}\n\nSHADOW-ELIGIBLE\nSettled: ${e.total||0}\nWins: ${e.wins||0}\nLosses: ${e.losses||0}\nDraws: ${e.draws||0}\nVoids: ${e.voids||0}\nPending: ${st.pendingEligible||0}\nW/L win rate: ${ewr}\n\nNON-ELIGIBLE COMPARISON\nSettled: ${n.total||0}\nWins: ${n.wins||0}\nLosses: ${n.losses||0}\nW/L win rate: ${nwr}\n\nEvidence target: 50 minimum, 100 preferred eligible settled signals.\nTracking uses Tiingo prices, not Pocket Option settlement prices.`
-      );
+      try{
+        const st=await hub(env,"/forwardstats");
+        if(!st?.ok)throw new Error(st?.error||"forward stats unavailable");
+        const e=st.eligible||{}, n=st.nonEligible||{};
+        const ewr=e.winRate==null?"n/a":Number(e.winRate).toFixed(1)+"%";
+        const nwr=n.winRate==null?"n/a":Number(n.winRate).toFixed(1)+"%";
+        await tgSend(env,chatId,`V13.4 FORWARD SHADOW STATS\nFrozen rule: DMI gap >= ${Number(st.frozenRule?.dmiGapMin).toFixed(2)} + ADX <= ${Number(st.frozenRule?.adxMax).toFixed(2)}\n\nSHADOW-ELIGIBLE\nSettled: ${e.total||0}\nWins: ${e.wins||0}\nLosses: ${e.losses||0}\nDraws: ${e.draws||0}\nVoids: ${e.voids||0}\nPending: ${st.pendingEligible||0}\nW/L win rate: ${ewr}\n\nNON-ELIGIBLE COMPARISON\nSettled: ${n.total||0}\nWins: ${n.wins||0}\nLosses: ${n.losses||0}\nW/L win rate: ${nwr}\n\nEvidence target: 50 minimum, 100 preferred eligible settled signals.\nTracking uses Tiingo prices, not Pocket Option settlement prices.`);
+      }catch(e){
+        console.error("forwardstats failed",String(e?.stack||e?.message||e));
+        try{await tgSend(env,chatId,`V13.4 FORWARD STATS ERROR\n${String(e?.message||e).slice(0,300)}\n\nTry /version and /stats. If those respond, the bot is live and only the V13.4 stats route needs attention.`);}catch(_){}
+      }
       return new Response("ok");
     }
     if(/^\/diagnose$/i.test(text)){
