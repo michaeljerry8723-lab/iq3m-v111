@@ -1990,6 +1990,15 @@ export default {
   async fetch(request,env,ctx){
     const u=new URL(request.url);
     if(u.pathname==="/health")return json({ok:true,version:VERSION,expirySeconds:EXPIRY_SECONDS});
+    if(u.pathname==="/diag")return json({
+      ok:true,
+      version:VERSION,
+      telegramTokenConfigured:Boolean(String(env.TELEGRAM_BOT_TOKEN||"").trim()),
+      webhookSecretConfigured:Boolean(String(env.TELEGRAM_WEBHOOK_SECRET||"").trim()),
+      tiingoTokenConfigured:Boolean(String(env.TIINGO_API_TOKEN||"").trim()),
+      tickHubBound:Boolean(env.TICK_HUB),
+      service:"iq3m-predictor diagnostic"
+    });
     if(u.pathname==="/feed"){
       const s=normalizeSymbol(u.searchParams.get("symbol")||"EUR/USD")||"EUR/USD";
       return json(await hub(env,`/status?symbol=${encodeURIComponent(s)}`));
