@@ -109,7 +109,7 @@ function adxSnapshot(bars,p=14){
   for(let i=1;i<bars.length;i++){
     const up=Number(bars[i].h)-Number(bars[i-1].h), dn=Number(bars[i-1].l)-Number(bars[i].l);
     plusDM.push(up>dn&&up>0?up:0); minusDM.push(dn>up&&dn>0?dn:0);
-    tr.push(Math.max(Number(bars[i].h)-Number(bars[i].l),Math.abs(Number(bars[i].h)-Number(bars[i-1].c)),Math.abs(Number(bars[i].l)-Number(bars[i-1].c)));
+    tr.push(Math.max(Number(bars[i].h)-Number(bars[i].l),Math.abs(Number(bars[i].h)-Number(bars[i-1].c)),Math.abs(Number(bars[i].l)-Number(bars[i-1].c))));
   }
   let trS=mean(tr.slice(0,p))*p, pS=mean(plusDM.slice(0,p))*p, mS=mean(minusDM.slice(0,p))*p;
   const dx=[]; let lastPlus=0,lastMinus=0;
