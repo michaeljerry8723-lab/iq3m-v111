@@ -16,3 +16,6 @@ class_name = "MarketHub"
 type = "durable-object"
 state = "created"
 storage = "sqlite"
+
+[triggers]
+crons = []
