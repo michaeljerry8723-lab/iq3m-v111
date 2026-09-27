@@ -1,12 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "1.0.0-forex-daytrader";
+const VERSION = "2.0.0-forex-scalp-swing";
 const SYMBOLS = ["EUR/USD","GBP/USD","USD/JPY","AUD/USD","USD/CAD","USD/CHF","XAU/USD","BTC/USD"];
 const FX_SYMBOLS = SYMBOLS.filter(s => s !== "BTC/USD");
 const CRYPTO_SYMBOLS = ["BTC/USD"];
-const MIN_SCORE = 82;
-const MAX_HOLD_MINUTES = 360;
+const SCALP_MIN_SCORE = 82;
+const SWING_MIN_SCORE = 82;
+const MAX_SCALP_HOLD_MINUTES = 360;
+const MAX_SWING_HOLD_MINUTES = 7*24*60;
 const TARGET_R_MULTIPLE = 2;
+const SHADOW_DMI_GAP_MIN = 20.93;
+const SHADOW_ADX_MAX = 76.23;
 
 function json(data,status=200){return new Response(JSON.stringify(data,null,2),{status,headers:{"content-type":"application/json;charset=UTF-8"}});}
 function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
@@ -29,6 +33,21 @@ function formatPrice(symbol,p){
   if(symbol==="XAU/USD")return n.toFixed(2);
   if(symbol.endsWith("/JPY"))return n.toFixed(3);
   return n.toFixed(5);
+}
+function pipSize(symbol){
+  if(symbol==="BTC/USD")return 1;
+  if(symbol==="XAU/USD")return 0.01;
+  if(symbol.endsWith("/JPY"))return 0.01;
+  return 0.0001;
+}
+function moveLabel(symbol,from,to){
+  const d=Math.abs(Number(to)-Number(from));
+  if(!Number.isFinite(d))return "n/a";
+  if(symbol==="BTC/USD")return `${d.toFixed(2)} points`;
+  return `${Math.round(d/pipSize(symbol))} pips`;
+}
+function shadowEligible(dmiGap,adx){
+  return Number(dmiGap)>=SHADOW_DMI_GAP_MIN && Number(adx)<=SHADOW_ADX_MAX;
 }
 function buildBarsFromTicks(ticks,spanMs){
   const m=new Map();
@@ -193,7 +212,7 @@ function scoreSetup(symbol,m5,m15,h1,lastQuote){
 
   const side=sideScores.BUY>=sideScores.SELL?"BUY":"SELL",other=side==="BUY"?"SELL":"BUY";
   const score=sideScores[side],edge=score-sideScores[other];
-  if(score<MIN_SCORE)return{ok:false,reason:`best setup ${score}/100 below ${MIN_SCORE}`,side,score,edge,buyScore:sideScores.BUY,sellScore:sideScores.SELL};
+  if(score<SCALP_MIN_SCORE)return{ok:false,reason:`best scalp setup ${score}/100 below ${SCALP_MIN_SCORE}`,side,score,edge,buyScore:sideScores.BUY,sellScore:sideScores.SELL};
   if(edge<15)return{ok:false,reason:`directional edge ${edge} below 15`,side,score,edge,buyScore:sideScores.BUY,sellScore:sideScores.SELL};
 
   const entry=Number(lastQuote?.mid||I5.close),atr=I5.atr; const sw=structureSnapshot(m5);
@@ -210,14 +229,80 @@ function scoreSetup(symbol,m5,m15,h1,lastQuote){
   const tp1=side==="BUY"?entry+risk:entry-risk;
   const tp2=side==="BUY"?entry+TARGET_R_MULTIPLE*risk:entry-TARGET_R_MULTIPLE*risk;
   const tp3=side==="BUY"?entry+3*risk:entry-3*risk;
-  return{ok:true,symbol,side,score,edge,buyScore:sideScores.BUY,sellScore:sideScores.SELL,entry,stop,tp1,tp2,tp3,risk,rr:TARGET_R_MULTIPLE,reasons:reasons[side],atr,rsi:I5.rsi,adx:A5.adx,generatedAt:Date.now()};
+  const dmiGap=Math.abs(Number(A5.plusDI)-Number(A5.minusDI));
+  return{ok:true,style:"SCALP",symbol,side,score,edge,buyScore:sideScores.BUY,sellScore:sideScores.SELL,entry,stop,tp1,tp2,tp3,risk,rr:TARGET_R_MULTIPLE,reasons:reasons[side],atr,rsi:I5.rsi,adx:A5.adx,dmiGap,shadowEligible:shadowEligible(dmiGap,A5.adx),generatedAt:Date.now()};
+}
+
+function scoreSwing(symbol,h1,h4,d1,lastQuote){
+  const I1=indicatorSnapshot(h1),I4=indicatorSnapshot(h4),ID=indicatorSnapshot(d1),S4=structureSnapshot(h4),L4=liquiditySnapshot(h4),A1=adxSnapshot(h1);
+  if(![I1.ready,I4.ready,ID.ready,S4.ready,L4.ready,A1.ready].every(Boolean))return{ok:false,reason:"insufficient H1/H4/D1 history"};
+  const sideScores={BUY:0,SELL:0},reasons={BUY:[],SELL:[]};
+  const add=(side,pts,reason)=>{sideScores[side]+=pts;reasons[side].push(`${reason} +${pts}`);};
+
+  if(ID.ema21>ID.ema50&&ID.slope21>0&&ID.close>ID.ema21)add("BUY",20,"D1 bullish trend");
+  else if(ID.ema21<ID.ema50&&ID.slope21<0&&ID.close<ID.ema21)add("SELL",20,"D1 bearish trend");
+  else{
+    if(ID.ema21>ID.ema50)add("BUY",10,"D1 partial bullish alignment");
+    if(ID.ema21<ID.ema50)add("SELL",10,"D1 partial bearish alignment");
+  }
+
+  if(S4.trend==="BULL")add("BUY",14,"H4 higher-high/higher-low structure");
+  if(S4.trend==="BEAR")add("SELL",14,"H4 lower-high/lower-low structure");
+  if(S4.bosUp)add("BUY",6,"H4 bullish break of structure");
+  if(S4.bosDown)add("SELL",6,"H4 bearish break of structure");
+
+  if(L4.sweepLow)add("BUY",15,"H4 sell-side liquidity sweep");
+  if(L4.sweepHigh)add("SELL",15,"H4 buy-side liquidity sweep");
+
+  const dist21=Math.abs(I4.close-I4.ema21)/Math.max(I4.atr,1e-12);
+  if(I4.close>=I4.ema21&&dist21<=1.0)add("BUY",10,"H4 bullish pullback/value area");
+  if(I4.close<=I4.ema21&&dist21<=1.0)add("SELL",10,"H4 bearish pullback/value area");
+
+  const last=h1.at(-1),prev=h1.at(-2);
+  const bullCandle=Number(last.c)>Number(last.o)&&Number(last.c)>Number(prev.h);
+  const bearCandle=Number(last.c)<Number(last.o)&&Number(last.c)<Number(prev.l);
+  if(I1.ema9>I1.ema21&&bullCandle)add("BUY",15,"H1 bullish displacement confirmation");
+  else if(I1.ema9>I1.ema21)add("BUY",8,"H1 bullish EMA trigger");
+  if(I1.ema9<I1.ema21&&bearCandle)add("SELL",15,"H1 bearish displacement confirmation");
+  else if(I1.ema9<I1.ema21)add("SELL",8,"H1 bearish EMA trigger");
+
+  if(I1.rsi>=52&&I1.rsi<=72&&A1.adx>=20&&A1.plusDI>A1.minusDI)add("BUY",10,"H1 RSI/ADX momentum aligned");
+  else if(I1.rsi>=50&&A1.plusDI>A1.minusDI)add("BUY",5,"H1 momentum partially aligned");
+  if(I1.rsi<=48&&I1.rsi>=28&&A1.adx>=20&&A1.minusDI>A1.plusDI)add("SELL",10,"H1 RSI/ADX momentum aligned");
+  else if(I1.rsi<=50&&A1.minusDI>A1.plusDI)add("SELL",5,"H1 momentum partially aligned");
+
+  const recent=h1.slice(-20),avgRange=mean(recent.map(b=>Number(b.h)-Number(b.l)));
+  if(Number.isFinite(avgRange)&&I1.atr>=avgRange*0.65&&I1.atr<=avgRange*2.4){add("BUY",5,"H1 volatility tradable");add("SELL",5,"H1 volatility tradable");}
+  if(spreadOk(symbol,lastQuote)){add("BUY",5,"spread acceptable");add("SELL",5,"spread acceptable");}
+
+  const side=sideScores.BUY>=sideScores.SELL?"BUY":"SELL",other=side==="BUY"?"SELL":"BUY";
+  const score=sideScores[side],edge=score-sideScores[other];
+  if(score<SWING_MIN_SCORE)return{ok:false,reason:`best swing setup ${score}/100 below ${SWING_MIN_SCORE}`,side,score,edge,buyScore:sideScores.BUY,sellScore:sideScores.SELL};
+  if(edge<15)return{ok:false,reason:`directional edge ${edge} below 15`,side,score,edge,buyScore:sideScores.BUY,sellScore:sideScores.SELL};
+
+  const entry=Number(lastQuote?.mid||I1.close),atr=I1.atr,sw=structureSnapshot(h1);
+  let stop;
+  if(side==="BUY"){
+    const swing=sw.ready?sw.lastLow.p:entry-atr;
+    stop=Math.min(swing-0.20*atr,entry-1.25*atr);
+  }else{
+    const swing=sw.ready?sw.lastHigh.p:entry+atr;
+    stop=Math.max(swing+0.20*atr,entry+1.25*atr);
+  }
+  let risk=Math.abs(entry-stop); if(!Number.isFinite(risk)||risk<=0)risk=1.35*atr;
+  risk=clamp(risk,0.9*atr,3.0*atr); stop=side==="BUY"?entry-risk:entry+risk;
+  const tp1=side==="BUY"?entry+risk:entry-risk;
+  const tp2=side==="BUY"?entry+2*risk:entry-2*risk;
+  const tp3=side==="BUY"?entry+3*risk:entry-3*risk;
+  const dmiGap=Math.abs(Number(A1.plusDI)-Number(A1.minusDI));
+  return{ok:true,style:"SWING",symbol,side,score,edge,buyScore:sideScores.BUY,sellScore:sideScores.SELL,entry,stop,tp1,tp2,tp3,risk,rr:2,reasons:reasons[side],atr,rsi:I1.rsi,adx:A1.adx,dmiGap,shadowEligible:shadowEligible(dmiGap,A1.adx),generatedAt:Date.now()};
 }
 
 export class MarketHub extends DurableObject{
   constructor(ctx,env){
     super(ctx,env); this.ctx=ctx; this.env=env;
     this.fxWs=null; this.cryptoWs=null; this.fxStatus="starting"; this.cryptoStatus="starting"; this.connectingFx=false; this.connectingCrypto=false;
-    this.ticks=new Map(); this.quotes=new Map(); this.base5m=new Map(); this.pending=[]; this.history=[]; this.stats={wins:0,losses:0,timeouts:0};
+    this.ticks=new Map(); this.quotes=new Map(); this.base5m=new Map(); this.base1h=new Map(); this.pending=[]; this.history=[]; this.stats={wins:0,losses:0,timeouts:0};
     this.lastFxMsg=0; this.lastCryptoMsg=0; this.quotaBlockedUntil=0;
     this.ctx.blockConcurrencyWhile(async()=>{
       this.pending=(await this.ctx.storage.get("pending"))||[];
@@ -308,18 +393,64 @@ export class MarketHub extends DurableObject{
     await this.ctx.storage.put(`bars5m:${symbol}`,pack);
     return mergeBars(bars,live);
   }
-  async analyze(symbol){
-    symbol=normalizeSymbol(symbol); if(!symbol)return{ok:false,error:"invalid symbol"}; await this.ensureSockets();
-    let bars5; try{bars5=await this.fetchHistorical5m(symbol);}catch(e){return{ok:false,symbol,reason:String(e?.message||e)};}
-    const bars15=resampleBars(bars5,900000).slice(-400),h1=resampleBars(bars5,3600000).slice(-160); const quote=this.quotes.get(symbol)||{mid:Number(bars5.at(-1)?.c)};
-    if(symbol!=="BTC/USD"&&!sessionOk(symbol))return{ok:false,symbol,reason:"outside London/New York day-trading window"};
-    const result=scoreSetup(symbol,bars5,bars15,h1,quote); return{...result,symbol,lastQuote:quote,frames:{M5:bars5.length,M15:bars15.length,H1:h1.length},generatedAt:Date.now()};
+  async fetchHistorical1h(symbol){
+    let cached=this.base1h.get(symbol);
+    if(!cached){
+      const saved=await this.ctx.storage.get(`bars1h:${symbol}`);
+      if(saved&&Array.isArray(saved.bars)){cached=saved;this.base1h.set(symbol,saved);}
+    }
+    const live1h=resampleBars(buildBarsFromTicks(this.ticks.get(symbol)||[],300000),3600000);
+    const cachedLast=Number(cached?.bars?.at(-1)?.t||0);
+    const cacheFresh=cachedLast>0&&(Date.now()-cachedLast)<2*60*60*1000;
+    if(cached&&cached.bars?.length>=500&&cacheFresh)return mergeBars(cached.bars,live1h);
+    if(this.quotaBlockedUntil>Date.now())throw new Error("Tiingo hourly request quota temporarily exhausted");
+    const key=String(this.env.TIINGO_API_TOKEN||"").trim(); if(!key)throw new Error("missing TIINGO_API_TOKEN");
+    const start=new Date(Date.now()-150*24*60*60*1000).toISOString().slice(0,10); let url;
+    if(symbol==="BTC/USD"){
+      url=new URL("https://api.tiingo.com/tiingo/crypto/prices"); url.searchParams.set("tickers",tiingoTicker(symbol)); url.searchParams.set("startDate",start); url.searchParams.set("resampleFreq","1hour");
+    }else{
+      url=new URL(`https://api.tiingo.com/tiingo/fx/${tiingoTicker(symbol)}/prices`); url.searchParams.set("startDate",start); url.searchParams.set("resampleFreq","1hour");
+    }
+    const r=await fetch(url.toString(),{headers:{accept:"application/json",authorization:`Token ${key}`}}); let data=null; try{data=await r.json();}catch(_){}
+    if(!r.ok){const msg=String(data?.detail||data?.message||`Tiingo ${r.status}`);if(/hourly|limit|allocation/i.test(msg)){this.quotaBlockedUntil=(Math.floor(Date.now()/3600000)+1)*3600000+60000;await this.ctx.storage.put("quotaBlockedUntil",this.quotaBlockedUntil);}throw new Error(msg);}
+    let rows;
+    if(symbol==="BTC/USD")rows=Array.isArray(data)&&data[0]&&Array.isArray(data[0].priceData)?data[0].priceData:[]; else rows=Array.isArray(data)?data:[];
+    const current=Math.floor(Date.now()/3600000)*3600000;
+    const bars=rows.map(v=>({t:Date.parse(String(v.date||"")),o:Number(v.open),h:Number(v.high),l:Number(v.low),c:Number(v.close),n:1})).filter(b=>Number.isFinite(b.t)&&[b.o,b.h,b.l,b.c].every(Number.isFinite)&&b.t<current).sort((a,b)=>a.t-b.t).slice(-4000);
+    if(bars.length<500)throw new Error(`only ${bars.length} completed 1h bars available`);
+    const pack={at:Date.now(),bars}; this.base1h.set(symbol,pack); await this.ctx.storage.put(`bars1h:${symbol}`,pack);
+    return mergeBars(bars,live1h);
+  }
+  async analyze(symbol,style="SCALP"){
+    symbol=normalizeSymbol(symbol); style=String(style||"SCALP").toUpperCase();
+    if(!symbol)return{ok:false,error:"invalid symbol"}; if(!["SCALP","SWING"].includes(style))return{ok:false,error:"invalid style"};
+    await this.ensureSockets();
+    const quote=this.quotes.get(symbol);
+    const quoteAge=quote?.receivedAt?Math.max(0,(Date.now()-Number(quote.receivedAt))/1000):Infinity;
+    const maxQuoteAge=style==="SCALP"?60:300;
+    if(!Number.isFinite(quoteAge)||quoteAge>maxQuoteAge)return{ok:false,symbol,style,reason:`no fresh live quote (${Number.isFinite(quoteAge)?quoteAge.toFixed(1):"n/a"}s old)`};
+
+    if(style==="SWING"){
+      let h1; try{h1=await this.fetchHistorical1h(symbol);}catch(e){return{ok:false,symbol,style,reason:String(e?.message||e)};}
+      const h4=resampleBars(h1,4*3600000).slice(-900),d1=resampleBars(h1,24*3600000).slice(-220);
+      const result=scoreSwing(symbol,h1,h4,d1,quote);
+      return{...result,symbol,style,lastQuote:quote,frames:{H1:h1.length,H4:h4.length,D1:d1.length},generatedAt:Date.now()};
+    }
+
+    let bars5; try{bars5=await this.fetchHistorical5m(symbol);}catch(e){return{ok:false,symbol,style,reason:String(e?.message||e)};}
+    const bars15=resampleBars(bars5,900000).slice(-400),h1=resampleBars(bars5,3600000).slice(-160);
+    if(symbol!=="BTC/USD"&&!sessionOk(symbol))return{ok:false,symbol,style,reason:"outside London/New York day-trading window"};
+    const result=scoreSetup(symbol,bars5,bars15,h1,quote);
+    return{...result,symbol,style,lastQuote:quote,frames:{M5:bars5.length,M15:bars15.length,H1:h1.length},generatedAt:Date.now()};
   }
   async track(payload){
-    const symbol=normalizeSymbol(payload.symbol),side=String(payload.side||"").toUpperCase(),entry=Number(payload.entry),stop=Number(payload.stop),tp2=Number(payload.tp2),chatId=payload.chatId;
-    if(!symbol||!["BUY","SELL"].includes(side)||![entry,stop,tp2].every(Number.isFinite)||!chatId)return{ok:false,error:"invalid trade payload"};
-    const id=crypto.randomUUID(),now=Date.now(); const trade={id,symbol,side,entry,stop,tp2,chatId,openedAt:now,expiresAt:now+MAX_HOLD_MINUTES*60000,sourceUpdateId:String(payload.sourceUpdateId||"")};
-    this.pending.push(trade); await this.ctx.storage.put("pending",this.pending); await this.scheduleAlarm(); return{ok:true,id};
+    const symbol=normalizeSymbol(payload.symbol),side=String(payload.side||"").toUpperCase(),style=String(payload.style||"SCALP").toUpperCase();
+    const entry=Number(payload.entry),stop=Number(payload.stop),tp1=Number(payload.tp1),tp2=Number(payload.tp2),tp3=Number(payload.tp3),chatId=payload.chatId;
+    const dmiGap=Number(payload.dmiGap),adx=Number(payload.adx);
+    if(!symbol||!["BUY","SELL"].includes(side)||!["SCALP","SWING"].includes(style)||![entry,stop,tp2].every(Number.isFinite)||!chatId)return{ok:false,error:"invalid trade payload"};
+    const id=crypto.randomUUID(),now=Date.now(),maxHold=style==="SWING"?MAX_SWING_HOLD_MINUTES:MAX_SCALP_HOLD_MINUTES;
+    const trade={id,symbol,side,style,entry,stop,tp1,tp2,tp3,dmiGap,adx,shadowEligible:shadowEligible(dmiGap,adx),chatId,openedAt:now,expiresAt:now+maxHold*60000,sourceUpdateId:String(payload.sourceUpdateId||"")};
+    this.pending.push(trade); await this.ctx.storage.put("pending",this.pending); await this.scheduleAlarm(); return{ok:true,id,shadowEligible:trade.shadowEligible};
   }
   async send(chatId,text){const token=String(this.env.TELEGRAM_BOT_TOKEN||"").trim();if(!token)return;try{await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({chat_id:chatId,text})});}catch(_){}}
   async settle(){
@@ -332,7 +463,7 @@ export class MarketHub extends DurableObject{
       if(!result&&now>=t.expiresAt)result="TIMEOUT";
       if(!result){keep.push(t);continue;}
       if(result==="WIN")this.stats.wins++; else if(result==="LOSS")this.stats.losses++; else this.stats.timeouts++;
-      const rec={...t,result,exit:p,closedAt:now}; this.history=[rec,...this.history].slice(0,100);
+      const rec={...t,result,exit:p,closedAt:now}; this.history=[rec,...this.history].slice(0,500);
       const icon=result==="WIN"?"✅":result==="LOSS"?"❌":"⌛";
       await this.send(t.chatId,`${icon} ${t.symbol} ${t.side} — ${result}\nEntry: ${formatPrice(t.symbol,t.entry)}\nExit: ${formatPrice(t.symbol,p)}\nTracked target: 2R`);
     }
@@ -342,9 +473,19 @@ export class MarketHub extends DurableObject{
   async alarm(){try{await this.ensureSockets();if(this.lastFxMsg&&Date.now()-this.lastFxMsg>60000)await this.ensureFx(true);if(this.lastCryptoMsg&&Date.now()-this.lastCryptoMsg>60000)await this.ensureCrypto(true);await this.settle();}catch(_){}await this.scheduleAlarm();}
   async fetch(req){
     const u=new URL(req.url),symbol=normalizeSymbol(u.searchParams.get("symbol"));
-    if(u.pathname==="/analyze")return json(await this.analyze(symbol));
+    if(u.pathname==="/analyze")return json(await this.analyze(symbol,String(u.searchParams.get("style")||"SCALP")));
     if(u.pathname==="/track"&&req.method==="POST")return json(await this.track(await req.json()));
-    if(u.pathname==="/stats"){const resolved=this.stats.wins+this.stats.losses;return json({ok:true,...this.stats,pending:this.pending.length,winRate:resolved?100*this.stats.wins/resolved:null,recent:this.history.slice(0,8)});}
+    if(u.pathname==="/stats"){
+      const resolved=this.stats.wins+this.stats.losses;
+      const byStyle={};
+      for(const style of ["SCALP","SWING"]){
+        const rows=this.history.filter(x=>String(x.style||"SCALP")===style),wins=rows.filter(x=>x.result==="WIN").length,losses=rows.filter(x=>x.result==="LOSS").length,timeouts=rows.filter(x=>x.result==="TIMEOUT").length;
+        byStyle[style]={settled:rows.length,wins,losses,timeouts,winRate:(wins+losses)?100*wins/(wins+losses):null};
+      }
+      const eligible=this.history.filter(x=>x.shadowEligible===true),nonEligible=this.history.filter(x=>x.shadowEligible!==true);
+      const summarize=rows=>{const wins=rows.filter(x=>x.result==="WIN").length,losses=rows.filter(x=>x.result==="LOSS").length,timeouts=rows.filter(x=>x.result==="TIMEOUT").length;return{settled:rows.length,wins,losses,timeouts,winRate:(wins+losses)?100*wins/(wins+losses):null};};
+      return json({ok:true,...this.stats,pending:this.pending.length,winRate:resolved?100*this.stats.wins/resolved:null,byStyle,shadow:{rule:`DMI gap >= ${SHADOW_DMI_GAP_MIN} + ADX <= ${SHADOW_ADX_MAX}`,eligible:summarize(eligible),nonEligible:summarize(nonEligible)},recent:this.history.slice(0,12)});
+    }
     if(u.pathname==="/status"){
       const rows=SYMBOLS.map(s=>{const q=this.quotes.get(s),age=q?Math.max(0,(Date.now()-q.receivedAt)/1000):null;return{symbol:s,ageSeconds:age,live:age!=null&&age<30,price:q?.mid??q?.p??null};});
       return json({ok:true,version:VERSION,fxStatus:this.fxStatus,cryptoStatus:this.cryptoStatus,fxConnected:Boolean(this.fxWs&&this.fxWs.readyState===1),cryptoConnected:Boolean(this.cryptoWs&&this.cryptoWs.readyState===1),symbols:rows});
@@ -362,27 +503,35 @@ async function tgSend(env,chatId,text){
 function hubStub(env){const id=env.MARKET_HUB.idFromName("global-daytrader-feed");return env.MARKET_HUB.get(id);}
 async function hubGet(env,path){const r=await hubStub(env).fetch(`https://hub${path}`);return r.json();}
 async function hubPost(env,path,body){const r=await hubStub(env).fetch(`https://hub${path}`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});return r.json();}
-async function scanUniverse(env){
+async function scanUniverse(env,style="AUTO"){
+  style=String(style||"AUTO").toUpperCase();
+  const styles=style==="AUTO"?["SCALP","SWING"]:[style];
   const checked=[];
-  for(const symbol of SYMBOLS){try{checked.push(await hubGet(env,`/analyze?symbol=${encodeURIComponent(symbol)}`));}catch(e){checked.push({ok:false,symbol,reason:String(e?.message||e)});}}
+  for(const mode of styles){
+    for(const symbol of SYMBOLS){
+      try{checked.push(await hubGet(env,`/analyze?symbol=${encodeURIComponent(symbol)}&style=${mode}`));}
+      catch(e){checked.push({ok:false,symbol,style:mode,reason:String(e?.message||e)});}
+    }
+  }
   const qualified=checked.filter(x=>x?.ok&&Number.isFinite(Number(x.score))).sort((a,b)=>Number(b.score)-Number(a.score)||Number(b.edge)-Number(a.edge));
-  return qualified.length?{ok:true,best:qualified[0],checked}:{ok:false,checked,reason:"No qualifying setup"};
+  return qualified.length?{ok:true,best:qualified[0],checked}:{ok:false,checked,reason:`No qualifying ${style.toLowerCase()} setup`};
 }
 function setupMessage(x){
-  const dir=x.side==="BUY"?"🟢 BUY":"🔴 SELL";
-  return `${dir} — ${x.symbol}\n\nEntry: ${formatPrice(x.symbol,x.entry)}\nStop Loss: ${formatPrice(x.symbol,x.stop)}\nTP1 (1R): ${formatPrice(x.symbol,x.tp1)}\nTP2 (2R): ${formatPrice(x.symbol,x.tp2)}\nTP3 (3R): ${formatPrice(x.symbol,x.tp3)}\n\nSetup score: ${x.score}/100\nDirectional edge: ${x.edge}\nM5 RSI: ${Number(x.rsi).toFixed(1)}\nM5 ADX: ${Number(x.adx).toFixed(1)}\n\nRisk rule: size the position so the stop equals no more than your chosen account-risk %.\nTracking target: TP2 (2R).`;
+  const dir=x.side==="BUY"?"🟢 BUY":"🔴 SELL",tf=x.style==="SWING"?"H1/H4/D1":"M5/M15/H1";
+  const shadow=x.shadowEligible?"YES":"NO";
+  return `${dir} — ${x.symbol}\nSTYLE: ${x.style}\nTIMEFRAMES: ${tf}\n\nEntry: ${formatPrice(x.symbol,x.entry)}\nStop Loss: ${formatPrice(x.symbol,x.stop)} (${moveLabel(x.symbol,x.entry,x.stop)})\nTP1 (1R): ${formatPrice(x.symbol,x.tp1)} (${moveLabel(x.symbol,x.entry,x.tp1)})\nTP2 (2R): ${formatPrice(x.symbol,x.tp2)} (${moveLabel(x.symbol,x.entry,x.tp2)})\nTP3 (3R): ${formatPrice(x.symbol,x.tp3)} (${moveLabel(x.symbol,x.entry,x.tp3)})\n\nSetup score: ${x.score}/100\nDirectional edge: ${x.edge}\nRSI: ${Number(x.rsi).toFixed(1)}\nADX: ${Number(x.adx).toFixed(1)}\nDMI gap: ${Number(x.dmiGap).toFixed(2)}\nV13.4 shadow rule: ${shadow}\n\nTracking target: TP2 (2R) vs SL. Position sizing remains your decision.`;
 }
 
 export default{
   async fetch(request,env){
     const u=new URL(request.url);
-    if(u.pathname==="/health")return json({ok:true,version:VERSION,symbols:SYMBOLS,minScore:MIN_SCORE});
+    if(u.pathname==="/health")return json({ok:true,version:VERSION,symbols:SYMBOLS,scalpMinScore:SCALP_MIN_SCORE,swingMinScore:SWING_MIN_SCORE,shadowRule:{dmiGapMin:SHADOW_DMI_GAP_MIN,adxMax:SHADOW_ADX_MAX}});
     if(request.method!=="POST")return new Response(`Forex Day Trader ${VERSION}`,{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim(); if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
     const update=await request.json(),msg=update.message||update.edited_message; if(!msg?.chat?.id)return new Response("ok");
     const chatId=msg.chat.id,text=String(msg.text||"").trim();
-    if(/^\/start$/i.test(text)){await tgSend(env,chatId,`FOREX DAY TRADER V1\n\nUse /signal to scan all 8 markets:\nEUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, USD/CHF, XAU/USD, BTC/USD\n\nOnly qualifying setups are returned. No forced trades.`);return new Response("ok");}
+    if(/^\/start$/i.test(text)){await tgSend(env,chatId,`FOREX SIGNAL V2\n\nMarkets: EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, USD/CHF, XAU/USD, BTC/USD\n\n/signal — strongest setup across SCALP + SWING\n/scalp — M5/M15/H1 only\n/swing — H1/H4/D1 only\n/checkall — live feeds\n/stats — tracked TP2-vs-SL results\n/forwardstats — V13.4 DMI/ADX shadow comparison\n\nNo forced trades: weak conditions return NO TRADE.`);return new Response("ok");}
     if(/^\/version$/i.test(text)){await tgSend(env,chatId,VERSION);return new Response("ok");}
     if(/^\/checkall$/i.test(text)){
       const s=await hubGet(env,"/status"); const lines=s.symbols.map(x=>`${x.live?"🟢":"⚪"} ${x.symbol} — ${x.live?"LIVE":"NO FRESH TICK"}${x.ageSeconds==null?"":` • ${x.ageSeconds.toFixed(1)}s`}`);
@@ -390,19 +539,28 @@ export default{
     }
     if(/^\/stats$/i.test(text)){
       const s=await hubGet(env,"/stats"),wr=s.winRate==null?"n/a":`${Number(s.winRate).toFixed(1)}%`;
-      await tgSend(env,chatId,`DAY-TRADE STATS\nWins: ${s.wins}\nLosses: ${s.losses}\nTimeouts: ${s.timeouts}\nPending: ${s.pending}\nWin rate (2R vs SL): ${wr}`);return new Response("ok");
+      const sw=s.byStyle?.SWING||{},sc=s.byStyle?.SCALP||{};
+      await tgSend(env,chatId,`FOREX SIGNAL STATS\nWins: ${s.wins}\nLosses: ${s.losses}\nTimeouts: ${s.timeouts}\nPending: ${s.pending}\nOverall W/L win rate: ${wr}\n\nSCALP — ${sc.wins||0}W / ${sc.losses||0}L / ${sc.timeouts||0}T\nSWING — ${sw.wins||0}W / ${sw.losses||0}L / ${sw.timeouts||0}T`);return new Response("ok");
+    }
+    if(/^\/forwardstats$/i.test(text)){
+      const s=await hubGet(env,"/stats"),sh=s.shadow||{},e=sh.eligible||{},n=sh.nonEligible||{};
+      const ew=e.winRate==null?"n/a":`${Number(e.winRate).toFixed(1)}%`,nw=n.winRate==null?"n/a":`${Number(n.winRate).toFixed(1)}%`;
+      await tgSend(env,chatId,`V13.4 FOREX SHADOW STATS\nFrozen rule: DMI gap >= ${SHADOW_DMI_GAP_MIN} + ADX <= ${SHADOW_ADX_MAX}\n\nSHADOW-ELIGIBLE\nSettled: ${e.settled||0}\nWins: ${e.wins||0}\nLosses: ${e.losses||0}\nTimeouts: ${e.timeouts||0}\nW/L win rate: ${ew}\n\nNON-ELIGIBLE COMPARISON\nSettled: ${n.settled||0}\nWins: ${n.wins||0}\nLosses: ${n.losses||0}\nTimeouts: ${n.timeouts||0}\nW/L win rate: ${nw}`);return new Response("ok");
     }
     if(/^\/reconnect$/i.test(text)){const s=await hubGet(env,"/reconnect");await tgSend(env,chatId,`Reconnect requested.\nFX: ${s.fxStatus}\nBTC: ${s.cryptoStatus}`);return new Response("ok");}
-    if(/^\/signal\s*$/i.test(text)){
-      const scan=await scanUniverse(env);
+    const runSignal=async mode=>{
+      const scan=await scanUniverse(env,mode);
       if(!scan.ok){
-        const reasons=scan.checked.slice(0,8).map(x=>`${x.symbol}: ${x.reason||"not qualified"}`).join("\n");
-        await tgSend(env,chatId,`⏳ NO QUALIFIED DAY-TRADE SETUP\n\nThe bot scanned all 8 markets and did not force a trade.\n\n${reasons}`);return new Response("ok");
+        const reasons=scan.checked.slice(0,16).map(x=>`${x.style||mode} ${x.symbol}: ${x.reason||"not qualified"}`).join("\n");
+        await tgSend(env,chatId,`⏳ NO QUALIFIED ${mode} SETUP\n\nThe bot scanned the market universe and did not force a trade.\n\n${reasons}`);return;
       }
       const x=scan.best; await tgSend(env,chatId,setupMessage(x));
-      await hubPost(env,"/track",{sourceUpdateId:update.update_id,chatId,symbol:x.symbol,side:x.side,entry:x.entry,stop:x.stop,tp2:x.tp2}); return new Response("ok");
-    }
-    if(/^\/signal\b/i.test(text)){await tgSend(env,chatId,"Use /signal by itself. V1 scans all 8 markets and returns only the strongest qualifying setup.");return new Response("ok");}
+      await hubPost(env,"/track",{sourceUpdateId:update.update_id,chatId,style:x.style,symbol:x.symbol,side:x.side,entry:x.entry,stop:x.stop,tp1:x.tp1,tp2:x.tp2,tp3:x.tp3,dmiGap:x.dmiGap,adx:x.adx});
+    };
+    if(/^\/signal\s*$/i.test(text)){await runSignal("AUTO");return new Response("ok");}
+    if(/^\/scalp\s*$/i.test(text)){await runSignal("SCALP");return new Response("ok");}
+    if(/^\/swing\s*$/i.test(text)){await runSignal("SWING");return new Response("ok");}
+    if(/^\/(signal|scalp|swing)\b/i.test(text)){await tgSend(env,chatId,"Use /signal, /scalp or /swing by itself. The bot scans all 8 markets and returns only the strongest qualifying setup.");return new Response("ok");}
     return new Response("ok");
   }
 };
