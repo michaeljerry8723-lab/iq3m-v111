@@ -1,10 +1,12 @@
-name = "forex-daytrader-v1"
+name = "forex-signal-v2"
 main = "forex-worker.js"
-compatibility_date = "2026-09-24"
+compatibility_date = "2026-09-27"
 
 [vars]
-MIN_SETUP_SCORE = "82"
-MAX_HOLD_MINUTES = "360"
+SCALP_MIN_SCORE = "82"
+SWING_MIN_SCORE = "82"
+SHADOW_DMI_GAP_MIN = "20.93"
+SHADOW_ADX_MAX = "76.23"
 
 [[durable_objects.bindings]]
 name = "MARKET_HUB"
