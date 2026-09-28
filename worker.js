@@ -1,7 +1,7 @@
 // V13.1 — two-minute automatic sniper with persistent READY pre-alerts
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "13.2.2-scheduler-diagnostic";
+const VERSION = "13.2.3-quota-safe";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set();
@@ -739,7 +739,7 @@ export class TickHub extends DurableObject {
     super(ctx,env);
     this.ctx=ctx; this.env=env; this.ws=null; this.cryptoWs=null; this.ticks=new Map(); this.symbols=new Set();
     this.lastStatus="starting"; this.lastSubscribeStatus=null; this.connecting=false; this.cryptoConnecting=false; this.provider="tiingo"; this.lastCryptoStatus="starting"; this.lastCryptoSubscribeStatus=null; this.lastCryptoWsMessageAt=0;
-    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map(); this.quotaBlockedUntil=0; this.pendingSignals=[]; this.signalStats={total:0,wins:0,losses:0,draws:0,voids:0}; this.signalHistory=[]; this.forwardStats=null; this.alertChats=[]; this.setupStates={}; this.readyAlertClaims={}; this.readyAudit=[];
+    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map(); this.oneMinuteCacheDirty=false; this.quotaBlockedUntil=0; this.pendingSignals=[]; this.signalStats={total:0,wins:0,losses:0,draws:0,voids:0}; this.signalHistory=[]; this.forwardStats=null; this.alertChats=[]; this.setupStates={}; this.readyAlertClaims={}; this.readyAudit=[];
 
     this.ctx.blockConcurrencyWhile(async()=>{
       // V11.2: prefer the configured warm list over old persisted symbols so a Basic/trial
@@ -873,7 +873,10 @@ export class TickHub extends DurableObject {
 
   async primeLiveFlow(sampleMs=5000){
     const ms=Math.max(2000,Math.min(8000,Number(sampleMs)||5000));
-    try{await this.fetchTopSnapshots(FIXED_UNIVERSE);}catch(_){}
+    // QUOTA-SAFE: do not call Tiingo REST here. This route runs every minute and
+    // a single REST request per scan would exceed Tiingo Starter's 50/hour limit.
+    // Fresh quotes come from the WebSocket; REST is reserved for historical context,
+    // explicit /checkall health checks and settlement snapshots.
     const before={};
     for(const symbol of FIXED_UNIVERSE)before[symbol]=(this.ticks.get(symbol)||[]).length;
     await this.ensureSocket();
@@ -940,6 +943,9 @@ export class TickHub extends DurableObject {
   }
 
   async closeFeeds(reason="free-tier sleep"){
+    if(this.oneMinuteCacheDirty){
+      try{await this.persistOneMinuteCache();}catch(e){this.lastStatus=`context persist error: ${String(e?.message||e)}`;}
+    }
     try{if(this.ws){try{this.ws.close(1000,reason);}catch(_){}}}catch(_){}
     try{if(this.cryptoWs){try{this.cryptoWs.close(1000,reason);}catch(_){}}}catch(_){}
     this.ws=null; this.cryptoWs=null; this.connecting=false; this.cryptoConnecting=false;
@@ -1263,6 +1269,7 @@ export class TickHub extends DurableObject {
     const out={};
     for(const [symbol,value] of this.oneMinuteCache.entries())out[symbol]=value;
     await this.ctx.storage.put("oneMinuteCacheData",out);
+    this.oneMinuteCacheDirty=false;
   }
 
   mergeOneMinuteContext(symbol,cachedBars=[]){
@@ -1297,6 +1304,7 @@ export class TickHub extends DurableObject {
     if(this.contextIsUsable(merged)){
       if(!cached||merged.at(-1)?.t!==cached.bars?.at(-1)?.t){
         this.oneMinuteCache.set(symbol,{at:Date.now(),bars:merged});
+        this.oneMinuteCacheDirty=true;
       }
       return merged;
     }
@@ -1918,7 +1926,11 @@ export class TickHub extends DurableObject {
       const count=Number((await this.ctx.storage.get("cronScanCount"))||0);
       const lastResult=(await this.ctx.storage.get("lastCronResult"))||null;
       const ageSeconds=lastCronClaimAt?Math.max(0,(Date.now()-lastCronClaimAt)/1000):null;
-      return json({ok:true,lastCronClaimAt,lastCronResultAt,ageSeconds,count,lastResult});
+      return json({
+        ok:true,lastCronClaimAt,lastCronResultAt,ageSeconds,count,lastResult,
+        quotaBlockedUntil:Number(this.quotaBlockedUntil||0)||null,
+        quotaRetryMinutes:this.quotaBlockedUntil>Date.now()?this.quotaRetryMinutes():0
+      });
     }
 
     if(u.pathname==="/reconnect"){
@@ -2362,7 +2374,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V13.2.1 — TWO-MINUTE AUTO SNIPER. Automatic scanning is maintained by a self-scheduling Durable Object alarm, so it can continue without consuming another account Cron Trigger slot. The free-tier runtime primes all six live feeds together, expires stale pullbacks, and uses a strict fresh live-tick timing fallback when durable 30-second history is unavailable. READY 🔥🔥 must still be delivered before any final 2-minute signal."
+        "V13.2.3 — TWO-MINUTE AUTO SNIPER. Automatic scanning is maintained by a Durable Object alarm. Minute-by-minute priming now uses WebSocket data only so Tiingo's 50/hour Starter REST allowance is preserved for historical context, health checks and settlement. READY 🔥🔥 must still be delivered before any final 2-minute signal."
       );
       return new Response("ok");
     }
@@ -2448,7 +2460,8 @@ export default {
       const r=st.lastResult||{};
       const next=sch.nextAlarmAt?Math.max(0,Math.ceil((Number(sch.nextAlarmAt)-Date.now())/1000))+"s":"n/a";
       const source=schedulerError?"NOT ARMED":(sch.enabled?"Durable Object alarm":"NOT ARMED");
-      await tgSend(env,chatId,`AUTO-SCAN STATUS\nVersion: ${VERSION}\nScheduler: ${source}\nLast scan: ${age} ago\nScans recorded: ${st.count||0}\nNext scheduler wake: ${next}\nLast result: ${r.ok?"qualified/handled":(r.reason||"no qualified setup")}\nREADY alerts in last scan: ${r.readyAlertsSent||0}${r.symbol?`\nSymbol: ${r.symbol}`:""}${schedulerError?`\nScheduler error: ${schedulerError}`:""}${sch.lastError?`\nAlarm error: ${sch.lastError}`:""}`);
+      const quota=Number(st.quotaRetryMinutes||0)>0?`BLOCKED — about ${st.quotaRetryMinutes}m to reset`:"OK";
+      await tgSend(env,chatId,`AUTO-SCAN STATUS\nVersion: ${VERSION}\nScheduler: ${source}\nLast scan: ${age} ago\nScans recorded: ${st.count||0}\nNext scheduler wake: ${next}\nTiingo REST quota: ${quota}\nLast result: ${r.ok?"qualified/handled":(r.reason||"no qualified setup")}\nREADY alerts in last scan: ${r.readyAlertsSent||0}${r.symbol?`\nSymbol: ${r.symbol}`:""}${schedulerError?`\nScheduler error: ${schedulerError}`:""}${sch.lastError?`\nAlarm error: ${sch.lastError}`:""}`);
       return new Response("ok");
     }
     if(/^\/reconnect$/i.test(text)){
