@@ -1,14 +1,14 @@
 // V13.5 — five-minute automatic sniper with persistent READY pre-alerts
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "13.5.2-structural-room-fix";
+const VERSION = "13.5.3-frequency-balanced";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set();
 const A_GRADE_MIN_QUALITY = 0.90;
 const EXPIRY_SECONDS = 300;
-const STRATEGY_ID = "v13.5.2-structural-room-fix";
-const PREPARE_TTL_MS = 6*60*1000;
+const STRATEGY_ID = "v13.5.3-frequency-balanced";
+const PREPARE_TTL_MS = 8*60*1000;
 const PULLBACK_TTL_MS = 4*60*1000;
 const GLOBAL_SIGNAL_COOLDOWN_MS = 0;
 const PAIR_SIGNAL_COOLDOWN_MS = 12*60*1000;
@@ -446,14 +446,14 @@ function score5m(ticks,bars1m,symbol){
       coreDirection:direction,regime15:regime15.direction};
   }
 
-  // For a 5-minute hold, the fast/slow stack and fast-slope continuation are the
-  // important hard requirements. The slower SMA slope can lag briefly after a valid
-  // pullback, so it contributes to quality instead of vetoing an otherwise valid setup.
+  // For a five-minute hold the SMA stack is the structural hard gate. The fast
+  // slope can briefly flatten after a pullback, so it contributes to quality rather
+  // than automatically cancelling an otherwise strong continuation.
   const smaStack=direction==="CALL"?sma1.fast>sma1.slow:sma1.fast<sma1.slow;
   const fastSlopeAligned=direction==="CALL"?sma1.fastSlope>0:sma1.fastSlope<0;
   const slowSlopeAligned=direction==="CALL"?sma1.slowSlope>=0:sma1.slowSlope<=0;
-  if(!smaStack||!fastSlopeAligned){
-    return {ok:false,grade:"NO TRADE",reason:"1m SMA(5/13) continuation structure failed",coreDirection:direction};
+  if(!smaStack){
+    return {ok:false,grade:"NO TRADE",reason:"SMA 5/13 stack reversed",coreDirection:direction};
   }
 
   if(direction==="CALL"&&fr1.lastLow&&last<=Number(fr1.lastLow.price)){
@@ -463,12 +463,13 @@ function score5m(ticks,bars1m,symbol){
     return {ok:false,grade:"NO TRADE",reason:"Fractal(2) resistance failed",coreDirection:direction};
   }
 
-  // A five-minute continuation can legitimately move away from SMA(5) after READY.
-  // Only reject clearly chased entries; moderate extension is handled by the quality score.
+  // Five-minute entries can remain valid after a strong post-pullback expansion.
+  // 2.00 ATR is the absolute chase cap; extension inside that range is penalized
+  // through quality instead of acting as an automatic veto.
   const distanceFast=Math.abs(last-sma1.fast)/atr1.atr;
-  if(distanceFast>1.25){
+  if(distanceFast>2.00){
     return {ok:false,grade:"NO TRADE",
-      reason:`entry extension ${distanceFast.toFixed(2)} ATR exceeds the 1.25 ATR five-minute limit`,
+      reason:`entry extension ${distanceFast.toFixed(2)} ATR exceeds the 2.00 ATR five-minute limit`,
       distanceFastAtr:distanceFast,coreDirection:direction};
   }
 
@@ -503,11 +504,14 @@ function score5m(ticks,bars1m,symbol){
   const pressureAligned=direction==="CALL"?pressure.bull>=2:pressure.bear>=2;
   const momentumChecks={macd:macdAligned,rsi:rsiAligned,aroon:aroonAligned,pressure:pressureAligned};
   const momentumConfirmations=Object.values(momentumChecks).filter(Boolean).length;
-  if(momentumConfirmations<3){
+  const strongCoreForTwo=dmi.adx>=23&&dmiGap>=6&&regime5.efficiency>=0.25;
+  if(momentumConfirmations<2||(momentumConfirmations===2&&!strongCoreForTwo)){
     const failed=Object.entries(momentumChecks).filter(([,ok])=>!ok).map(([k])=>k.toUpperCase()).join(", ");
     return {ok:false,grade:"NO TRADE",
-      reason:`momentum confluence ${momentumConfirmations}/4 — need 3/4${failed?"; missing "+failed:""}`,
-      momentumConfirmations,momentumChecks,rsi:rsi1.rsi,coreDirection:direction};
+      reason:momentumConfirmations<2
+        ? `momentum confluence ${momentumConfirmations}/4 — need at least 2/4${failed?"; missing "+failed:""}`
+        : `momentum is 2/4 but core strength is not high enough for the five-minute override`,
+      momentumConfirmations,momentumChecks,strongCoreForTwo,rsi:rsi1.rsi,coreDirection:direction};
   }
 
   const last1=bars1m.at(-1);
@@ -560,13 +564,14 @@ function score5m(ticks,bars1m,symbol){
   }
 
   let score=9.0;
-  score+=0.15*(momentumConfirmations-2);
+  score+=0.15*Math.max(0,momentumConfirmations-2);
   if(regime15.ready&&regime15.direction===direction)score+=0.5;
   if(regime5.efficiency>=0.35)score+=0.3;
   if(dmi.adx>=25)score+=0.3;
-  if(slowSlopeAligned)score+=0.2;
+  if(fastSlopeAligned)score+=0.2;
+  if(slowSlopeAligned)score+=0.1;
   if(distanceFast<=0.60)score+=0.3;
-  else if(distanceFast<=0.95)score+=0.15;
+  else if(distanceFast<=1.25)score+=0.15;
   if(room.roomAtr>=1.20)score+=0.3;
   if(imp.upRatio>=0.65||imp.downRatio>=0.65)score+=0.2;
 
@@ -575,10 +580,11 @@ function score5m(ticks,bars1m,symbol){
     (regime15.ready&&regime15.direction===direction?0.012:0) +
     Math.min(Math.max(dmi.adx-20,0),15)/15*0.018 +
     Math.min(Math.max(room.roomAtr-0.35,0),0.85)/0.85*0.014 +
-    (slowSlopeAligned?0.004:0) +
-    (distanceFast<=0.60?0.010:(distanceFast<=0.95?0.005:0)) +
+    (fastSlopeAligned?0.005:0) +
+    (slowSlopeAligned?0.003:0) +
+    (distanceFast<=0.60?0.010:(distanceFast<=1.25?0.005:0)) +
     (Math.max(imp.upRatio,imp.downRatio)>=0.65?0.008:0) +
-    (momentumConfirmations===4?0.006:0.003),
+    (momentumConfirmations===4?0.007:(momentumConfirmations===3?0.004:(strongCoreForTwo?0.002:0))),
     0.895,0.970
   );
 
@@ -598,12 +604,14 @@ function score5m(ticks,bars1m,symbol){
     dmiGap,smaFastPeriod:5,smaSlowPeriod:13,fractalPeriod:2,
     timeframe:"1min",expiryMinutes:5,smaFast:sma1.fast,smaSlow:sma1.slow,
     distanceFastAtr:distanceFast,atr:atr1.atr,
+    smaFastSlopeAligned:fastSlopeAligned,
     smaSlowSlopeAligned:slowSlopeAligned,
-    entryExtensionBand:distanceFast<=0.88?"pullback-zone":(distanceFast<=1.25?"continuation-zone":"overextended"),
+    strongCoreForTwo,
+    entryExtensionBand:distanceFast<=0.88?"pullback-zone":(distanceFast<=1.25?"continuation-zone":(distanceFast<=2.00?"expanded-continuation":"overextended")),
     momentumConfirmations,momentumChecks,
     reasons:[
       "completed 5m trend aligned",
-      "1m SMA(5/13) stack and slopes aligned",
+      "1m SMA(5/13) stack aligned",
       "Fractal(2) structure intact",
       "fresh completed 1m continuation",
       `momentum confluence ${momentumConfirmations}/4`,
@@ -690,8 +698,8 @@ function preAlert5m(ticks,bars1m,symbol,direction){
   }
 
   const distanceFast=Math.abs(last-sma.fast)/atr.atr;
-  if(distanceFast>1.25)return {ok:false,
-    reason:`price extension ${distanceFast.toFixed(2)} ATR exceeds the 1.25 ATR READY limit`};
+  if(distanceFast>1.60)return {ok:false,
+    reason:`price extension ${distanceFast.toFixed(2)} ATR exceeds the 1.60 ATR READY limit`};
 
   const room=roomToMoveSnapshot(bars1m,last,direction,atr.atr);
   if(!room.ready)return {ok:false,reason:"structural room context is still building"};
@@ -712,7 +720,7 @@ function preAlert5m(ticks,bars1m,symbol,direction){
     Math.min(Math.max(room.roomAtr-0.50,0),0.70)/0.70*0.025 +
     (reg15.ready&&reg15.direction===direction?0.020:0) +
     (slopeSupport?0.008:0) +
-    (distanceFast<=0.65?0.015:(distanceFast<=0.95?0.008:0)),
+    (distanceFast<=0.65?0.015:(distanceFast<=1.10?0.008:0)),
     0.84,0.94
   );
 
@@ -729,7 +737,7 @@ function preAlert5m(ticks,bars1m,symbol,direction){
     spreadAtrRatio:spread.spreadAtrRatio,
     spreadBps:spread.spreadBps,
     smaFastSlopeAligned:slopeSupport,
-    entryExtensionBand:distanceFast<=0.88?"pullback-zone":(distanceFast<=1.25?"continuation-zone":"overextended"),
+    entryExtensionBand:distanceFast<=0.88?"pullback-zone":(distanceFast<=1.60?"continuation-zone":"overextended"),
     preMomentumConfirmations,preMomentumChecks
   };
 }
@@ -2516,7 +2524,7 @@ export default {
         return json({ok:false,error:String(e?.message||e)},500);
       }
     }
-    if(request.method!=="POST")return new Response("V13.5.2 five-minute auto sniper — structural-room fix",{status:200});
+    if(request.method!=="POST")return new Response("V13.5.3 five-minute auto sniper — frequency-balanced",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -2539,7 +2547,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V13.5.2 — FIVE-MINUTE AUTO SNIPER. Room-to-move now uses confirmed 15m swing structure instead of every candle wick, and an already-delivered READY is preserved through transient blockers rather than being cancelled immediately. Hard cancellation is reserved for genuine structural invalidation: 5m direction change, fractal failure, SMA-stack reversal or a strong opposite 15m trend. Final CALL/PUT still requires A-grade confirmation and live timing. Use /readystats for exact blockers."
+        "V13.5.3 — FIVE-MINUTE AUTO SNIPER. Frequency is rebalanced for the five-minute horizon: SMA stack remains structural, fast-slope lag is scored rather than vetoed, extension is allowed up to 2.00 ATR, and 2/4 momentum can qualify only when ADX/DMI and the 5m trend are especially strong. The 90% A-grade floor, fractal structure, structural room, completed 1m continuation and live-tick timing remain mandatory. Use /readystats for exact blockers."
       );
       return new Response("ok");
     }
