@@ -2205,9 +2205,10 @@ export default {
       const rows=await checkAllFeeds(env);
       const icon=h=>h==="LIVE"?"🟢":h==="WARMING"?"🟡":h==="STALE"?"🔴":h==="ERROR"?"❌":"⚪";
       const lines=rows.map(r=>{
-        const rx=r.receivedAge==null?"n/a":r.receivedAge.toFixed(1)+"s";
         const px=r.providerAge==null?"n/a":r.providerAge.toFixed(1)+"s";
-        return `${icon(r.health)} ${r.symbol} — ${r.health}\nTicks: ${r.ticks} • Rx: ${rx} • Px: ${px}`;
+        const price=Number.isFinite(Number(r.price))?formatFxPrice(r.symbol,Number(r.price)):"n/a";
+        const source=r.source==="tiingo-rest-top"?"REST top-of-book":"feed";
+        return `${icon(r.health)} ${r.symbol} — ${r.health}\nPrice: ${price} • Quote age: ${px} • ${source}`;
       });
       const liveCount=rows.filter(r=>r.health==="LIVE").length;
       await tgSend(
