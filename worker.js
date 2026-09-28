@@ -1,17 +1,17 @@
 // V13.5 — five-minute automatic sniper with persistent READY pre-alerts
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "13.5.3-frequency-balanced";
+const VERSION = "13.6.0-signal-only";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set();
-const A_GRADE_MIN_QUALITY = 0.90;
+const A_GRADE_MIN_QUALITY = 0.895;
 const EXPIRY_SECONDS = 300;
-const STRATEGY_ID = "v13.5.3-frequency-balanced";
-const PREPARE_TTL_MS = 8*60*1000;
-const PULLBACK_TTL_MS = 4*60*1000;
+const STRATEGY_ID = "v13.6-signal-only";
+const PREPARE_TTL_MS = 10*60*1000;
+const PULLBACK_TTL_MS = 5*60*1000;
 const GLOBAL_SIGNAL_COOLDOWN_MS = 0;
-const PAIR_SIGNAL_COOLDOWN_MS = 12*60*1000;
+const PAIR_SIGNAL_COOLDOWN_MS = 6*60*1000;
 const LOSS_CIRCUIT_BREAKER_MS = 20*60*1000;
 
 // V13.4 shadow validation only. This rule is logged and cannot admit or reject a signal.
@@ -467,9 +467,9 @@ function score5m(ticks,bars1m,symbol){
   // 2.00 ATR is the absolute chase cap; extension inside that range is penalized
   // through quality instead of acting as an automatic veto.
   const distanceFast=Math.abs(last-sma1.fast)/atr1.atr;
-  if(distanceFast>2.00){
+  if(distanceFast>2.50){
     return {ok:false,grade:"NO TRADE",
-      reason:`entry extension ${distanceFast.toFixed(2)} ATR exceeds the 2.00 ATR five-minute limit`,
+      reason:`entry extension ${distanceFast.toFixed(2)} ATR exceeds the 2.50 ATR five-minute limit`,
       distanceFastAtr:distanceFast,coreDirection:direction};
   }
 
@@ -556,8 +556,8 @@ function score5m(ticks,bars1m,symbol){
     microMode="30s-macd+live";
   }else{
     microAligned=direction==="CALL"
-      ? (imp.upRatio>=0.60&&imp.norm>=0.20)
-      : (imp.downRatio>=0.60&&imp.norm<=-0.20);
+      ? (imp.upRatio>=0.57&&imp.norm>=0.10)
+      : (imp.downRatio>=0.57&&imp.norm<=-0.10);
   }
   if(!microAligned){
     return {ok:false,grade:"NO TRADE",reason:has30sContext?"30s/live timing is not fully aligned":"fresh live-tick burst is not strong enough"};
@@ -607,7 +607,7 @@ function score5m(ticks,bars1m,symbol){
     smaFastSlopeAligned:fastSlopeAligned,
     smaSlowSlopeAligned:slowSlopeAligned,
     strongCoreForTwo,
-    entryExtensionBand:distanceFast<=0.88?"pullback-zone":(distanceFast<=1.25?"continuation-zone":(distanceFast<=2.00?"expanded-continuation":"overextended")),
+    entryExtensionBand:distanceFast<=0.88?"pullback-zone":(distanceFast<=1.25?"continuation-zone":(distanceFast<=2.50?"expanded-continuation":"overextended")),
     momentumConfirmations,momentumChecks,
     reasons:[
       "completed 5m trend aligned",
@@ -1664,17 +1664,13 @@ export class TickHub extends DurableObject {
         const readyKey=`${symbol}|${phase.direction}|${Number(phase.lastBarT)}`;
         phase=await this.setSetupStage(symbol,{
           stage:"PREPARE",direction:phase.direction,lastBarT:phase.lastBarT,
-          setupCandleT:Number(phase.lastBarT),prepareAt:Date.now(),readyKey,updatedAt:Date.now()
+          setupCandleT:Number(phase.lastBarT),prepareAt:Date.now(),readyKey,
+          internalPrepare:true,updatedAt:Date.now()
         });
-        return {
-          ok:false,grade:"NO TRADE",symbol,setupStage:"PREPARE",setupDirection:phase.direction,
-          setupCandleT:phase.setupCandleT,readyKey,preAlert:true,preScore:pre.preScore,
-          preMomentumConfirmations:pre.preMomentumConfirmations,
-          ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status,
-          reason:"setup qualified for PREPARE — waiting only for final continuation/timing confirmation"
-        };
+        // Signal-only mode: continue immediately into final validation.
+      }else{
+        pullbackBlocker=pre.reason||"pullback has not qualified for PREPARE";
       }
-      pullbackBlocker=pre.reason||"pullback has not qualified for PREPARE";
     }
 
     if(phase.stage==="PREPARE"){
@@ -1685,12 +1681,11 @@ export class TickHub extends DurableObject {
         // transient issues such as room compression, momentum fading, spread,
         // extension or a missing continuation candle. Preserve it until TTL so it
         // can recover. Only structural invalidations cancel the READY immediately.
-        if(phase.readyAlertAt&&!isHardReadyInvalidation(reason)){
-          await this.updateReadyAuditBlocker(phase.readyKey,reason);
+        if(!isHardReadyInvalidation(reason)){
           return {ok:false,grade:"NO TRADE",symbol,setupStage:"PREPARE",setupDirection:phase.direction,
             setupCandleT:phase.setupCandleT,readyKey:phase.readyKey,preAlert:false,preScore:pre.preScore||null,
             ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status,
-            reason:`READY preserved — ${reason}`};
+            reason:`setup preserved — ${reason}`};
         }
         await this.finishReadyAudit(phase.readyKey,"CANCELLED",Date.now(),reason);
         phase=await this.setSetupStage(symbol,{stage:"SEEK",direction:null,lastBarT:Number(phase.lastBarT||0),updatedAt:Date.now()});
@@ -1700,38 +1695,13 @@ export class TickHub extends DurableObject {
 
       const final=score5m(arr,bars1m,symbol);
 
-      // Hard READY-before-signal guarantee. A setup may satisfy the final filters
-      // while its warning is still waiting to be delivered. Keep it in PREPARE
-      // until /claim-ready has persisted readyAlertAt.
-      if(!phase.readyAlertAt){
-        return {
-          ...final,
-          ok:false,
-          grade:"NO TRADE",
-          symbol,
-          setupStage:"PREPARE",
-          setupDirection:phase.direction,
-          setupCandleT:phase.setupCandleT,
-          readyKey:phase.readyKey,
-          preAlert:true,
-          preScore:pre.preScore,
-          ticks:arr.length,
-          receiveAgeSeconds:receiveAge,
-          marketAgeSeconds:marketAge,
-          status,
-          reason:final.ok
-            ? "final conditions met — READY alert must be delivered before entry"
-            : (final.reason||"waiting for final continuation/timing confirmation")
-        };
-      }
-
       if(!final.ok){
         await this.updateReadyAuditBlocker(phase.readyKey,final.reason||"waiting for final continuation/timing confirmation");
         return {...final,symbol,setupStage:"PREPARE",setupDirection:phase.direction,
           setupCandleT:phase.setupCandleT,readyKey:phase.readyKey,preAlert:false,
           preScore:pre.preScore,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status};
       }
-      phase=await this.setSetupStage(symbol,{...phase,stage:"READY",readyBarT:Number(bars1m.at(-1)?.t||0),updatedAt:Date.now()});
+      phase=await this.setSetupStage(symbol,{...phase,stage:"READY",readyBarT:Number(bars1m.at(-1)?.t||0),internalReady:true,updatedAt:Date.now()});
     }
 
     if(phase.stage!=="READY"){
@@ -2313,12 +2283,6 @@ async function issueAgradeSignal(env,chatIds,candidate,sourceUpdateId="auto",aut
     if(cancelOnFail)await hubPost(env,"/ready-outcome",{symbol,outcome:"CANCELLED",reason:blocker});
     return {ok:false,reason:blocker,preserved:!cancelOnFail};
   }
-  if(!(Number(result.readyAlertAt)>0)){
-    const blocker="READY warning was not confirmed before final signal";
-    if(cancelOnFail)await hubPost(env,"/ready-outcome",{symbol,outcome:"CANCELLED",reason:blocker});
-    return {ok:false,reason:blocker,preserved:!cancelOnFail};
-  }
-
   const quoteBefore=await hub(env,`/quote?symbol=${encodeURIComponent(symbol)}`);
   if(!quoteBefore.ok||!Number.isFinite(Number(quoteBefore.price))||Number(quoteBefore.receiveAgeSeconds)>8){
     const blocker="fresh entry quote unavailable";
@@ -2398,45 +2362,14 @@ async function autoScanAndAlert(env){
     await hub(env,"/prime-live?ms=5000");
     const scan=await scanUniverse(env);
 
-    // READY warnings are always delivered before any final signal from this scan.
-    const readySent=[];
-    if(Array.isArray(scan.preAlerts)&&scan.preAlerts.length){
-      for(const candidate of scan.preAlerts){
-        const ready=await issueReadyAlert(env,chats,candidate);
-        if(ready.ok)readySent.push(ready);
-      }
-    }
-
+    // Signal-only mode: internal setup states are never sent to Telegram.
     if(scan.ok){
       const minuteKey=Math.floor(Date.now()/60000);
       const signal=await issueAgradeSignal(env,chats,scan.best,`auto-${minuteKey}-${scan.best.symbol}`,true);
-      return {...signal,readyAlertsSent:readySent.length};
+      return {...signal,readyAlertsSent:0};
     }
 
-    if(readySent.length){
-      // A 5-minute entry can still appear and weaken inside one scheduler minute. Perform
-      // two short rechecks while the feed is still warm. Final A-grade rules are unchanged.
-      let quickBlockers=[];
-      for(let round=1;round<=2;round++){
-        await sleep(10000);
-        quickBlockers=[];
-        for(const ready of readySent){
-          const attempt=await issueAgradeSignal(
-            env,chats,{symbol:ready.symbol,direction:ready.direction},
-            `auto-ready-r${round}-${Math.floor(Date.now()/1000)}-${ready.symbol}`,true,false
-          );
-          if(attempt.ok)return {...attempt,readyAlertsSent:readySent.length,quickConfirmed:true,quickRound:round};
-          quickBlockers.push(`${ready.symbol}: ${attempt.reason||"not yet confirmed"}`);
-        }
-      }
-      return {
-        ok:true,ready:true,readyAlertsSent:readySent.length,
-        symbols:readySent.map(x=>x.symbol),
-        reason:quickBlockers.length?quickBlockers.join(" | "):"READY sent; waiting for final confirmation"
-      };
-    }
-
-    return {ok:false,reason:scan.reason||"no fully qualified setup"};
+    return {ok:false,reason:scan.reason||"no fully qualified setup",readyAlertsSent:0};
   }finally{
     try{await hub(env,"/sleep");}catch(_){}
   }
@@ -2524,7 +2457,7 @@ export default {
         return json({ok:false,error:String(e?.message||e)},500);
       }
     }
-    if(request.method!=="POST")return new Response("V13.5.3 five-minute auto sniper — frequency-balanced",{status:200});
+    if(request.method!=="POST")return new Response("V13.6 five-minute auto sniper — signal-only",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -2547,7 +2480,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V13.5.3 — FIVE-MINUTE AUTO SNIPER. Frequency is rebalanced for the five-minute horizon: SMA stack remains structural, fast-slope lag is scored rather than vetoed, extension is allowed up to 2.00 ATR, and 2/4 momentum can qualify only when ADX/DMI and the 5m trend are especially strong. The 90% A-grade floor, fractal structure, structural room, completed 1m continuation and live-tick timing remain mandatory. Use /readystats for exact blockers."
+        "V13.6 — FIVE-MINUTE SIGNAL-ONLY MODE. READY Telegram warnings are disabled. Pullback and preparation states are tracked internally and Telegram receives only final CALL/PUT signals. The 5m trend, SMA stack, fractal structure, DMI/ADX, structural room, completed 1m continuation and live-tick timing remain required. The quality floor is 89.5% and continuation extension is allowed up to 2.50 ATR. Use /diagnose for blockers and /stats for performance."
       );
       return new Response("ok");
     }
@@ -2593,21 +2526,8 @@ export default {
       return new Response("ok");
     }
     if(/^\/readystats$/i.test(text)){
-      const st=await hub(env,"/stats");
-      const rows=Array.isArray(st?.readyAudit)?st.readyAudit.slice(0,8):[];
-      if(!rows.length){
-        await tgSend(env,chatId,"READY AUDIT\nNo READY events recorded for the current strategy yet.");
-        return new Response("ok");
-      }
-      const now=Date.now();
-      const lines=rows.map(r=>{
-        const state=r.outcome||"PENDING";
-        const age=Math.max(0,Math.round((now-Number(r.readyAlertAt||now))/60000));
-        const blocker=r.lastBlocker?`\n  Blocker: ${r.lastBlocker}`:"";
-        const t=r.timeToSignalSeconds!=null?` • signal in ${Number(r.timeToSignalSeconds).toFixed(0)}s`:"";
-        return `${r.symbol} ${r.direction} — ${state} • ${age}m ago${t}${blocker}`;
-      });
-      await tgSend(env,chatId,`READY AUDIT — RECENT EVENTS\n\n${lines.join("\n\n")}\n\nREADY is preparation only. A final CALL/PUT is sent only after every A-grade entry filter passes.`);
+      await tgSend(env,chatId,
+        `SIGNAL-ONLY MODE\nREADY alerts are disabled in ${VERSION}.\nPreparation is tracked internally; Telegram now receives only final CALL/PUT signals.\nUse /diagnose for current blockers and /stats for settled performance.`);
       return new Response("ok");
     }
     if(/^\/forwardstats$/i.test(text)){
