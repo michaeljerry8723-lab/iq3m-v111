@@ -1,7 +1,7 @@
 // V13.1 — two-minute automatic sniper with persistent READY pre-alerts
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "13.2.1-self-scheduler";
+const VERSION = "13.2.2-scheduler-diagnostic";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set();
@@ -2049,8 +2049,10 @@ async function hubPost(env,path,body){
 }
 
 async function schedulerGet(env,path){
+  if(!env.AUTO_SCHEDULER)throw new Error("AUTO_SCHEDULER binding is missing from the active Cloudflare deployment");
   const id=env.AUTO_SCHEDULER.idFromName("global-auto-scheduler"), stub=env.AUTO_SCHEDULER.get(id);
   const r=await stub.fetch(`https://autoscheduler${path}`);
+  if(!r.ok)throw new Error(`AUTO_SCHEDULER HTTP ${r.status}`);
   return await r.json();
 }
 
@@ -2434,16 +2436,19 @@ export default {
       return new Response("ok");
     }
     if(/^\/cronstatus$/i.test(text)){
-      try{await schedulerGet(env,"/ensure");}catch(_){}
-      const [st,sch]=await Promise.all([
-        hub(env,"/cronstatus"),
-        schedulerGet(env,"/status").catch(()=>({}))
-      ]);
+      let sch={},schedulerError=null;
+      try{
+        await schedulerGet(env,"/ensure");
+        sch=await schedulerGet(env,"/status");
+      }catch(e){
+        schedulerError=String(e?.message||e);
+      }
+      const st=await hub(env,"/cronstatus");
       const age=st.ageSeconds==null?"n/a":Number(st.ageSeconds).toFixed(0)+"s";
       const r=st.lastResult||{};
       const next=sch.nextAlarmAt?Math.max(0,Math.ceil((Number(sch.nextAlarmAt)-Date.now())/1000))+"s":"n/a";
-      const source=sch.enabled?"Durable Object alarm":"Cloudflare Cron";
-      await tgSend(env,chatId,`AUTO-SCAN STATUS\nVersion: ${VERSION}\nScheduler: ${source}\nLast scan: ${age} ago\nScans recorded: ${st.count||0}\nNext scheduler wake: ${next}\nLast result: ${r.ok?"qualified/handled":(r.reason||"no qualified setup")}\nREADY alerts in last scan: ${r.readyAlertsSent||0}${r.symbol?`\nSymbol: ${r.symbol}`:""}${sch.lastError?`\nScheduler error: ${sch.lastError}`:""}`);
+      const source=schedulerError?"NOT ARMED":(sch.enabled?"Durable Object alarm":"NOT ARMED");
+      await tgSend(env,chatId,`AUTO-SCAN STATUS\nVersion: ${VERSION}\nScheduler: ${source}\nLast scan: ${age} ago\nScans recorded: ${st.count||0}\nNext scheduler wake: ${next}\nLast result: ${r.ok?"qualified/handled":(r.reason||"no qualified setup")}\nREADY alerts in last scan: ${r.readyAlertsSent||0}${r.symbol?`\nSymbol: ${r.symbol}`:""}${schedulerError?`\nScheduler error: ${schedulerError}`:""}${sch.lastError?`\nAlarm error: ${sch.lastError}`:""}`);
       return new Response("ok");
     }
     if(/^\/reconnect$/i.test(text)){
