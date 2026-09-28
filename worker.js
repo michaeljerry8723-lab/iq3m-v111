@@ -660,7 +660,7 @@ export class TickHub extends DurableObject {
     super(ctx,env);
     this.ctx=ctx; this.env=env; this.ws=null; this.cryptoWs=null; this.ticks=new Map(); this.symbols=new Set();
     this.lastStatus="starting"; this.lastSubscribeStatus=null; this.connecting=false; this.cryptoConnecting=false; this.provider="tiingo"; this.lastCryptoStatus="starting"; this.lastCryptoSubscribeStatus=null; this.lastCryptoWsMessageAt=0;
-    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map(); this.quotaBlockedUntil=0; this.pendingSignals=[]; this.signalStats={total:0,wins:0,losses:0,draws:0,voids:0}; this.signalHistory=[]; this.alertChats=[]; this.setupStates={}; this.readyAlertClaims={}; this.readyAudit=[];
+    this.lastWsMessageAt=0; this.lastPriceReceivedAt=0; this.lastConnectAt=0; this.reconnectCount=0; this.oneMinuteCache=new Map(); this.quotaBlockedUntil=0; this.pendingSignals=[]; this.signalStats={total:0,wins:0,losses:0,draws:0,voids:0}; this.signalHistory=[]; this.forwardStats=null; this.alertChats=[]; this.setupStates={}; this.readyAlertClaims={}; this.readyAudit=[];
 
     this.ctx.blockConcurrencyWhile(async()=>{
       // V11.2: prefer the configured warm list over old persisted symbols so a Basic/trial
@@ -676,6 +676,40 @@ export class TickHub extends DurableObject {
       this.pendingSignals=(await this.ctx.storage.get("pendingSignals"))||[];
       this.signalStats=(await this.ctx.storage.get("signalStats"))||{total:0,wins:0,losses:0,draws:0,voids:0};
       this.signalHistory=(await this.ctx.storage.get("signalHistory"))||[];
+
+      const emptyForwardBucket=()=>({total:0,wins:0,losses:0,draws:0,voids:0});
+      const storedForward=await this.ctx.storage.get("v13_4ForwardStats");
+      if(storedForward?.shadowId===V13_4_SHADOW.id){
+        this.forwardStats=storedForward;
+      }else{
+        const seeded={
+          shadowId:V13_4_SHADOW.id,
+          frozenRule:{dmiGapMin:V13_4_SHADOW.dmiGapMin,adxMax:V13_4_SHADOW.adxMax},
+          initializedAt:Date.now(),
+          firstObservedAt:null,
+          lastObservedAt:null,
+          eligible:emptyForwardBucket(),
+          nonEligible:emptyForwardBucket()
+        };
+        const tagged=this.signalHistory
+          .filter(x=>this.isCurrentStrategyRecord(x)&&x?.features?.v13_4Shadow?.id===V13_4_SHADOW.id);
+        for(const rec of tagged){
+          const bucket=rec.features.v13_4Shadow.eligible===true?seeded.eligible:seeded.nonEligible;
+          bucket.total++;
+          if(rec.result==="WIN")bucket.wins++;
+          else if(rec.result==="LOSS")bucket.losses++;
+          else if(rec.result==="DRAW")bucket.draws++;
+          else if(rec.result==="VOID")bucket.voids++;
+          const at=Number(rec.settledAt||rec.entryAt||0)||null;
+          if(at){
+            seeded.firstObservedAt=seeded.firstObservedAt==null?at:Math.min(seeded.firstObservedAt,at);
+            seeded.lastObservedAt=seeded.lastObservedAt==null?at:Math.max(seeded.lastObservedAt,at);
+          }
+        }
+        this.forwardStats=seeded;
+        await this.ctx.storage.put("v13_4ForwardStats",this.forwardStats);
+      }
+
       this.alertChats=(await this.ctx.storage.get("alertChats"))||[];
       this.setupStates=(await this.ctx.storage.get("setupStates"))||{};
       this.readyAlertClaims=(await this.ctx.storage.get("readyAlertClaims"))||{};
@@ -868,13 +902,17 @@ export class TickHub extends DurableObject {
       );
     }
 
+    const previousPendingCount=this.pendingSignals.length;
     this.pendingSignals=keep;
     if(settled.length){
+      let forwardChanged=false;
+      for(const rec of settled)forwardChanged=this.recordForwardSettlement(rec)||forwardChanged;
       this.signalHistory=[...settled,...this.signalHistory].slice(0,100);
       await this.ctx.storage.put("pendingSignals",this.pendingSignals);
       await this.ctx.storage.put("signalStats",this.signalStats);
       await this.ctx.storage.put("signalHistory",this.signalHistory);
-    }else if(keep.length!==this.pendingSignals.length){
+      if(forwardChanged)await this.ctx.storage.put("v13_4ForwardStats",this.forwardStats);
+    }else if(keep.length!==previousPendingCount){
       await this.ctx.storage.put("pendingSignals",this.pendingSignals);
     }
   }
@@ -1645,28 +1683,63 @@ export class TickHub extends DurableObject {
     return {ok:true};
   }
 
+  recordForwardSettlement(rec){
+    const tag=rec?.features?.v13_4Shadow;
+    if(!tag||tag.id!==V13_4_SHADOW.id||typeof tag.eligible!=="boolean")return false;
+    if(!this.forwardStats||this.forwardStats.shadowId!==V13_4_SHADOW.id){
+      this.forwardStats={
+        shadowId:V13_4_SHADOW.id,
+        frozenRule:{dmiGapMin:V13_4_SHADOW.dmiGapMin,adxMax:V13_4_SHADOW.adxMax},
+        initializedAt:Date.now(),
+        firstObservedAt:null,
+        lastObservedAt:null,
+        eligible:{total:0,wins:0,losses:0,draws:0,voids:0},
+        nonEligible:{total:0,wins:0,losses:0,draws:0,voids:0}
+      };
+    }
+    const bucket=tag.eligible===true?this.forwardStats.eligible:this.forwardStats.nonEligible;
+    bucket.total++;
+    if(rec.result==="WIN")bucket.wins++;
+    else if(rec.result==="LOSS")bucket.losses++;
+    else if(rec.result==="DRAW")bucket.draws++;
+    else if(rec.result==="VOID")bucket.voids++;
+    const at=Number(rec.settledAt||Date.now());
+    this.forwardStats.firstObservedAt=this.forwardStats.firstObservedAt==null?at:Math.min(Number(this.forwardStats.firstObservedAt),at);
+    this.forwardStats.lastObservedAt=this.forwardStats.lastObservedAt==null?at:Math.max(Number(this.forwardStats.lastObservedAt),at);
+    return true;
+  }
+
   async getForwardStats(){
-    const current=this.signalHistory.filter(x=>this.isCurrentStrategyRecord(x));
-    const shadow=current.filter(x=>x?.features?.v13_4Shadow?.eligible===true);
-    const rejected=current.filter(x=>x?.features?.v13_4Shadow&&x.features.v13_4Shadow.eligible===false);
-    const summarize=xs=>{
-      const wins=xs.filter(x=>x.result==="WIN").length;
-      const losses=xs.filter(x=>x.result==="LOSS").length;
-      const draws=xs.filter(x=>x.result==="DRAW").length;
-      const voids=xs.filter(x=>x.result==="VOID").length;
-      const wl=wins+losses;
-      return {total:xs.length,wins,losses,draws,voids,wl,winRate:wl?(wins/wl)*100:null};
+    const base=this.forwardStats||{
+      shadowId:V13_4_SHADOW.id,
+      frozenRule:{dmiGapMin:V13_4_SHADOW.dmiGapMin,adxMax:V13_4_SHADOW.adxMax},
+      initializedAt:null,
+      firstObservedAt:null,
+      lastObservedAt:null,
+      eligible:{total:0,wins:0,losses:0,draws:0,voids:0},
+      nonEligible:{total:0,wins:0,losses:0,draws:0,voids:0}
     };
-    const pending=this.pendingSignals.filter(x=>this.isCurrentStrategyRecord(x)&&x?.features?.v13_4Shadow?.eligible===true).length;
+    const summarize=b=>{
+      const x=b||{total:0,wins:0,losses:0,draws:0,voids:0};
+      const wl=Number(x.wins||0)+Number(x.losses||0);
+      return {...x,wl,winRate:wl?(Number(x.wins||0)/wl)*100:null};
+    };
+    const pending=this.pendingSignals.filter(
+      x=>this.isCurrentStrategyRecord(x)&&x?.features?.v13_4Shadow?.id===V13_4_SHADOW.id&&x.features.v13_4Shadow.eligible===true
+    ).length;
     return {
       ok:true,
       shadowId:V13_4_SHADOW.id,
       frozenRule:{dmiGapMin:V13_4_SHADOW.dmiGapMin,adxMax:V13_4_SHADOW.adxMax},
-      eligible:summarize(shadow),
-      nonEligible:summarize(rejected),
+      initializedAt:base.initializedAt||null,
+      firstObservedAt:base.firstObservedAt||null,
+      lastObservedAt:base.lastObservedAt||null,
+      eligible:summarize(base.eligible),
+      nonEligible:summarize(base.nonEligible),
       pendingEligible:pending,
       targetMinimum:50,
-      targetPreferred:100
+      targetPreferred:100,
+      persistence:"durable-object-aggregate"
     };
   }
 
