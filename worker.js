@@ -1,4 +1,4 @@
-// V13.1 — five-minute automatic sniper with persistent READY pre-alerts
+// V13.5 — five-minute automatic sniper with persistent READY pre-alerts
 import { DurableObject } from "cloudflare:workers";
 
 const VERSION = "13.5.0-five-minute-expiry";
@@ -533,7 +533,7 @@ function score5m(ticks,bars1m,symbol){
   if(regime15.ready&&regime15.direction===direction)score+=0.5;
   if(regime5.efficiency>=0.35)score+=0.3;
   if(dmi.adx>=25)score+=0.3;
-  if(distanceFast<=0.45)score+=0.3;
+  if(distanceFast<=0.60)score+=0.3;
   if(room.roomAtr>=1.20)score+=0.3;
   if(imp.upRatio>=0.65||imp.downRatio>=0.65)score+=0.2;
 
@@ -542,7 +542,7 @@ function score5m(ticks,bars1m,symbol){
     (regime15.ready&&regime15.direction===direction?0.012:0) +
     Math.min(Math.max(dmi.adx-20,0),15)/15*0.018 +
     Math.min(Math.max(room.roomAtr-1.00,0),0.80)/0.80*0.014 +
-    (distanceFast<=0.45?0.010:0) +
+    (distanceFast<=0.60?0.010:0) +
     (Math.max(imp.upRatio,imp.downRatio)>=0.65?0.008:0) +
     (momentumConfirmations===4?0.006:0.003),
     0.895,0.970
@@ -1916,7 +1916,6 @@ export class TickHub extends DurableObject {
   async getForwardStats(){
     const base=this.forwardStats||{
       strategyId:STRATEGY_ID,
-      strategyId:STRATEGY_ID,
       shadowId:V13_4_SHADOW.id,
       frozenRule:{dmiGapMin:V13_4_SHADOW.dmiGapMin,adxMax:V13_4_SHADOW.adxMax},
       initializedAt:null,
@@ -1935,6 +1934,7 @@ export class TickHub extends DurableObject {
     ).length;
     return {
       ok:true,
+      strategyId:STRATEGY_ID,
       shadowId:V13_4_SHADOW.id,
       frozenRule:{dmiGapMin:V13_4_SHADOW.dmiGapMin,adxMax:V13_4_SHADOW.adxMax},
       initializedAt:base.initializedAt||null,
@@ -2350,7 +2350,7 @@ async function autoScanAndAlert(env){
       // two short rechecks while the feed is still warm. Final A-grade rules are unchanged.
       let quickBlockers=[];
       for(let round=1;round<=2;round++){
-        await sleep(15000);
+        await sleep(10000);
         quickBlockers=[];
         for(const ready of readySent){
           const attempt=await issueAgradeSignal(
