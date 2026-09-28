@@ -1,17 +1,17 @@
-// V13.1 — two-minute automatic sniper with persistent READY pre-alerts
+// V13.1 — five-minute automatic sniper with persistent READY pre-alerts
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "13.3.4-quota-safe-context";
+const VERSION = "13.5.0-five-minute-expiry";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set();
 const A_GRADE_MIN_QUALITY = 0.90;
-const EXPIRY_SECONDS = 120;
-const STRATEGY_ID = "v13.3.4-quota-safe-context";
-const PREPARE_TTL_MS = 5*60*1000;
+const EXPIRY_SECONDS = 300;
+const STRATEGY_ID = "v13.5-five-minute-expiry";
+const PREPARE_TTL_MS = 6*60*1000;
 const PULLBACK_TTL_MS = 4*60*1000;
 const GLOBAL_SIGNAL_COOLDOWN_MS = 0;
-const PAIR_SIGNAL_COOLDOWN_MS = 8*60*1000;
+const PAIR_SIGNAL_COOLDOWN_MS = 12*60*1000;
 const LOSS_CIRCUIT_BREAKER_MS = 20*60*1000;
 
 // V13.4 shadow validation only. This rule is logged and cannot admit or reject a signal.
@@ -370,7 +370,7 @@ function completedTickBars(ticks,seconds){
   return buildBars(ticks,seconds).filter(b=>Number(b.t)<current);
 }
 
-function score2m(ticks,bars1m,symbol){
+function score5m(ticks,bars1m,symbol){
   const sma1=smaTrendSnapshot(bars1m,5,13);
   const fr1=fractalSnapshot(bars1m,2);
   const m1=macdSnapshot(bars1m,5,13,4);
@@ -390,7 +390,7 @@ function score2m(ticks,bars1m,symbol){
 
   if(!sma1.ready||!fr1.ready||!m1.ready||!ar1.ready||!atr1.ready||!rsi1.ready||
      !dmi.ready||!pressure.ready||!regime5.ready){
-    return {ok:false,grade:"NO TRADE",reason:"2-minute sniper context is still building"};
+    return {ok:false,grade:"NO TRADE",reason:"5-minute sniper context is still building"};
   }
 
   const last=Number(ticks.at(-1)?.p);
@@ -401,14 +401,14 @@ function score2m(ticks,bars1m,symbol){
   const spreadBps=spreadInfo.spreadBps;
   const atrRatio=last>0?atr1.atr/last:0;
 
-  // Two-minute trades are highly sensitive to spread and abnormal volatility.
+  // Five-minute trades are highly sensitive to spread and abnormal volatility.
   if(spreadInfo.abnormal||
      (Number.isFinite(spreadAtrRatio)&&spreadAtrRatio>0.35&&Number(spreadBps)>0.80)){
-    return {ok:false,grade:"NO TRADE",reason:"spread is too large for a 2-minute entry",
+    return {ok:false,grade:"NO TRADE",reason:"spread is too large for a 5-minute entry",
       spreadAtrRatio,spreadBps};
   }
   if(atrRatio<0.000008||atrRatio>0.0028){
-    return {ok:false,grade:"NO TRADE",reason:"volatility is outside the 2-minute sniper range",atrRatio};
+    return {ok:false,grade:"NO TRADE",reason:"volatility is outside the 5-minute sniper range",atrRatio};
   }
 
   const direction=regime5.direction;
@@ -418,7 +418,7 @@ function score2m(ticks,bars1m,symbol){
 
   // A strong opposite 15m trend vetoes the short-expiry setup.
   if(regime15.ready&&regime15.direction!=="NEUTRAL"&&regime15.direction!==direction&&regime15.efficiency>=0.30){
-    return {ok:false,grade:"NO TRADE",reason:"15m trend opposes the 2-minute setup",
+    return {ok:false,grade:"NO TRADE",reason:"15m trend opposes the 5-minute setup",
       coreDirection:direction,regime15:regime15.direction};
   }
 
@@ -437,16 +437,17 @@ function score2m(ticks,bars1m,symbol){
     return {ok:false,grade:"NO TRADE",reason:"Fractal(2) resistance failed",coreDirection:direction};
   }
 
-  // No chasing: a 2-minute trade must begin near the resumption point.
+  // A 5-minute trade can tolerate a slightly wider pullback/continuation entry
+  // than the previous 2-minute mode, but it also needs more room to develop.
   const distanceFast=Math.abs(last-sma1.fast)/atr1.atr;
-  if(distanceFast>0.68){
-    return {ok:false,grade:"NO TRADE",reason:"entry is too extended for 2-minute expiry",
+  if(distanceFast>0.88){
+    return {ok:false,grade:"NO TRADE",reason:"entry is too extended for 5-minute expiry",
       distanceFastAtr:distanceFast,coreDirection:direction};
   }
 
   const room=roomToMoveSnapshot(bars1m,last,direction,atr1.atr);
-  if(!room.ready||room.roomAtr<0.85){
-    return {ok:false,grade:"NO TRADE",reason:"insufficient room before support/resistance for 2-minute expiry",
+  if(!room.ready||room.roomAtr<1.00){
+    return {ok:false,grade:"NO TRADE",reason:"insufficient room before support/resistance for 5-minute expiry",
       roomAtr:room.roomAtr};
   }
 
@@ -455,7 +456,7 @@ function score2m(ticks,bars1m,symbol){
     ? dmi.plusDI>dmi.minusDI
     : dmi.minusDI>dmi.plusDI;
   if(!dmiAligned||dmi.adx<20||dmiGap<4){
-    return {ok:false,grade:"NO TRADE",reason:"ADX/DMI is not strong enough for the 2-minute setup",
+    return {ok:false,grade:"NO TRADE",reason:"ADX/DMI is not strong enough for the 5-minute setup",
       adx:dmi.adx,dmiGap,coreDirection:direction};
   }
 
@@ -520,8 +521,8 @@ function score2m(ticks,bars1m,symbol){
     microMode="30s-macd+live";
   }else{
     microAligned=direction==="CALL"
-      ? (imp.upRatio>=0.64&&imp.norm>=0.35)
-      : (imp.downRatio>=0.64&&imp.norm<=-0.35);
+      ? (imp.upRatio>=0.60&&imp.norm>=0.20)
+      : (imp.downRatio>=0.60&&imp.norm<=-0.20);
   }
   if(!microAligned){
     return {ok:false,grade:"NO TRADE",reason:has30sContext?"30s/live timing is not fully aligned":"fresh live-tick burst is not strong enough"};
@@ -540,7 +541,7 @@ function score2m(ticks,bars1m,symbol){
     0.895 +
     (regime15.ready&&regime15.direction===direction?0.012:0) +
     Math.min(Math.max(dmi.adx-20,0),15)/15*0.018 +
-    Math.min(Math.max(room.roomAtr-0.85,0),0.75)/0.75*0.014 +
+    Math.min(Math.max(room.roomAtr-1.00,0),0.80)/0.80*0.014 +
     (distanceFast<=0.45?0.010:0) +
     (Math.max(imp.upRatio,imp.downRatio)>=0.65?0.008:0) +
     (momentumConfirmations===4?0.006:0.003),
@@ -549,7 +550,7 @@ function score2m(ticks,bars1m,symbol){
 
   if(quality<A_GRADE_MIN_QUALITY){
     return {ok:false,grade:"NO TRADE",
-      reason:`2-minute sniper score ${Math.round(quality*100)}/100 is below threshold`,
+      reason:`5-minute sniper score ${Math.round(quality*100)}/100 is below threshold`,
       quality};
   }
 
@@ -561,7 +562,7 @@ function score2m(ticks,bars1m,symbol){
     regime5Efficiency:regime5.efficiency,regime15Efficiency:regime15.ready?regime15.efficiency:null,
     roomAtr:room.roomAtr,spreadAtrRatio,spreadBps,atrRatio,rsi:rsi1.rsi,adx:dmi.adx,
     dmiGap,smaFastPeriod:5,smaSlowPeriod:13,fractalPeriod:2,
-    timeframe:"1min",expiryMinutes:2,smaFast:sma1.fast,smaSlow:sma1.slow,
+    timeframe:"1min",expiryMinutes:5,smaFast:sma1.fast,smaSlow:sma1.slow,
     distanceFastAtr:distanceFast,atr:atr1.atr,
     momentumConfirmations,momentumChecks,
     reasons:[
@@ -580,7 +581,7 @@ function score2m(ticks,bars1m,symbol){
   };
 }
 
-function preAlert2m(ticks,bars1m,symbol,direction){
+function preAlert5m(ticks,bars1m,symbol,direction){
   if(!["CALL","PUT"].includes(direction))return {ok:false};
 
   const sequence=setupSequenceSnapshot(bars1m);
@@ -650,10 +651,10 @@ function preAlert2m(ticks,bars1m,symbol,direction){
   }
 
   const distanceFast=Math.abs(last-sma.fast)/atr.atr;
-  if(distanceFast>0.68)return {ok:false,reason:"price left the SMA 5/13 setup zone"};
+  if(distanceFast>0.88)return {ok:false,reason:"price moved too far from the SMA 5/13 setup zone for a 5-minute entry"};
 
   const room=roomToMoveSnapshot(bars1m,last,direction,atr.atr);
-  if(!room.ready||room.roomAtr<0.85)return {ok:false,reason:"room-to-move is no longer adequate"};
+  if(!room.ready||room.roomAtr<1.00)return {ok:false,reason:"room-to-move is no longer adequate for a 5-minute entry"};
 
   const imp=tickImpulse(ticks);
   if(imp.ready){
@@ -666,9 +667,9 @@ function preAlert2m(ticks,bars1m,symbol,direction){
   const preScore=clamp(
     0.84 +
     Math.min(Math.max(dmi.adx-20,0),15)/15*0.035 +
-    Math.min(Math.max(room.roomAtr-0.85,0),0.75)/0.75*0.025 +
+    Math.min(Math.max(room.roomAtr-1.00,0),0.80)/0.80*0.025 +
     (reg15.ready&&reg15.direction===direction?0.020:0) +
-    (distanceFast<=0.55?0.015:0),
+    (distanceFast<=0.65?0.015:0),
     0.84,0.94
   );
 
@@ -775,10 +776,11 @@ export class TickHub extends DurableObject {
 
       const emptyForwardBucket=()=>({total:0,wins:0,losses:0,draws:0,voids:0});
       const storedForward=await this.ctx.storage.get("v13_4ForwardStats");
-      if(storedForward?.shadowId===V13_4_SHADOW.id){
+      if(storedForward?.shadowId===V13_4_SHADOW.id&&storedForward?.strategyId===STRATEGY_ID){
         this.forwardStats=storedForward;
       }else{
         const seeded={
+          strategyId:STRATEGY_ID,
           shadowId:V13_4_SHADOW.id,
           frozenRule:{dmiGapMin:V13_4_SHADOW.dmiGapMin,adxMax:V13_4_SHADOW.adxMax},
           initializedAt:Date.now(),
@@ -1008,7 +1010,7 @@ export class TickHub extends DurableObject {
         const chats=Array.isArray(sig.chatIds)&&sig.chatIds.length?sig.chatIds:[sig.chatId];
         for(const chat of chats) if(chat!=null) await this.sendTrackedResult(
           chat,
-          `RESULT — ${sig.symbol}\n${sig.direction==="CALL"?"⬆️ CALL":"⬇️ PUT"} • 2 minutes\n⚪ VOID — no fresh Tiingo tick was available at expiry`
+          `RESULT — ${sig.symbol}\n${sig.direction==="CALL"?"⬆️ CALL":"⬇️ PUT"} • 5 minutes\n⚪ VOID — no fresh Tiingo tick was available at expiry`
         );
         continue;
       }
@@ -1032,7 +1034,7 @@ export class TickHub extends DurableObject {
       const chats=Array.isArray(sig.chatIds)&&sig.chatIds.length?sig.chatIds:[sig.chatId];
       for(const chat of chats) if(chat!=null) await this.sendTrackedResult(
         chat,
-        `RESULT — ${sig.symbol}\n${sig.direction==="CALL"?"⬆️ CALL":"⬇️ PUT"} • 2 minutes\nENTRY: ${formatFxPrice(sig.symbol,entry)}\nEXIT: ${formatFxPrice(sig.symbol,exit)}\n${mark} ${result}\nTRACKING: Tiingo feed`
+        `RESULT — ${sig.symbol}\n${sig.direction==="CALL"?"⬆️ CALL":"⬇️ PUT"} • 5 minutes\nENTRY: ${formatFxPrice(sig.symbol,entry)}\nEXIT: ${formatFxPrice(sig.symbol,exit)}\n${mark} ${result}\nTRACKING: Tiingo feed`
       );
     }
 
@@ -1602,7 +1604,7 @@ export class TickHub extends DurableObject {
     let phase=await this.advanceSetupState(symbol,bars1m);
     let pullbackBlocker=null;
     if(phase.stage==="PULLBACK"){
-      const pre=preAlert2m(arr,bars1m,symbol,phase.direction);
+      const pre=preAlert5m(arr,bars1m,symbol,phase.direction);
       if(pre.ok){
         const readyKey=`${symbol}|${phase.direction}|${Number(phase.lastBarT)}`;
         phase=await this.setSetupStage(symbol,{
@@ -1621,7 +1623,7 @@ export class TickHub extends DurableObject {
     }
 
     if(phase.stage==="PREPARE"){
-      const pre=preAlert2m(arr,bars1m,symbol,phase.direction);
+      const pre=preAlert5m(arr,bars1m,symbol,phase.direction);
       if(!pre.ok){
         await this.finishReadyAudit(phase.readyKey,"CANCELLED",Date.now(),pre.reason||"PREPARE setup cancelled");
         phase=await this.setSetupStage(symbol,{stage:"SEEK",direction:null,lastBarT:Number(phase.lastBarT||0),updatedAt:Date.now()});
@@ -1629,7 +1631,7 @@ export class TickHub extends DurableObject {
           receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status,reason:pre.reason||"PREPARE setup cancelled"};
       }
 
-      const final=score2m(arr,bars1m,symbol);
+      const final=score5m(arr,bars1m,symbol);
 
       // Hard READY-before-signal guarantee. A setup may satisfy the final filters
       // while its warning is still waiting to be delivered. Keep it in PREPARE
@@ -1680,7 +1682,7 @@ export class TickHub extends DurableObject {
       };
     }
 
-    const x=score2m(arr,bars1m,symbol);
+    const x=score5m(arr,bars1m,symbol);
     if(!x.ok){
       if(phase.stage==="READY"){
         await this.finishReadyAudit(phase.readyKey,"CANCELLED",Date.now(),x.reason||"final A-grade timing failed");
@@ -1716,7 +1718,7 @@ export class TickHub extends DurableObject {
 
   getRiskGate(){
     const now=Date.now();
-    // Do not globally block scans while another 2-minute trade is still pending.
+    // Do not globally block scans while another 5-minute trade is still pending.
     // pairCooldownSeconds() already excludes the active pair, so the remaining pairs
     // can still be scanned for independent qualified opportunities.
 
@@ -1887,8 +1889,9 @@ export class TickHub extends DurableObject {
   recordForwardSettlement(rec){
     const tag=rec?.features?.v13_4Shadow;
     if(!tag||tag.id!==V13_4_SHADOW.id||typeof tag.eligible!=="boolean")return false;
-    if(!this.forwardStats||this.forwardStats.shadowId!==V13_4_SHADOW.id){
+    if(!this.forwardStats||this.forwardStats.shadowId!==V13_4_SHADOW.id||this.forwardStats.strategyId!==STRATEGY_ID){
       this.forwardStats={
+        strategyId:STRATEGY_ID,
         shadowId:V13_4_SHADOW.id,
         frozenRule:{dmiGapMin:V13_4_SHADOW.dmiGapMin,adxMax:V13_4_SHADOW.adxMax},
         initializedAt:Date.now(),
@@ -1912,6 +1915,8 @@ export class TickHub extends DurableObject {
 
   async getForwardStats(){
     const base=this.forwardStats||{
+      strategyId:STRATEGY_ID,
+      strategyId:STRATEGY_ID,
       shadowId:V13_4_SHADOW.id,
       frozenRule:{dmiGapMin:V13_4_SHADOW.dmiGapMin,adxMax:V13_4_SHADOW.adxMax},
       initializedAt:null,
@@ -2180,7 +2185,7 @@ async function scanUniverse(env){
       ok:false,
       checked,
       preAlerts,
-      reason:"No fully qualified 2-minute entry across the six-pair FX universe."
+      reason:"No fully qualified 5-minute entry across the six-pair FX universe."
     };
   }
   return {ok:true,best:qualified[0],checked,preAlerts};
@@ -2204,7 +2209,7 @@ async function issueReadyAlert(env,chatIds,candidate){
     `READY 🔥🔥\n`+
     `${candidate.symbol} setup developing.\n`+
     `Trend, pullback, structure and strength aligned${Number.isFinite(pm)?` • momentum ${pm}/4`:""}.\n`+
-    `DO NOT ENTER YET — wait for the actual 2-minute signal.`;
+    `DO NOT ENTER YET — wait for the actual 5-minute signal.`;
 
   let delivered=0;
   for(const chat of chats){
@@ -2255,15 +2260,15 @@ async function issueAgradeSignal(env,chatIds,candidate,sourceUpdateId="auto",aut
   const driftAtr=Number(result.atr)>0
     ? Math.abs(Number(quoteBefore.price)-Number(result.lastPrice))/Number(result.atr)
     : Infinity;
-  if(!Number.isFinite(driftAtr)||driftAtr>0.20){
-    const blocker="price moved too far during final 2-minute entry check";
+  if(!Number.isFinite(driftAtr)||driftAtr>0.30){
+    const blocker="price moved too far during final 5-minute entry check";
     if(cancelOnFail)await hubPost(env,"/ready-outcome",{symbol,outcome:"CANCELLED",reason:blocker});
     return {ok:false,reason:blocker,preserved:!cancelOnFail};
   }
 
   const arrow=result.direction==="CALL"?"⬆️":"⬇️";
-  const label=automatic?"AUTO 2-MINUTE SNIPER":"2-MINUTE SNIPER";
-  const textMsg=`${arrow} ${symbol}\n${label}\nEXPIRY: 2 minutes\nGRADE: A\nSETUP SCORE: ${Math.round(Number(result.quality)*100)}/100\nTRACKING: ON`;
+  const label=automatic?"AUTO 5-MINUTE SNIPER":"5-MINUTE SNIPER";
+  const textMsg=`${arrow} ${symbol}\n${label}\nEXPIRY: 5 minutes\nGRADE: A\nSETUP SCORE: ${Math.round(Number(result.quality)*100)}/100\nTRACKING: ON`;
 
   let sentAt=null;
   for(const chat of chats){
@@ -2341,11 +2346,11 @@ async function autoScanAndAlert(env){
     }
 
     if(readySent.length){
-      // A 2-minute entry can appear and vanish inside one scheduler minute. Perform
+      // A 5-minute entry can still appear and weaken inside one scheduler minute. Perform
       // two short rechecks while the feed is still warm. Final A-grade rules are unchanged.
       let quickBlockers=[];
       for(let round=1;round<=2;round++){
-        await sleep(10000);
+        await sleep(15000);
         quickBlockers=[];
         for(const ready of readySent){
           const attempt=await issueAgradeSignal(
@@ -2451,7 +2456,7 @@ export default {
         return json({ok:false,error:String(e?.message||e)},500);
       }
     }
-    if(request.method!=="POST")return new Response("V13.3.4 two-minute auto sniper — quota-safe context",{status:200});
+    if(request.method!=="POST")return new Response("V13.5 five-minute auto sniper — quota-safe context",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -2474,7 +2479,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V13.3.4 — TWO-MINUTE AUTO SNIPER. Tiingo WebSocket ticks now extend the persisted one-minute context between scans, reducing repeated historical REST calls and protecting the hourly data allowance. READY requires at least 2/4 momentum confirmations; final CALL/PUT requires at least 3/4 plus the core trend, structure, DMI, room, continuation and live-timing filters. Use /readystats for READY conversion blockers."
+        "V13.5 — FIVE-MINUTE AUTO SNIPER. The longer expiry gives the confirmed 1m/5m setup more time to develop while Tiingo WebSocket ticks extend the persisted context between scans. READY requires at least 2/4 momentum confirmations; final CALL/PUT requires at least 3/4 plus the core trend, structure, DMI, room, continuation and live-timing filters. Use /readystats for READY conversion blockers."
       );
       return new Response("ok");
     }
@@ -2562,7 +2567,7 @@ export default {
           rows.push(`${symbol}: error`);
         }
       }
-      await tgSend(env,chatId,`V13 TWO-MINUTE SNIPER DIAGNOSIS\n\n${rows.join("\n")}`);
+      await tgSend(env,chatId,`V13.5 FIVE-MINUTE SNIPER DIAGNOSIS\n\n${rows.join("\n")}`);
       return new Response("ok");
     }
     if(/^\/cronstatus$/i.test(text)){
@@ -2600,7 +2605,7 @@ export default {
         `PROVIDER TICK AGE: ${st.providerTickAgeSeconds??"n/a"}s\n`+
         `WS MESSAGE AGE: ${st.lastWsMessageAgeSeconds??"n/a"}s\n`+
         `RECONNECTS: ${st.reconnectCount||0}\n`+
-        `EXPIRY: 120s\n`+
+        `EXPIRY: 300s\n`+
         `STATUS: ${st.status||"n/a"}\n`+
         `SUBSCRIBE: ${st.subscribeStatus?.response?.message||st.subscribeStatus?.status||"n/a"}`
       );
@@ -2614,7 +2619,7 @@ export default {
         await tgSend(
           env,
           chatId,
-          `🛡️ 2-MINUTE MODE PAUSED\n${risk.reason}.\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.`
+          `🛡️ 5-MINUTE MODE PAUSED\n${risk.reason}.\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.`
         );
         return new Response("ok");
       }
@@ -2627,7 +2632,7 @@ export default {
           await tgSend(
             env,
             chatId,
-            `⏳ HISTORICAL CONTEXT LIMIT REACHED\nTiingo live WebSocket ticks are still available, but the hourly REST allowance used to hydrate 1-minute history is temporarily exhausted.\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.\nV13.3.4 now persists WebSocket-sampled minute bars so normal automatic scans should stop repeatedly consuming this REST allowance after the next successful history refresh.`
+            `⏳ HISTORICAL CONTEXT LIMIT REACHED\nTiingo live WebSocket ticks are still available, but the hourly REST allowance used to hydrate 1-minute history is temporarily exhausted.\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.\nV13.5 now persists WebSocket-sampled minute bars so normal automatic scans should stop repeatedly consuming this REST allowance after the next successful history refresh.`
           );
           return new Response("ok");
         }
@@ -2650,7 +2655,7 @@ export default {
         await tgSend(
           env,
           chatId,
-          `⏳ NO ULTRA-HIGH-CONFIDENCE 2-MINUTE SETUP RIGHT NOW\nFeeds are live across the scan.${top?"\nMain blocker: "+top:""}\nAutomatic scanning remains active.`
+          `⏳ NO HIGH-CONFIDENCE 5-MINUTE SETUP RIGHT NOW\nFeeds are live across the scan.${top?"\nMain blocker: "+top:""}\nAutomatic scanning remains active.`
         );
         return new Response("ok");
       }
@@ -2663,7 +2668,7 @@ export default {
     }
 
     if(/^\/signal\b/i.test(text)){
-      await tgSend(env,chatId,"You do not need /signal for normal use: automatic scans run every minute. /signal is optional for an immediate six-pair scan and still returns only a fully qualified 2-minute setup.");
+      await tgSend(env,chatId,"You do not need /signal for normal use: automatic scans run every minute. /signal is optional for an immediate six-pair scan and still returns only a fully qualified 5-minute setup.");
       return new Response("ok");
     }
 
