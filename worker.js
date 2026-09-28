@@ -758,6 +758,47 @@ export class TickHub extends DurableObject {
     return pushed;
   }
 
+  async getTopHealth(){
+    const requested=[...FIXED_UNIVERSE];
+    let fetchError=null;
+    try{
+      await this.fetchTopSnapshots(requested);
+    }catch(e){
+      fetchError=String(e?.message||e);
+    }
+
+    const rows=requested.map(symbol=>{
+      const arr=this.ticks.get(symbol)||[];
+      const q=arr.at(-1);
+      const received=q?Math.max(0,(Date.now()-Number(q.r||q.t))/1000):null;
+      const provider=q?Math.max(0,(Date.now()-Number(q.t))/1000):null;
+      let health="NO DATA";
+      if(q&&Number.isFinite(provider)){
+        if(provider<=90)health="LIVE";
+        else if(provider<=300)health="WARMING";
+        else health="STALE";
+      }else if(fetchError){
+        health="ERROR";
+      }
+      return {
+        symbol,
+        health,
+        connected:Boolean(q),
+        ticks:arr.length,
+        receivedAge:Number.isFinite(received)?received:null,
+        providerAge:Number.isFinite(provider)?provider:null,
+        price:q?Number(q.p):null,
+        bid:q?.bid??null,
+        ask:q?.ask??null,
+        quoteAt:q?Number(q.t):null,
+        source:"tiingo-rest-top",
+        status:fetchError||health
+      };
+    });
+
+    return {ok:!fetchError,source:"tiingo-rest-top",error:fetchError,rows};
+  }
+
   async closeFeeds(reason="free-tier sleep"){
     try{if(this.ws){try{this.ws.close(1000,reason);}catch(_){}}}catch(_){}
     try{if(this.cryptoWs){try{this.cryptoWs.close(1000,reason);}catch(_){}}}catch(_){}
@@ -1694,6 +1735,7 @@ export class TickHub extends DurableObject {
         marketAgeSeconds:this.latestMarketAge(symbol)
       });
     }
+    if(u.pathname==="/top-health")return json(await this.getTopHealth());
     if(u.pathname==="/risk")return json(this.getRiskGate());
     if(u.pathname==="/register-chat"&&req.method==="POST")return json(await this.registerAlertChat(req));
     if(u.pathname==="/claim-ready"&&req.method==="POST")return json(await this.claimReadyAlert(req));
@@ -1983,44 +2025,25 @@ async function autoScanAndAlert(env){
 
 
 async function checkAllFeeds(env){
-  const results=await Promise.all(FIXED_UNIVERSE.map(async symbol=>{
-    try{
-      const st=await hub(env,`/status?symbol=${encodeURIComponent(symbol)}`);
-      const ticks=Number(st.ticks||0);
-      const received=st.lastTickAgeSeconds==null?null:Number(st.lastTickAgeSeconds);
-      const provider=st.providerTickAgeSeconds==null?null:Number(st.providerTickAgeSeconds);
-
-      let health="NO DATA";
-      if(st.connected && ticks>0 && Number.isFinite(received) && Number.isFinite(provider)){
-        if(received<=12 && provider<=20) health="LIVE";
-        else if(received<=30 && provider<=45) health="WARMING";
-        else health="STALE";
-      }else if(st.connected){
-        health="WARMING";
-      }
-
-      return {
-        symbol,
-        health,
-        connected:Boolean(st.connected),
-        ticks,
-        receivedAge:Number.isFinite(received)?received:null,
-        providerAge:Number.isFinite(provider)?provider:null,
-        status:st.status||"n/a"
-      };
-    }catch(e){
-      return {
-        symbol,
-        health:"ERROR",
-        connected:false,
-        ticks:0,
-        receivedAge:null,
-        providerAge:null,
-        status:String(e?.message||e)
-      };
-    }
-  }));
-  return results;
+  try{
+    const st=await hub(env,"/top-health");
+    if(Array.isArray(st?.rows))return st.rows;
+    throw new Error(st?.error||"REST top-of-book health check returned no rows");
+  }catch(e){
+    const msg=String(e?.message||e);
+    return FIXED_UNIVERSE.map(symbol=>({
+      symbol,
+      health:"ERROR",
+      connected:false,
+      ticks:0,
+      receivedAge:null,
+      providerAge:null,
+      status:msg,
+      source:"tiingo-rest-top"
+    }));
+  }finally{
+    try{await hub(env,"/sleep");}catch(_){}
+  }
 }
 
 
