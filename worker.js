@@ -1,13 +1,13 @@
 // V13.1 — two-minute automatic sniper with persistent READY pre-alerts
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "13.3.1-balanced-ready";
+const VERSION = "13.3.2-ready-conversion";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set();
 const A_GRADE_MIN_QUALITY = 0.90;
 const EXPIRY_SECONDS = 120;
-const STRATEGY_ID = "v13.3.1-balanced-ready";
+const STRATEGY_ID = "v13.3.2-ready-conversion";
 const PREPARE_TTL_MS = 5*60*1000;
 const PULLBACK_TTL_MS = 4*60*1000;
 const GLOBAL_SIGNAL_COOLDOWN_MS = 0;
@@ -1453,7 +1453,16 @@ export class TickHub extends DurableObject {
     return next;
   }
 
-  async finishReadyAudit(key,outcome,at=Date.now()){
+  async updateReadyAuditBlocker(key,reason){
+    if(!key||!reason)return;
+    const row=this.readyAudit.find(x=>x.key===key&&!x.outcome);
+    if(!row)return;
+    row.lastBlocker=String(reason).slice(0,220);
+    row.lastCheckedAt=Date.now();
+    await this.ctx.storage.put("readyAudit",this.readyAudit);
+  }
+
+  async finishReadyAudit(key,outcome,at=Date.now(),reason=null){
     if(!key)return;
     const row=this.readyAudit.find(x=>x.key===key&&!x.outcome);
     if(!row)return;
@@ -1463,6 +1472,7 @@ export class TickHub extends DurableObject {
     row.signalAt=outcome==="SIGNALLED"?at:null;
     row.timeToSignalMs=outcome==="SIGNALLED"?Math.max(0,at-Number(row.readyAlertAt||at)):null;
     row.timeToSignalSeconds=Number.isFinite(row.timeToSignalMs)?row.timeToSignalMs/1000:null;
+    if(reason)row.lastBlocker=String(reason).slice(0,220);
     await this.ctx.storage.put("readyAudit",this.readyAudit);
     console.log(JSON.stringify({event:"ready-alert-outcome",...row}));
   }
@@ -1550,7 +1560,7 @@ export class TickHub extends DurableObject {
     if(phase.stage==="PREPARE"){
       const pre=preAlert2m(arr,bars1m,symbol,phase.direction);
       if(!pre.ok){
-        await this.finishReadyAudit(phase.readyKey,"CANCELLED");
+        await this.finishReadyAudit(phase.readyKey,"CANCELLED",Date.now(),pre.reason||"PREPARE setup cancelled");
         phase=await this.setSetupStage(symbol,{stage:"SEEK",direction:null,lastBarT:Number(phase.lastBarT||0),updatedAt:Date.now()});
         return {ok:false,grade:"NO TRADE",symbol,setupStage:"SEEK",ticks:arr.length,
           receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status,reason:pre.reason||"PREPARE setup cancelled"};
@@ -1584,6 +1594,7 @@ export class TickHub extends DurableObject {
       }
 
       if(!final.ok){
+        await this.updateReadyAuditBlocker(phase.readyKey,final.reason||"waiting for final continuation/timing confirmation");
         return {...final,symbol,setupStage:"PREPARE",setupDirection:phase.direction,
           setupCandleT:phase.setupCandleT,readyKey:phase.readyKey,preAlert:false,
           preScore:pre.preScore,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status};
@@ -1609,7 +1620,7 @@ export class TickHub extends DurableObject {
     const x=score2m(arr,bars1m,symbol);
     if(!x.ok){
       if(phase.stage==="READY"){
-        await this.finishReadyAudit(phase.readyKey,"CANCELLED");
+        await this.finishReadyAudit(phase.readyKey,"CANCELLED",Date.now(),x.reason||"final A-grade timing failed");
         await this.setSetupStage(symbol,{stage:"SEEK",direction:null,lastBarT:Number(phase.lastBarT||0),updatedAt:Date.now()});
       }
       return {...x,symbol,setupStage:phase.stage,ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status};
@@ -1617,7 +1628,7 @@ export class TickHub extends DurableObject {
 
     const conflict=this.exposureConflict(symbol,x.direction);
     if(conflict){
-      await this.finishReadyAudit(phase.readyKey,"CANCELLED");
+      await this.finishReadyAudit(phase.readyKey,"CANCELLED",Date.now(),`correlated exposure conflict with ${conflict.withSymbol}`);
       await this.setSetupStage(symbol,{stage:"SEEK",direction:null,lastBarT:Number(phase.lastBarT||0),updatedAt:Date.now()});
       return {
         ok:false,grade:"NO TRADE",symbol,setupStage:phase.stage,
@@ -1805,7 +1816,7 @@ export class TickHub extends DurableObject {
     const outcome=String(body?.outcome||"").toUpperCase();
     if(!symbol||!["CANCELLED","EXPIRED"].includes(outcome))return {ok:false,error:"invalid READY outcome"};
     const setup=this.setupStates[symbol];
-    if(setup?.readyKey)await this.finishReadyAudit(setup.readyKey,outcome);
+    if(setup?.readyKey)await this.finishReadyAudit(setup.readyKey,outcome,Date.now(),body?.reason||null);
     await this.setSetupStage(symbol,{stage:"SEEK",direction:null,lastBarT:Number(setup?.lastBarT||0),updatedAt:Date.now()});
     return {ok:true};
   }
@@ -2149,36 +2160,40 @@ async function issueReadyAlert(env,chatIds,candidate){
     return {ok:false,reason:"READY alert could not be delivered; setup cancelled"};
   }
 
-  return {ok:true,symbol:candidate.symbol,preScore:candidate.preScore,delivered};
+  return {ok:true,symbol:candidate.symbol,direction:candidate.setupDirection,preScore:candidate.preScore,delivered};
 }
 
 
-async function issueAgradeSignal(env,chatIds,candidate,sourceUpdateId="auto",automatic=false){
+async function issueAgradeSignal(env,chatIds,candidate,sourceUpdateId="auto",automatic=false,cancelOnFail=true){
   const chats=(chatIds||[]).map(String).filter(Boolean);
   if(!chats.length)return {ok:false,reason:"no alert chat registered"};
 
   const symbol=candidate.symbol;
   const result=await hub(env,`/signal?symbol=${encodeURIComponent(symbol)}`);
   if(!result.ok||result.grade!=="A"||result.direction!==candidate.direction||Number(result.quality)<A_GRADE_MIN_QUALITY){
-    await hubPost(env,"/ready-outcome",{symbol,outcome:"CANCELLED"});
-    return {ok:false,reason:"setup changed during final check"};
+    const blocker=result?.reason||"setup changed during final check";
+    if(cancelOnFail)await hubPost(env,"/ready-outcome",{symbol,outcome:"CANCELLED",reason:blocker});
+    return {ok:false,reason:blocker,preserved:!cancelOnFail};
   }
   if(!(Number(result.readyAlertAt)>0)){
-    await hubPost(env,"/ready-outcome",{symbol,outcome:"CANCELLED"});
-    return {ok:false,reason:"READY warning was not confirmed before final signal"};
+    const blocker="READY warning was not confirmed before final signal";
+    if(cancelOnFail)await hubPost(env,"/ready-outcome",{symbol,outcome:"CANCELLED",reason:blocker});
+    return {ok:false,reason:blocker,preserved:!cancelOnFail};
   }
 
   const quoteBefore=await hub(env,`/quote?symbol=${encodeURIComponent(symbol)}`);
   if(!quoteBefore.ok||!Number.isFinite(Number(quoteBefore.price))||Number(quoteBefore.receiveAgeSeconds)>8){
-    await hubPost(env,"/ready-outcome",{symbol,outcome:"CANCELLED"});
-    return {ok:false,reason:"fresh entry quote unavailable"};
+    const blocker="fresh entry quote unavailable";
+    if(cancelOnFail)await hubPost(env,"/ready-outcome",{symbol,outcome:"CANCELLED",reason:blocker});
+    return {ok:false,reason:blocker,preserved:!cancelOnFail};
   }
   const driftAtr=Number(result.atr)>0
     ? Math.abs(Number(quoteBefore.price)-Number(result.lastPrice))/Number(result.atr)
     : Infinity;
   if(!Number.isFinite(driftAtr)||driftAtr>0.20){
-    await hubPost(env,"/ready-outcome",{symbol,outcome:"CANCELLED"});
-    return {ok:false,reason:"price moved too far during final 2-minute entry check"};
+    const blocker="price moved too far during final 2-minute entry check";
+    if(cancelOnFail)await hubPost(env,"/ready-outcome",{symbol,outcome:"CANCELLED",reason:blocker});
+    return {ok:false,reason:blocker,preserved:!cancelOnFail};
   }
 
   const arrow=result.direction==="CALL"?"⬆️":"⬇️";
@@ -2261,7 +2276,24 @@ async function autoScanAndAlert(env){
     }
 
     if(readySent.length){
-      return {ok:true,ready:true,readyAlertsSent:readySent.length,symbols:readySent.map(x=>x.symbol)};
+      // READY previously had to wait for the next one-minute scheduler pass, which
+      // could miss a short-lived 2-minute entry window. Keep feeds open briefly and
+      // perform one near-term recheck without weakening any final A-grade filter.
+      await sleep(12000);
+      const quickBlockers=[];
+      for(const ready of readySent){
+        const attempt=await issueAgradeSignal(
+          env,chats,{symbol:ready.symbol,direction:ready.direction},
+          `auto-ready-${Math.floor(Date.now()/1000)}-${ready.symbol}`,true,false
+        );
+        if(attempt.ok)return {...attempt,readyAlertsSent:readySent.length,quickConfirmed:true};
+        quickBlockers.push(`${ready.symbol}: ${attempt.reason||"not yet confirmed"}`);
+      }
+      return {
+        ok:true,ready:true,readyAlertsSent:readySent.length,
+        symbols:readySent.map(x=>x.symbol),
+        reason:quickBlockers.length?quickBlockers.join(" | "):"READY sent; waiting for final confirmation"
+      };
     }
 
     return {ok:false,reason:scan.reason||"no fully qualified setup"};
@@ -2352,7 +2384,7 @@ export default {
         return json({ok:false,error:String(e?.message||e)},500);
       }
     }
-    if(request.method!=="POST")return new Response("V13.3.1 two-minute auto sniper — balanced READY",{status:200});
+    if(request.method!=="POST")return new Response("V13.3.2 two-minute auto sniper — READY conversion recheck",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -2375,7 +2407,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V13.3.1 — TWO-MINUTE AUTO SNIPER. READY is restored to the preparation stage once the completed 5m trend, SMA-zone pullback, structure, ADX/DMI, room-to-move, spread/volatility and anti-reversal checks pass. The final CALL/PUT still requires every A-grade continuation and live-timing filter. DO NOT ENTER from READY alone."
+        "V13.3.2 — TWO-MINUTE AUTO SNIPER. READY remains a preparation warning, but the bot now keeps the live feed open and performs a near-term recheck about 12 seconds later so short 2-minute entry windows are not lost while waiting for the next one-minute scan. Final CALL/PUT thresholds are unchanged. Use /readystats to see why recent READY events converted, cancelled or expired."
       );
       return new Response("ok");
     }
@@ -2418,6 +2450,24 @@ export default {
         chatId,
         `TRACKED SIGNAL STATS\nTotal settled: ${st.total||0}\nWins: ${st.wins||0}\nLosses: ${st.losses||0}\nDraws: ${st.draws||0}\nVoids: ${st.voids||0}\nPending: ${st.pending||0}\nWin rate (W/L only): ${wr}\n\nResults are measured from Tiingo prices, not Pocket Option settlement prices.`
       );
+      return new Response("ok");
+    }
+    if(/^\/readystats$/i.test(text)){
+      const st=await hub(env,"/stats");
+      const rows=Array.isArray(st?.readyAudit)?st.readyAudit.slice(0,8):[];
+      if(!rows.length){
+        await tgSend(env,chatId,"READY AUDIT\nNo READY events recorded for the current strategy yet.");
+        return new Response("ok");
+      }
+      const now=Date.now();
+      const lines=rows.map(r=>{
+        const state=r.outcome||"PENDING";
+        const age=Math.max(0,Math.round((now-Number(r.readyAlertAt||now))/60000));
+        const blocker=r.lastBlocker?`\n  Blocker: ${r.lastBlocker}`:"";
+        const t=r.timeToSignalSeconds!=null?` • signal in ${Number(r.timeToSignalSeconds).toFixed(0)}s`:"";
+        return `${r.symbol} ${r.direction} — ${state} • ${age}m ago${t}${blocker}`;
+      });
+      await tgSend(env,chatId,`READY AUDIT — RECENT EVENTS\n\n${lines.join("\n\n")}\n\nREADY is preparation only. A final CALL/PUT is sent only after every A-grade entry filter passes.`);
       return new Response("ok");
     }
     if(/^\/forwardstats$/i.test(text)){
