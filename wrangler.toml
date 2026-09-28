@@ -6,14 +6,21 @@ compatibility_date = "2026-09-24"
 BOT_COMPACT_MODE = "1"
 WS_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF"
 
-[triggers]
-crons = ["* * * * *"]
 
 [[durable_objects.bindings]]
 name = "TICK_HUB"
 class_name = "TickHub"
 
 [exports.TickHub]
+type = "durable-object"
+state = "created"
+storage = "sqlite"
+
+[[durable_objects.bindings]]
+name = "AUTO_SCHEDULER"
+class_name = "AutoScheduler"
+
+[exports.AutoScheduler]
 type = "durable-object"
 state = "created"
 storage = "sqlite"
