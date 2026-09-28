@@ -1,13 +1,13 @@
 // V13.5 — five-minute automatic sniper with persistent READY pre-alerts
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "13.5.0-five-minute-expiry";
+const VERSION = "13.5.1-continuation-flex";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set();
 const A_GRADE_MIN_QUALITY = 0.90;
 const EXPIRY_SECONDS = 300;
-const STRATEGY_ID = "v13.5-five-minute-expiry";
+const STRATEGY_ID = "v13.5.1-continuation-flex";
 const PREPARE_TTL_MS = 6*60*1000;
 const PULLBACK_TTL_MS = 4*60*1000;
 const GLOBAL_SIGNAL_COOLDOWN_MS = 0;
@@ -422,12 +422,14 @@ function score5m(ticks,bars1m,symbol){
       coreDirection:direction,regime15:regime15.direction};
   }
 
-  // The 1m fast/slow stack must agree with the 5m direction.
+  // For a 5-minute hold, the fast/slow stack and fast-slope continuation are the
+  // important hard requirements. The slower SMA slope can lag briefly after a valid
+  // pullback, so it contributes to quality instead of vetoing an otherwise valid setup.
   const smaStack=direction==="CALL"?sma1.fast>sma1.slow:sma1.fast<sma1.slow;
   const fastSlopeAligned=direction==="CALL"?sma1.fastSlope>0:sma1.fastSlope<0;
   const slowSlopeAligned=direction==="CALL"?sma1.slowSlope>=0:sma1.slowSlope<=0;
-  if(!smaStack||!fastSlopeAligned||!slowSlopeAligned){
-    return {ok:false,grade:"NO TRADE",reason:"1m SMA(5/13) structure is not fully aligned",coreDirection:direction};
+  if(!smaStack||!fastSlopeAligned){
+    return {ok:false,grade:"NO TRADE",reason:"1m SMA(5/13) continuation structure failed",coreDirection:direction};
   }
 
   if(direction==="CALL"&&fr1.lastLow&&last<=Number(fr1.lastLow.price)){
@@ -437,11 +439,12 @@ function score5m(ticks,bars1m,symbol){
     return {ok:false,grade:"NO TRADE",reason:"Fractal(2) resistance failed",coreDirection:direction};
   }
 
-  // A 5-minute trade can tolerate a slightly wider pullback/continuation entry
-  // than the previous short-expiry mode, but it also needs more room to develop.
+  // A five-minute continuation can legitimately move away from SMA(5) after READY.
+  // Only reject clearly chased entries; moderate extension is handled by the quality score.
   const distanceFast=Math.abs(last-sma1.fast)/atr1.atr;
-  if(distanceFast>0.88){
-    return {ok:false,grade:"NO TRADE",reason:"entry is too extended for 5-minute expiry",
+  if(distanceFast>1.25){
+    return {ok:false,grade:"NO TRADE",
+      reason:`entry extension ${distanceFast.toFixed(2)} ATR exceeds the 1.25 ATR five-minute limit`,
       distanceFastAtr:distanceFast,coreDirection:direction};
   }
 
@@ -533,7 +536,9 @@ function score5m(ticks,bars1m,symbol){
   if(regime15.ready&&regime15.direction===direction)score+=0.5;
   if(regime5.efficiency>=0.35)score+=0.3;
   if(dmi.adx>=25)score+=0.3;
+  if(slowSlopeAligned)score+=0.2;
   if(distanceFast<=0.60)score+=0.3;
+  else if(distanceFast<=0.95)score+=0.15;
   if(room.roomAtr>=1.20)score+=0.3;
   if(imp.upRatio>=0.65||imp.downRatio>=0.65)score+=0.2;
 
@@ -542,7 +547,8 @@ function score5m(ticks,bars1m,symbol){
     (regime15.ready&&regime15.direction===direction?0.012:0) +
     Math.min(Math.max(dmi.adx-20,0),15)/15*0.018 +
     Math.min(Math.max(room.roomAtr-1.00,0),0.80)/0.80*0.014 +
-    (distanceFast<=0.60?0.010:0) +
+    (slowSlopeAligned?0.004:0) +
+    (distanceFast<=0.60?0.010:(distanceFast<=0.95?0.005:0)) +
     (Math.max(imp.upRatio,imp.downRatio)>=0.65?0.008:0) +
     (momentumConfirmations===4?0.006:0.003),
     0.895,0.970
@@ -564,6 +570,8 @@ function score5m(ticks,bars1m,symbol){
     dmiGap,smaFastPeriod:5,smaSlowPeriod:13,fractalPeriod:2,
     timeframe:"1min",expiryMinutes:5,smaFast:sma1.fast,smaSlow:sma1.slow,
     distanceFastAtr:distanceFast,atr:atr1.atr,
+    smaSlowSlopeAligned:slowSlopeAligned,
+    entryExtensionBand:distanceFast<=0.88?"pullback-zone":(distanceFast<=1.25?"continuation-zone":"overextended"),
     momentumConfirmations,momentumChecks,
     reasons:[
       "completed 5m trend aligned",
@@ -627,7 +635,10 @@ function preAlert5m(ticks,bars1m,symbol,direction){
 
   const stack=direction==="CALL"?sma.fast>sma.slow:sma.fast<sma.slow;
   const slope=direction==="CALL"?sma.fastSlope>=0:sma.fastSlope<=0;
-  if(!stack||!slope)return {ok:false,reason:"SMA structure lost"};
+  if(!stack)return {ok:false,reason:"SMA 5/13 stack reversed"};
+  // A flat/briefly lagging fast slope is tolerated during READY for a 5-minute hold;
+  // the final signal still requires the fast slope to point with the trade.
+  const slopeSupport=slope;
 
   const dmiGap=Math.abs(Number(dmi.plusDI)-Number(dmi.minusDI));
   const dmiAligned=direction==="CALL"?dmi.plusDI>dmi.minusDI:dmi.minusDI>dmi.plusDI;
@@ -651,7 +662,8 @@ function preAlert5m(ticks,bars1m,symbol,direction){
   }
 
   const distanceFast=Math.abs(last-sma.fast)/atr.atr;
-  if(distanceFast>0.88)return {ok:false,reason:"price moved too far from the SMA 5/13 setup zone for a 5-minute entry"};
+  if(distanceFast>1.25)return {ok:false,
+    reason:`price extension ${distanceFast.toFixed(2)} ATR exceeds the 1.25 ATR READY limit`};
 
   const room=roomToMoveSnapshot(bars1m,last,direction,atr.atr);
   if(!room.ready||room.roomAtr<1.00)return {ok:false,reason:"room-to-move is no longer adequate for a 5-minute entry"};
@@ -669,7 +681,8 @@ function preAlert5m(ticks,bars1m,symbol,direction){
     Math.min(Math.max(dmi.adx-20,0),15)/15*0.035 +
     Math.min(Math.max(room.roomAtr-1.00,0),0.80)/0.80*0.025 +
     (reg15.ready&&reg15.direction===direction?0.020:0) +
-    (distanceFast<=0.65?0.015:0),
+    (slopeSupport?0.008:0) +
+    (distanceFast<=0.65?0.015:(distanceFast<=0.95?0.008:0)),
     0.84,0.94
   );
 
@@ -683,6 +696,8 @@ function preAlert5m(ticks,bars1m,symbol,direction){
     atrRatio,
     spreadAtrRatio:spread.spreadAtrRatio,
     spreadBps:spread.spreadBps,
+    smaFastSlopeAligned:slopeSupport,
+    entryExtensionBand:distanceFast<=0.88?"pullback-zone":(distanceFast<=1.25?"continuation-zone":"overextended"),
     preMomentumConfirmations,preMomentumChecks
   };
 }
@@ -2208,7 +2223,8 @@ async function issueReadyAlert(env,chatIds,candidate){
   const msg=
     `READY 🔥🔥\n`+
     `${candidate.symbol} setup developing.\n`+
-    `Trend, pullback, structure and strength aligned${Number.isFinite(pm)?` • momentum ${pm}/4`:""}.\n`+
+    `Trend, pullback, structure and strength aligned${Number.isFinite(pm)?` • momentum ${pm}/4`:""}.
+`+
     `DO NOT ENTER YET — wait for the actual 5-minute signal.`;
 
   let delivered=0;
@@ -2456,7 +2472,7 @@ export default {
         return json({ok:false,error:String(e?.message||e)},500);
       }
     }
-    if(request.method!=="POST")return new Response("V13.5 five-minute auto sniper — quota-safe context",{status:200});
+    if(request.method!=="POST")return new Response("V13.5.1 five-minute auto sniper — continuation-flex",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -2479,7 +2495,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V13.5 — FIVE-MINUTE AUTO SNIPER. The longer expiry gives the confirmed 1m/5m setup more time to develop while Tiingo WebSocket ticks extend the persisted context between scans. READY requires at least 2/4 momentum confirmations; final CALL/PUT requires at least 3/4 plus the core trend, structure, DMI, room, continuation and live-timing filters. Use /readystats for READY conversion blockers."
+        "V13.5.1 — FIVE-MINUTE AUTO SNIPER. READY and final entries now allow a controlled post-pullback continuation zone instead of cancelling simply because price moved moderately away from SMA(5). The hard chase limit is 1.25 ATR. Final CALL/PUT still requires the 5m trend, SMA stack plus fast slope, fractal structure, DMI/ADX, room, 3/4 momentum, completed 1m continuation and live-tick timing. Use /readystats for exact blockers."
       );
       return new Response("ok");
     }
