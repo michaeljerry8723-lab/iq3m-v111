@@ -1,13 +1,13 @@
 // V13.1 — two-minute automatic sniper with persistent READY pre-alerts
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "13.3.3-confluence-balanced";
+const VERSION = "13.3.4-quota-safe-context";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set();
 const A_GRADE_MIN_QUALITY = 0.90;
 const EXPIRY_SECONDS = 120;
-const STRATEGY_ID = "v13.3.3-confluence-balanced";
+const STRATEGY_ID = "v13.3.4-quota-safe-context";
 const PREPARE_TTL_MS = 5*60*1000;
 const PULLBACK_TTL_MS = 4*60*1000;
 const GLOBAL_SIGNAL_COOLDOWN_MS = 0;
@@ -890,6 +890,7 @@ export class TickHub extends DurableObject {
 
   async primeLiveFlow(sampleMs=5000){
     const ms=Math.max(2000,Math.min(8000,Number(sampleMs)||5000));
+    try{this.captureSampledMinuteBars();}catch(_){}
     // QUOTA-SAFE: do not call Tiingo REST here. This route runs every minute and
     // a single REST request per scan would exceed Tiingo Starter's 50/hour limit.
     // Fresh quotes come from the WebSocket; REST is reserved for historical context,
@@ -960,6 +961,10 @@ export class TickHub extends DurableObject {
   }
 
   async closeFeeds(reason="free-tier sleep"){
+    // Persist the live WebSocket sample into the one-minute context before the
+    // Durable Object sleeps. This lets future scans advance indicators without
+    // repeatedly consuming Tiingo's hourly historical REST allocation.
+    try{this.captureSampledMinuteBars();}catch(e){this.lastStatus=`sample capture error: ${String(e?.message||e)}`;}
     if(this.oneMinuteCacheDirty){
       try{await this.persistOneMinuteCache();}catch(e){this.lastStatus=`context persist error: ${String(e?.message||e)}`;}
     }
@@ -1291,11 +1296,49 @@ export class TickHub extends DurableObject {
 
   mergeOneMinuteContext(symbol,cachedBars=[]){
     const currentMinute=Math.floor(Date.now()/60000)*60000;
-    const liveBars=buildBars(this.ticks.get(symbol)||[],60).filter(b=>b.t<currentMinute);
+    const liveBars=buildBars(this.ticks.get(symbol)||[],60).filter(b=>Number(b.t)<currentMinute);
     const merged=new Map();
-    for(const b of cachedBars||[])merged.set(Number(b.t),b);
+    for(const b of cachedBars||[]){
+      if(Number(b?.t)<currentMinute)merged.set(Number(b.t),b);
+    }
     for(const b of liveBars)merged.set(Number(b.t),b);
     return [...merged.values()].sort((a,b)=>a.t-b.t).slice(-480);
+  }
+
+  captureSampledMinuteBars(){
+    const currentMinute=Math.floor(Date.now()/60000)*60000;
+    let changed=false;
+    for(const symbol of FIXED_UNIVERSE){
+      const arr=this.ticks.get(symbol)||[];
+      if(!arr.length)continue;
+      const sampled=buildBars(arr,60).filter(b=>Number(b.t)<=currentMinute);
+      if(!sampled.length)continue;
+      const cached=this.oneMinuteCache.get(symbol);
+      const merged=new Map();
+      for(const b of cached?.bars||[])merged.set(Number(b.t),{...b});
+      for(const b of sampled){
+        const t=Number(b.t);
+        const prev=merged.get(t);
+        if(!prev){
+          merged.set(t,{...b,sampled:true});
+        }else{
+          merged.set(t,{
+            t,
+            o:Number(prev.o),
+            h:Math.max(Number(prev.h),Number(b.h)),
+            l:Math.min(Number(prev.l),Number(b.l)),
+            c:Number(b.c),
+            n:Number(prev.n||0)+Number(b.n||0),
+            sampled:Boolean(prev.sampled||false)
+          });
+        }
+      }
+      const bars=[...merged.values()].sort((a,b)=>Number(a.t)-Number(b.t)).slice(-480);
+      this.oneMinuteCache.set(symbol,{at:Date.now(),bars});
+      changed=true;
+    }
+    if(changed)this.oneMinuteCacheDirty=true;
+    return changed;
   }
 
   contextIsUsable(bars){
@@ -1303,7 +1346,9 @@ export class TickHub extends DurableObject {
     const xs=bars.slice(-24);
     const last=xs.at(-1);
     if(!last||Date.now()-Number(last.t)>3*60*1000)return false;
-    // Reject a context window with a large missing-data gap.
+    // Once Tiingo REST has hydrated the baseline history, the one-minute cache is
+    // extended every automatic scan from the live WebSocket. Reject only genuinely
+    // broken recent context rather than refetching historical bars every minute.
     for(let i=1;i<xs.length;i++){
       if(Number(xs[i].t)-Number(xs[i-1].t)>3*60*1000)return false;
     }
@@ -2406,7 +2451,7 @@ export default {
         return json({ok:false,error:String(e?.message||e)},500);
       }
     }
-    if(request.method!=="POST")return new Response("V13.3.3 two-minute auto sniper — balanced confluence",{status:200});
+    if(request.method!=="POST")return new Response("V13.3.4 two-minute auto sniper — quota-safe context",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -2429,7 +2474,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V13.3.3 — TWO-MINUTE AUTO SNIPER. Tiingo supplies the live market data, while the strategy now uses balanced confluence instead of requiring MACD, RSI, Aroon and candle pressure to all pass individually. READY requires at least 2/4 momentum confirmations; a final CALL/PUT requires at least 3/4 plus every core trend, structure, DMI, room, continuation and live-timing filter. Two rapid post-READY rechecks help capture short 2-minute entry windows. Use /readystats for conversion blockers."
+        "V13.3.4 — TWO-MINUTE AUTO SNIPER. Tiingo WebSocket ticks now extend the persisted one-minute context between scans, reducing repeated historical REST calls and protecting the hourly data allowance. READY requires at least 2/4 momentum confirmations; final CALL/PUT requires at least 3/4 plus the core trend, structure, DMI, room, continuation and live-timing filters. Use /readystats for READY conversion blockers."
       );
       return new Response("ok");
     }
@@ -2582,7 +2627,7 @@ export default {
           await tgSend(
             env,
             chatId,
-            `⏳ DATA LIMIT REACHED\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.\nThe bot will scan all 6 FX pairs again and only issue an ultra-selective 2-minute setup.`
+            `⏳ HISTORICAL CONTEXT LIMIT REACHED\nTiingo live WebSocket ticks are still available, but the hourly REST allowance used to hydrate 1-minute history is temporarily exhausted.\nTry /signal again in about ${mins} minute${mins===1?"":"s"}.\nV13.3.4 now persists WebSocket-sampled minute bars so normal automatic scans should stop repeatedly consuming this REST allowance after the next successful history refresh.`
           );
           return new Response("ok");
         }
