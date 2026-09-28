@@ -806,7 +806,6 @@ export class TickHub extends DurableObject {
     return pushed;
   }
 
-  async sampleTickFlow(sampleMs=5000){
   async primeLiveFlow(sampleMs=5000){
     const ms=Math.max(2000,Math.min(8000,Number(sampleMs)||5000));
     try{await this.fetchTopSnapshots(FIXED_UNIVERSE);}catch(_){}
