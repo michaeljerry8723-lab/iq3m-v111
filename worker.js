@@ -1,14 +1,15 @@
 // V13.1 — two-minute automatic sniper with persistent READY pre-alerts
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "13.1.1-ready-guarantee";
+const VERSION = "13.2.0-free-tier-runtime-fix";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set();
 const A_GRADE_MIN_QUALITY = 0.90;
 const EXPIRY_SECONDS = 120;
-const STRATEGY_ID = "v13.1.1-two-minute-ready-guarantee";
+const STRATEGY_ID = "v13.2-free-tier-runtime-fix";
 const PREPARE_TTL_MS = 5*60*1000;
+const PULLBACK_TTL_MS = 4*60*1000;
 const GLOBAL_SIGNAL_COOLDOWN_MS = 0;
 const PAIR_SIGNAL_COOLDOWN_MS = 8*60*1000;
 const LOSS_CIRCUIT_BREAKER_MS = 20*60*1000;
@@ -158,13 +159,13 @@ function fractalSnapshot(bars,p=2){
   return {ready:Boolean(lastHigh||lastLow),lastHigh,lastLow,period:p};
 }
 function tickImpulse(ticks){
-  const xs=ticks.slice(-24); if(xs.length<8)return {ready:false};
+  const xs=ticks.slice(-24); if(xs.length<8)return {ready:false,samples:xs.length};
   let up=0,down=0,abs=0;
   for(let i=1;i<xs.length;i++){
     const d=xs[i].p-xs[i-1].p; if(d>0)up++; else if(d<0)down++; abs+=Math.abs(d);
   }
   const delta=xs.at(-1).p-xs[0].p, avg=abs/Math.max(1,xs.length-1);
-  return {ready:true,upRatio:up/Math.max(1,up+down),downRatio:down/Math.max(1,up+down),delta,norm:avg>0?delta/avg:0};
+  return {ready:true,samples:xs.length,upRatio:up/Math.max(1,up+down),downRatio:down/Math.max(1,up+down),delta,norm:avg>0?delta/avg:0};
 }
 
 function smaTrendSnapshot(bars,fast=2,slow=5){
@@ -488,32 +489,44 @@ function score2m(ticks,bars1m,symbol){
   }
 
   // The 30-second layer confirms timing only after the 1m/5m setup is already valid.
-  if(!m30.ready||b30.length<12){
-    return {ok:false,grade:"NO TRADE",reason:"30-second timing layer is still warming"};
-  }
-  const microMacd=direction==="CALL"
-    ? (m30.macd>m30.signal&&m30.hist>0)
-    : (m30.macd<m30.signal&&m30.hist<0);
-  const microLast=b30.at(-1);
-  const microCandle=direction==="CALL"
-    ? Number(microLast.c)>Number(microLast.o)
-    : Number(microLast.c)<Number(microLast.o);
-
+  // Free-tier runtime model: the Durable Object intentionally sleeps between scans.
+  // A seven-minute in-memory 30s MACD history therefore cannot be a mandatory gate.
+  // Use the 30s layer when it genuinely exists; otherwise require a stricter fresh
+  // live-tick burst on top of the already-confirmed 1m continuation.
   const imp=tickImpulse(ticks);
   if(!imp.ready){
-    return {ok:false,grade:"NO TRADE",reason:"live tick confirmation is not ready"};
+    return {ok:false,grade:"NO TRADE",reason:`live tick confirmation needs more fresh ticks (${imp.samples||0}/8)`};
   }
-  const tickAligned=direction==="CALL"
-    ? (imp.upRatio>=0.60&&imp.norm>0)
-    : (imp.downRatio>=0.60&&imp.norm<0);
   const strongOpp=direction==="CALL"
     ? (imp.downRatio>=0.68&&imp.norm<0)
     : (imp.upRatio>=0.68&&imp.norm>0);
   if(strongOpp){
     return {ok:false,grade:"NO TRADE",reason:"live tick flow is reversing against the setup"};
   }
-  if(!microMacd||!microCandle||!tickAligned){
-    return {ok:false,grade:"NO TRADE",reason:"30s/live timing is not fully aligned"};
+
+  const has30sContext=Boolean(m30.ready&&b30.length>=14);
+  let microMode="live-burst";
+  let microAligned=false;
+  if(has30sContext){
+    const microMacd=direction==="CALL"
+      ? (m30.macd>m30.signal&&m30.hist>0)
+      : (m30.macd<m30.signal&&m30.hist<0);
+    const microLast=b30.at(-1);
+    const microCandle=direction==="CALL"
+      ? Number(microLast.c)>Number(microLast.o)
+      : Number(microLast.c)<Number(microLast.o);
+    const tickAligned=direction==="CALL"
+      ? (imp.upRatio>=0.60&&imp.norm>0)
+      : (imp.downRatio>=0.60&&imp.norm<0);
+    microAligned=microMacd&&microCandle&&tickAligned;
+    microMode="30s-macd+live";
+  }else{
+    microAligned=direction==="CALL"
+      ? (imp.upRatio>=0.64&&imp.norm>=0.35)
+      : (imp.downRatio>=0.64&&imp.norm<=-0.35);
+  }
+  if(!microAligned){
+    return {ok:false,grade:"NO TRADE",reason:has30sContext?"30s/live timing is not fully aligned":"fresh live-tick burst is not strong enough"};
   }
 
   const pressureAligned=direction==="CALL"?pressure.bull>=2:pressure.bear>=2;
@@ -565,9 +578,10 @@ function score2m(ticks,bars1m,symbol){
       "RSI(7) continuation zone",
       "Aroon aligned",
       "room-to-move passed",
-      "30s MACD + candle aligned",
+      microMode==="30s-macd+live"?"30s MACD + candle aligned":"strict fresh live-tick burst aligned",
       "live tick flow aligned"
     ],
+    microMode,microTickSamples:imp.samples||0,
     bars1m:bars1m.length,bars30:b30.length,lastPrice:last
   };
 }
@@ -793,7 +807,9 @@ export class TickHub extends DurableObject {
   }
 
   async sampleTickFlow(sampleMs=5000){
+  async primeLiveFlow(sampleMs=5000){
     const ms=Math.max(2000,Math.min(8000,Number(sampleMs)||5000));
+    try{await this.fetchTopSnapshots(FIXED_UNIVERSE);}catch(_){}
     const before={};
     for(const symbol of FIXED_UNIVERSE)before[symbol]=(this.ticks.get(symbol)||[]).length;
     await this.ensureSocket();
@@ -809,8 +825,13 @@ export class TickHub extends DurableObject {
         providerTickAgeSeconds:last?this.latestMarketAge(symbol):null
       };
     });
-    await this.closeFeeds("tick sample complete");
     return {ok:true,sampleSeconds:ms/1000,rows};
+  }
+
+  async sampleTickFlow(sampleMs=5000){
+    const result=await this.primeLiveFlow(sampleMs);
+    await this.closeFeeds("tick sample complete");
+    return result;
   }
 
   async getTopHealth(){
@@ -1320,6 +1341,17 @@ export class TickHub extends DurableObject {
       return {...next,snapshot:snap};
     }
 
+    // A recorded pullback must not survive indefinitely. If it leaves the recent
+    // setup window or ages beyond four minutes, re-arm for a genuinely fresh pullback.
+    if(st.stage==="PULLBACK"&&(
+      !snap.pullbackSeen ||
+      now-Number(st.pullbackAt||st.updatedAt||0)>PULLBACK_TTL_MS
+    )){
+      const next={stage:"ARMED",direction:snap.direction,lastBarT:snap.barT,updatedAt:now};
+      await save(next);
+      return {...next,snapshot:snap};
+    }
+
     // Repeated /signal commands within the same completed 1m candle must not
     // artificially advance the sequence.
     if(Number(st.lastBarT)===Number(snap.barT)){
@@ -1330,7 +1362,7 @@ export class TickHub extends DurableObject {
     if(st.stage==="SEEK"){
       next={stage:"ARMED",direction:snap.direction,lastBarT:snap.barT,updatedAt:now};
     }else if(st.stage==="ARMED"&&snap.pullbackSeen){
-      next={stage:"PULLBACK",direction:snap.direction,lastBarT:snap.barT,updatedAt:now};
+      next={stage:"PULLBACK",direction:snap.direction,lastBarT:snap.barT,pullbackAt:now,updatedAt:now};
     }else if(st.stage==="READY"){
       const ageBars=Math.max(0,(Number(snap.barT)-Number(st.readyBarT||st.lastBarT))/60000);
       if(ageBars>1){
@@ -1424,6 +1456,7 @@ export class TickHub extends DurableObject {
     }
 
     let phase=await this.advanceSetupState(symbol,bars1m);
+    let pullbackBlocker=null;
     if(phase.stage==="PULLBACK"){
       const pre=preAlert2m(arr,bars1m,symbol,phase.direction);
       if(pre.ok){
@@ -1439,6 +1472,7 @@ export class TickHub extends DurableObject {
           reason:"setup qualified for PREPARE — waiting only for final continuation/timing confirmation"
         };
       }
+      pullbackBlocker=pre.reason||"pullback has not qualified for PREPARE";
     }
 
     if(phase.stage==="PREPARE"){
@@ -1490,7 +1524,7 @@ export class TickHub extends DurableObject {
         ? "waiting for a clean completed 5m trend"
         : phase.stage==="ARMED"
           ? "trend armed — waiting for the next pullback into the SMA zone"
-          : "pullback recorded — waiting for a fresh 1m continuation";
+          : (pullbackBlocker||"pullback recorded — waiting for a fresh 1m continuation");
 
       return {
         ok:false,grade:"NO TRADE",symbol,setupStage:phase.stage,setupDirection:phase.direction,
@@ -1791,11 +1825,36 @@ export class TickHub extends DurableObject {
     if(u.pathname==="/sleep")return json(await this.closeFeeds("request complete"));
 
     if(u.pathname==="/claim-cron"&&req.method==="POST"){
-      const minute=Math.floor(Date.now()/60000);
+      const now=Date.now(),minute=Math.floor(now/60000);
       const last=Number((await this.ctx.storage.get("lastCronMinute"))??-1);
       if(last===minute)return json({ok:true,claimed:false,minute});
+      const count=Number((await this.ctx.storage.get("cronScanCount"))||0)+1;
       await this.ctx.storage.put("lastCronMinute",minute);
-      return json({ok:true,claimed:true,minute});
+      await this.ctx.storage.put("lastCronClaimAt",now);
+      await this.ctx.storage.put("cronScanCount",count);
+      return json({ok:true,claimed:true,minute,count});
+    }
+
+    if(u.pathname==="/cron-result"&&req.method==="POST"){
+      const body=await req.json().catch(()=>({}));
+      const result=body?.result||null;
+      const summary=result?{
+        ok:Boolean(result.ok),ready:Boolean(result.ready),symbol:result.symbol||null,
+        direction:result.direction||null,reason:result.reason||null,
+        readyAlertsSent:Number(result.readyAlertsSent||0)
+      }:null;
+      await this.ctx.storage.put("lastCronResultAt",Date.now());
+      await this.ctx.storage.put("lastCronResult",summary);
+      return json({ok:true});
+    }
+
+    if(u.pathname==="/cronstatus"){
+      const lastCronClaimAt=Number((await this.ctx.storage.get("lastCronClaimAt"))||0);
+      const lastCronResultAt=Number((await this.ctx.storage.get("lastCronResultAt"))||0);
+      const count=Number((await this.ctx.storage.get("cronScanCount"))||0);
+      const lastResult=(await this.ctx.storage.get("lastCronResult"))||null;
+      const ageSeconds=lastCronClaimAt?Math.max(0,(Date.now()-lastCronClaimAt)/1000):null;
+      return json({ok:true,lastCronClaimAt,lastCronResultAt,ageSeconds,count,lastResult});
     }
 
     if(u.pathname==="/reconnect"){
@@ -1832,6 +1891,10 @@ export class TickHub extends DurableObject {
     if(u.pathname==="/tick-sample"){
       const ms=Math.max(2000,Math.min(8000,Number(u.searchParams.get("ms")||5000)));
       return json(await this.sampleTickFlow(ms));
+    }
+    if(u.pathname==="/prime-live"){
+      const ms=Math.max(2000,Math.min(8000,Number(u.searchParams.get("ms")||5000)));
+      return json(await this.primeLiveFlow(ms));
     }
     if(u.pathname==="/top-health")return json(await this.getTopHealth());
     if(u.pathname==="/risk")return json(this.getRiskGate());
@@ -2094,6 +2157,7 @@ async function autoScanAndAlert(env){
     const risk=await hub(env,"/risk");
     if(!risk.ok)return {ok:false,reason:risk.reason||"risk gate"};
 
+    await hub(env,"/prime-live?ms=5000");
     const scan=await scanUniverse(env);
 
     // READY warnings are always delivered before any final signal from this scan.
@@ -2196,13 +2260,14 @@ export default {
         const claim=await hubPost(env,"/claim-cron",{});
         if(!claim?.claimed)return json({ok:true,skipped:true,reason:"minute already claimed"});
         const result=await autoScanAndAlert(env);
+        try{await hubPost(env,"/cron-result",{result});}catch(_){}
         return json({ok:true,claimed:true,result});
       }catch(e){
         console.error("cron-scan failed",String(e?.stack||e?.message||e));
         return json({ok:false,error:String(e?.message||e)},500);
       }
     }
-    if(request.method!=="POST")return new Response("V13.1.1 two-minute auto sniper with guaranteed READY-before-signal flow",{status:200});
+    if(request.method!=="POST")return new Response("V13.2 two-minute auto sniper — free-tier runtime fix",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -2222,7 +2287,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V13.1.1 — TWO-MINUTE AUTO SNIPER. Automatic scanning runs every minute. A structurally valid pullback enters PREPARE and must successfully deliver one READY 🔥🔥 warning before it can advance to a final entry. No trade should be taken from READY alone. The normal 2-minute signal is sent only if the later 1m continuation, 30-second timing, live-tick flow and every final filter pass."
+        "V13.2 — TWO-MINUTE AUTO SNIPER. Automatic scanning runs every minute. The free-tier runtime now primes all six live feeds together, expires stale pullbacks, and uses a strict fresh live-tick timing fallback when durable 30-second history is unavailable. READY 🔥🔥 must still be delivered before any final 2-minute signal."
       );
       return new Response("ok");
     }
@@ -2282,6 +2347,7 @@ export default {
       return new Response("ok");
     }
     if(/^\/diagnose$/i.test(text)){
+      try{await hub(env,"/prime-live?ms=5000");}catch(_){}
       const rows=[];
       for(const symbol of FIXED_UNIVERSE){
         try{
@@ -2292,6 +2358,13 @@ export default {
         }
       }
       await tgSend(env,chatId,`V13 TWO-MINUTE SNIPER DIAGNOSIS\n\n${rows.join("\n")}`);
+      return new Response("ok");
+    }
+    if(/^\/cronstatus$/i.test(text)){
+      const st=await hub(env,"/cronstatus");
+      const age=st.ageSeconds==null?"n/a":Number(st.ageSeconds).toFixed(0)+"s";
+      const r=st.lastResult||{};
+      await tgSend(env,chatId,`AUTO-SCAN STATUS\nVersion: ${VERSION}\nLast cron: ${age} ago\nScans recorded: ${st.count||0}\nLast result: ${r.ok?"qualified/handled":(r.reason||"no qualified setup")}\nREADY alerts in last scan: ${r.readyAlertsSent||0}${r.symbol?`\nSymbol: ${r.symbol}`:""}`);
       return new Response("ok");
     }
     if(/^\/reconnect$/i.test(text)){
@@ -2331,6 +2404,7 @@ export default {
         return new Response("ok");
       }
 
+      try{await hub(env,"/prime-live?ms=5000");}catch(_){}
       const scan=await scanUniverse(env);
       if(!scan.ok){
         if(scan.quotaExceeded){
