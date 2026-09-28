@@ -792,6 +792,27 @@ export class TickHub extends DurableObject {
     return pushed;
   }
 
+  async sampleTickFlow(sampleMs=5000){
+    const ms=Math.max(2000,Math.min(8000,Number(sampleMs)||5000));
+    const before={};
+    for(const symbol of FIXED_UNIVERSE)before[symbol]=(this.ticks.get(symbol)||[]).length;
+    await this.ensureSocket();
+    await sleep(ms);
+    const rows=FIXED_UNIVERSE.map(symbol=>{
+      const arr=this.ticks.get(symbol)||[];
+      const last=arr.at(-1);
+      return {
+        symbol,
+        sampleTicks:Math.max(0,arr.length-Number(before[symbol]||0)),
+        bufferedTicks:arr.length,
+        lastTickAgeSeconds:last?this.latestReceivedAge(symbol):null,
+        providerTickAgeSeconds:last?this.latestMarketAge(symbol):null
+      };
+    });
+    await this.closeFeeds("tick sample complete");
+    return {ok:true,sampleSeconds:ms/1000,rows};
+  }
+
   async getTopHealth(){
     const requested=[...FIXED_UNIVERSE];
     let fetchError=null;
@@ -1808,6 +1829,10 @@ export class TickHub extends DurableObject {
         marketAgeSeconds:this.latestMarketAge(symbol)
       });
     }
+    if(u.pathname==="/tick-sample"){
+      const ms=Math.max(2000,Math.min(8000,Number(u.searchParams.get("ms")||5000)));
+      return json(await this.sampleTickFlow(ms));
+    }
     if(u.pathname==="/top-health")return json(await this.getTopHealth());
     if(u.pathname==="/risk")return json(this.getRiskGate());
     if(u.pathname==="/register-chat"&&req.method==="POST")return json(await this.registerAlertChat(req));
@@ -2198,6 +2223,20 @@ export default {
         env,
         chatId,
         "V13.1.1 — TWO-MINUTE AUTO SNIPER. Automatic scanning runs every minute. A structurally valid pullback enters PREPARE and must successfully deliver one READY 🔥🔥 warning before it can advance to a final entry. No trade should be taken from READY alone. The normal 2-minute signal is sent only if the later 1m continuation, 30-second timing, live-tick flow and every final filter pass."
+      );
+      return new Response("ok");
+    }
+    if(/^\/tickstats$/i.test(text)){
+      const st=await hub(env,"/tick-sample?ms=5000");
+      const rows=Array.isArray(st?.rows)?st.rows:[];
+      const lines=rows.map(r=>{
+        const rx=r.lastTickAgeSeconds==null?"n/a":Number(r.lastTickAgeSeconds).toFixed(1)+"s";
+        return `${r.symbol}: ${r.sampleTicks||0} ticks in ${Number(st.sampleSeconds||5).toFixed(0)}s • buffered ${r.bufferedTicks||0} • last Rx ${rx}`;
+      });
+      await tgSend(
+        env,
+        chatId,
+        `LIVE TICK FLOW SAMPLE\n${Number(st.sampleSeconds||5).toFixed(0)}-second WebSocket sample\n\n${lines.join("\n")}\n\nBuffered counts are in-memory only and can reset when the Durable Object sleeps/restarts. /checkall uses REST snapshots and intentionally does not show cumulative ticks.`
       );
       return new Response("ok");
     }
