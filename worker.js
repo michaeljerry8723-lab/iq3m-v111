@@ -438,7 +438,7 @@ function score5m(ticks,bars1m,symbol){
   }
 
   // A 5-minute trade can tolerate a slightly wider pullback/continuation entry
-  // than the previous 2-minute mode, but it also needs more room to develop.
+  // than the previous short-expiry mode, but it also needs more room to develop.
   const distanceFast=Math.abs(last-sma1.fast)/atr1.atr;
   if(distanceFast>0.88){
     return {ok:false,grade:"NO TRADE",reason:"entry is too extended for 5-minute expiry",
