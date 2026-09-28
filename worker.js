@@ -1,13 +1,13 @@
 // V13.1 — two-minute automatic sniper with persistent READY pre-alerts
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "13.3.0-late-ready";
+const VERSION = "13.3.1-balanced-ready";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set();
 const A_GRADE_MIN_QUALITY = 0.90;
 const EXPIRY_SECONDS = 120;
-const STRATEGY_ID = "v13.3-late-ready";
+const STRATEGY_ID = "v13.3.1-balanced-ready";
 const PREPARE_TTL_MS = 5*60*1000;
 const PULLBACK_TTL_MS = 4*60*1000;
 const GLOBAL_SIGNAL_COOLDOWN_MS = 0;
@@ -587,7 +587,7 @@ function score2m(ticks,bars1m,symbol){
 }
 
 function preAlert2m(ticks,bars1m,symbol,direction){
-  if(!["CALL","PUT"].includes(direction))return {ok:false,reason:"invalid direction"};
+  if(!["CALL","PUT"].includes(direction))return {ok:false};
 
   const sequence=setupSequenceSnapshot(bars1m);
   if(!sequence.ready||sequence.direction!==direction||!sequence.structureOk||!sequence.pullbackSeen){
@@ -598,18 +598,12 @@ function preAlert2m(ticks,bars1m,symbol,direction){
   const atr=atrSnapshot(bars1m,14);
   const dmi=dmiAdxSnapshot(bars1m,7);
   const fr=fractalSnapshot(bars1m,2);
-  const m1=macdSnapshot(bars1m,5,13,4);
-  const rsi1=rsiSnapshot(bars1m,7);
-  const ar1=aroonSnapshot(bars1m,14);
-  const pressure=candlePressure(bars1m,3);
   const b5=completedAggregate(bars1m,300);
   const reg5=trendRegime(b5,5,13,0.20);
   const b15=completedAggregate(bars1m,900);
   const reg15=trendRegime(b15,3,8,0.18);
 
-  if(!sma.ready||!atr.ready||!fr.ready||!dmi.ready||!m1.ready||!rsi1.ready||!ar1.ready||!pressure.ready||!reg5.ready){
-    return {ok:false,reason:"late-stage READY context is still building"};
-  }
+  if(!sma.ready||!atr.ready||!fr.ready||!dmi.ready||!reg5.ready)return {ok:false,reason:"prepare context is still building"};
 
   const last=Number(ticks.at(-1)?.p);
   if(!Number.isFinite(last)||!(atr.atr>0))return {ok:false,reason:"invalid live price or volatility"};
@@ -617,7 +611,6 @@ function preAlert2m(ticks,bars1m,symbol,direction){
   const atrRatio=atr.atr/last;
   if(atrRatio<0.000008||atrRatio>0.0028)return {ok:false,reason:"volatility left the acceptable range"};
   if(reg5.direction!==direction)return {ok:false,reason:"completed 5m direction changed"};
-
   const structureOk=direction==="CALL"
     ? (!fr.lastLow||last>Number(fr.lastLow.price))
     : (!fr.lastHigh||last<Number(fr.lastHigh.price));
@@ -629,13 +622,12 @@ function preAlert2m(ticks,bars1m,symbol,direction){
   }
 
   if(reg15.ready&&reg15.direction!=="NEUTRAL"&&reg15.direction!==direction&&reg15.efficiency>=0.30){
-    return {ok:false,reason:"15m trend opposes the 2-minute setup"};
+    return {ok:false};
   }
 
   const stack=direction==="CALL"?sma.fast>sma.slow:sma.fast<sma.slow;
-  const fastSlope=direction==="CALL"?sma.fastSlope>0:sma.fastSlope<0;
-  const slowSlope=direction==="CALL"?sma.slowSlope>=0:sma.slowSlope<=0;
-  if(!stack||!fastSlope||!slowSlope)return {ok:false,reason:"1m SMA(5/13) structure is not fully aligned"};
+  const slope=direction==="CALL"?sma.fastSlope>=0:sma.fastSlope<=0;
+  if(!stack||!slope)return {ok:false,reason:"SMA structure lost"};
 
   const dmiGap=Math.abs(Number(dmi.plusDI)-Number(dmi.minusDI));
   const dmiAligned=direction==="CALL"?dmi.plusDI>dmi.minusDI:dmi.minusDI>dmi.plusDI;
@@ -647,30 +639,6 @@ function preAlert2m(ticks,bars1m,symbol,direction){
   const room=roomToMoveSnapshot(bars1m,last,direction,atr.atr);
   if(!room.ready||room.roomAtr<0.85)return {ok:false,reason:"room-to-move is no longer adequate"};
 
-  const macdAligned=direction==="CALL"
-    ? (m1.macd>m1.signal&&m1.hist>0&&m1.hist>=m1.prevHist)
-    : (m1.macd<m1.signal&&m1.hist<0&&m1.hist<=m1.prevHist);
-  if(!macdAligned)return {ok:false,reason:"1m MACD has not resumed strongly enough"};
-
-  const rsiAligned=direction==="CALL"
-    ? (rsi1.rsi>=52&&rsi1.rsi<=69)
-    : (rsi1.rsi<=48&&rsi1.rsi>=31);
-  if(!rsiAligned)return {ok:false,reason:"RSI(7) is outside the continuation zone"};
-
-  const aroonAligned=direction==="CALL"
-    ? ar1.up>ar1.down+15
-    : ar1.down>ar1.up+15;
-  if(!aroonAligned)return {ok:false,reason:"Aroon does not confirm the direction"};
-
-  const last1=bars1m.at(-1);
-  const continuation=last1&&(direction==="CALL"
-    ? Number(last1.c)>Number(last1.o)&&Number(last1.c)>sma.fast
-    : Number(last1.c)<Number(last1.o)&&Number(last1.c)<sma.fast);
-  if(!continuation)return {ok:false,reason:"fresh completed 1m continuation candle is missing"};
-
-  const pressureAligned=direction==="CALL"?pressure.bull>=2:pressure.bear>=2;
-  if(!pressureAligned)return {ok:false,reason:"1m candle pressure is not aligned"};
-
   const imp=tickImpulse(ticks);
   if(imp.ready){
     const strongOpp=direction==="CALL"
@@ -679,34 +647,25 @@ function preAlert2m(ticks,bars1m,symbol,direction){
     if(strongOpp)return {ok:false,reason:"live ticks reversed against the setup"};
   }
 
-  // READY is now a late-stage warning. The setup must already be capable of
-  // reaching the A-grade threshold without relying on the final micro-timing bonus.
-  const preQuality=clamp(
-    0.895 +
-    (reg15.ready&&reg15.direction===direction?0.012:0) +
-    Math.min(Math.max(dmi.adx-20,0),15)/15*0.018 +
-    Math.min(Math.max(room.roomAtr-0.85,0),0.75)/0.75*0.014 +
-    (distanceFast<=0.45?0.010:0),
-    0.895,0.957
+  const preScore=clamp(
+    0.84 +
+    Math.min(Math.max(dmi.adx-20,0),15)/15*0.035 +
+    Math.min(Math.max(room.roomAtr-0.85,0),0.75)/0.75*0.025 +
+    (reg15.ready&&reg15.direction===direction?0.020:0) +
+    (distanceFast<=0.55?0.015:0),
+    0.84,0.94
   );
 
-  if(preQuality<A_GRADE_MIN_QUALITY){
-    return {ok:false,reason:`late-stage setup score ${Math.round(preQuality*100)}/100 is below READY threshold`,preScore:preQuality};
-  }
-
   return {
-    ok:true,
-    preScore:preQuality,
+    ok:preScore>=0.86,
+    preScore,
     direction,
     adx:dmi.adx,
-    dmiGap,
-    rsi:rsi1.rsi,
     roomAtr:room.roomAtr,
     distanceFastAtr:distanceFast,
     atrRatio,
     spreadAtrRatio:spread.spreadAtrRatio,
-    spreadBps:spread.spreadBps,
-    readyStage:"ALL_BASE_FILTERS_PASSED_WAITING_LIVE_TIMING"
+    spreadBps:spread.spreadBps
   };
 }
 
@@ -2168,8 +2127,8 @@ async function issueReadyAlert(env,chatIds,candidate){
 
   const msg=
     `READY 🔥🔥\n`+
-    `${candidate.symbol} base setup fully qualified.\n`+
-    `Final live-timing confirmation is in progress.\n`+
+    `${candidate.symbol} setup developing.\n`+
+    `The trend, pullback, structure and strength filters have aligned.\n`+
     `DO NOT ENTER YET — wait for the actual 2-minute signal.`;
 
   let delivered=0;
@@ -2393,7 +2352,7 @@ export default {
         return json({ok:false,error:String(e?.message||e)},500);
       }
     }
-    if(request.method!=="POST")return new Response("V13.3 two-minute auto sniper — late READY / final timing",{status:200});
+    if(request.method!=="POST")return new Response("V13.3.1 two-minute auto sniper — balanced READY",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -2416,7 +2375,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V13.3 — TWO-MINUTE AUTO SNIPER. READY is now late-stage: the completed 5m trend, 1m structure, pullback, continuation, MACD, RSI, ADX/DMI, Aroon, room-to-move, spread/volatility and candle-pressure checks must already pass before READY is sent. The actual 2-minute signal waits only for the final fresh live-timing trigger. DO NOT ENTER from READY alone."
+        "V13.3.1 — TWO-MINUTE AUTO SNIPER. READY is restored to the preparation stage once the completed 5m trend, SMA-zone pullback, structure, ADX/DMI, room-to-move, spread/volatility and anti-reversal checks pass. The final CALL/PUT still requires every A-grade continuation and live-timing filter. DO NOT ENTER from READY alone."
       );
       return new Response("ok");
     }
