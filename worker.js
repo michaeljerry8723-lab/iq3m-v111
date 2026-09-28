@@ -1,7 +1,7 @@
 // V13.1 — two-minute automatic sniper with persistent READY pre-alerts
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "13.2.0-free-tier-runtime-fix";
+const VERSION = "13.2.1-self-scheduler";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set();
@@ -667,6 +667,71 @@ function preAlert2m(ticks,bars1m,symbol,direction){
     spreadAtrRatio:spread.spreadAtrRatio,
     spreadBps:spread.spreadBps
   };
+}
+
+export class AutoScheduler extends DurableObject {
+  constructor(ctx,env){
+    super(ctx,env);
+    this.ctx=ctx;
+    this.env=env;
+  }
+
+  async ensure(){
+    const now=Date.now();
+    let alarm=null;
+    try{alarm=await this.ctx.storage.getAlarm();}catch(_){}
+    if(!alarm||Number(alarm)<now+15000||Number(alarm)>now+90000){
+      await this.ctx.storage.setAlarm(now+5000);
+      alarm=now+5000;
+    }
+    await this.ctx.storage.put("enabled",true);
+    return {ok:true,enabled:true,nextAlarmAt:Number(alarm)};
+  }
+
+  async status(){
+    let alarm=null;
+    try{alarm=await this.ctx.storage.getAlarm();}catch(_){}
+    return {
+      ok:true,
+      enabled:Boolean((await this.ctx.storage.get("enabled"))||false),
+      nextAlarmAt:alarm?Number(alarm):null,
+      lastAlarmAt:Number((await this.ctx.storage.get("lastAlarmAt"))||0)||null,
+      lastDispatchAt:Number((await this.ctx.storage.get("lastDispatchAt"))||0)||null,
+      lastHttpStatus:Number((await this.ctx.storage.get("lastHttpStatus"))||0)||null,
+      lastError:(await this.ctx.storage.get("lastError"))||null
+    };
+  }
+
+  async alarm(){
+    const now=Date.now();
+    await this.ctx.storage.put("lastAlarmAt",now);
+    try{
+      const secret=String(this.env.TELEGRAM_WEBHOOK_SECRET||"").trim();
+      if(!secret)throw new Error("TELEGRAM_WEBHOOK_SECRET is missing");
+      const r=await fetch(`${PRIMARY_WORKER_URL}/cron-scan`,{
+        method:"POST",
+        headers:{"X-IQ3M-Cron-Secret":secret}
+      });
+      await this.ctx.storage.put("lastDispatchAt",Date.now());
+      await this.ctx.storage.put("lastHttpStatus",Number(r.status));
+      if(!r.ok){
+        const body=await r.text().catch(()=>"");
+        throw new Error(`cron-scan HTTP ${r.status}: ${body.slice(0,160)}`);
+      }
+      await this.ctx.storage.delete("lastError");
+    }catch(e){
+      await this.ctx.storage.put("lastError",String(e?.message||e).slice(0,300));
+    }finally{
+      await this.ctx.storage.setAlarm(Date.now()+60000);
+    }
+  }
+
+  async fetch(req){
+    const u=new URL(req.url);
+    if(u.pathname==="/ensure")return json(await this.ensure());
+    if(u.pathname==="/status")return json(await this.status());
+    return json({ok:true});
+  }
 }
 
 export class TickHub extends DurableObject {
@@ -1983,6 +2048,12 @@ async function hubPost(env,path,body){
   return await r.json();
 }
 
+async function schedulerGet(env,path){
+  const id=env.AUTO_SCHEDULER.idFromName("global-auto-scheduler"), stub=env.AUTO_SCHEDULER.get(id);
+  const r=await stub.fetch(`https://autoscheduler${path}`);
+  return await r.json();
+}
+
 
 async function scanUniverse(env){
   const checked=[];
@@ -2272,6 +2343,9 @@ export default {
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
     const update=await request.json(); const msg=update.message||update.edited_message; if(!msg?.chat?.id)return new Response("ok");
     const chatId=msg.chat.id, text=String(msg.text||"").trim();
+    // Free-tier autonomous fallback: a Durable Object alarm keeps the one-minute
+    // scanner alive even when the account cannot attach another Cron Trigger.
+    ctx.waitUntil(schedulerGet(env,"/ensure").catch(e=>console.error("scheduler ensure failed",String(e?.message||e))));
     // Lightweight commands must not enter the Durable Object. This keeps Telegram
     // responsive even when the market-feed object has exhausted its free-tier duration.
     if(/^\/version$/i.test(text)){await tgSend(env,chatId,VERSION);return new Response("ok");}
@@ -2286,7 +2360,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V13.2 — TWO-MINUTE AUTO SNIPER. Automatic scanning runs every minute. The free-tier runtime now primes all six live feeds together, expires stale pullbacks, and uses a strict fresh live-tick timing fallback when durable 30-second history is unavailable. READY 🔥🔥 must still be delivered before any final 2-minute signal."
+        "V13.2.1 — TWO-MINUTE AUTO SNIPER. Automatic scanning is maintained by a self-scheduling Durable Object alarm, so it can continue without consuming another account Cron Trigger slot. The free-tier runtime primes all six live feeds together, expires stale pullbacks, and uses a strict fresh live-tick timing fallback when durable 30-second history is unavailable. READY 🔥🔥 must still be delivered before any final 2-minute signal."
       );
       return new Response("ok");
     }
@@ -2360,10 +2434,16 @@ export default {
       return new Response("ok");
     }
     if(/^\/cronstatus$/i.test(text)){
-      const st=await hub(env,"/cronstatus");
+      try{await schedulerGet(env,"/ensure");}catch(_){}
+      const [st,sch]=await Promise.all([
+        hub(env,"/cronstatus"),
+        schedulerGet(env,"/status").catch(()=>({}))
+      ]);
       const age=st.ageSeconds==null?"n/a":Number(st.ageSeconds).toFixed(0)+"s";
       const r=st.lastResult||{};
-      await tgSend(env,chatId,`AUTO-SCAN STATUS\nVersion: ${VERSION}\nLast cron: ${age} ago\nScans recorded: ${st.count||0}\nLast result: ${r.ok?"qualified/handled":(r.reason||"no qualified setup")}\nREADY alerts in last scan: ${r.readyAlertsSent||0}${r.symbol?`\nSymbol: ${r.symbol}`:""}`);
+      const next=sch.nextAlarmAt?Math.max(0,Math.ceil((Number(sch.nextAlarmAt)-Date.now())/1000))+"s":"n/a";
+      const source=sch.enabled?"Durable Object alarm":"Cloudflare Cron";
+      await tgSend(env,chatId,`AUTO-SCAN STATUS\nVersion: ${VERSION}\nScheduler: ${source}\nLast scan: ${age} ago\nScans recorded: ${st.count||0}\nNext scheduler wake: ${next}\nLast result: ${r.ok?"qualified/handled":(r.reason||"no qualified setup")}\nREADY alerts in last scan: ${r.readyAlertsSent||0}${r.symbol?`\nSymbol: ${r.symbol}`:""}${sch.lastError?`\nScheduler error: ${sch.lastError}`:""}`);
       return new Response("ok");
     }
     if(/^\/reconnect$/i.test(text)){
