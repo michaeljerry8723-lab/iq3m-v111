@@ -1,13 +1,13 @@
 // V13.5 — five-minute automatic sniper with persistent READY pre-alerts
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "13.5.1-continuation-flex";
+const VERSION = "13.5.2-structural-room-fix";
 const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 const CRYPTO_SYMBOLS = new Set();
 const A_GRADE_MIN_QUALITY = 0.90;
 const EXPIRY_SECONDS = 300;
-const STRATEGY_ID = "v13.5.1-continuation-flex";
+const STRATEGY_ID = "v13.5.2-structural-room-fix";
 const PREPARE_TTL_MS = 6*60*1000;
 const PULLBACK_TTL_MS = 4*60*1000;
 const GLOBAL_SIGNAL_COOLDOWN_MS = 0;
@@ -301,18 +301,42 @@ function trendRegime(bars,fast=5,slow=13,minEfficiency=0.25){
   return {ready:true,direction,efficiency:eff,fast:sf[i],slow:ss[i]};
 }
 function roomToMoveSnapshot(bars1m,last,direction,atr){
-  const b15=completedAggregate(bars1m,900).slice(-24);
-  if(b15.length<6||!Number.isFinite(atr)||atr<=0)return {ready:false,roomAtr:0};
-  if(direction==="CALL"){
-    const levels=b15.map(b=>Number(b.h)).filter(x=>Number.isFinite(x)&&x>last);
-    if(!levels.length)return {ready:true,roomAtr:Infinity,level:null};
-    const level=Math.min(...levels);
-    return {ready:true,roomAtr:(level-last)/atr,level};
+  const b15=completedAggregate(bars1m,900).slice(-32);
+  if(b15.length<7||!Number.isFinite(atr)||atr<=0)return {ready:false,roomAtr:0,level:null,source:"not-ready"};
+
+  // Use confirmed 15m swing levels, not every historical candle wick. The old
+  // nearest-wick method repeatedly treated minor noise as resistance/support and
+  // cancelled READY setups even while the broader structure remained valid.
+  const pivotHighs=[],pivotLows=[];
+  for(let i=2;i<b15.length-2;i++){
+    const h=Number(b15[i].h),l=Number(b15[i].l);
+    if(Number.isFinite(h)&&
+       h>=Number(b15[i-1].h)&&h>=Number(b15[i-2].h)&&
+       h>Number(b15[i+1].h)&&h>Number(b15[i+2].h)) pivotHighs.push(h);
+    if(Number.isFinite(l)&&
+       l<=Number(b15[i-1].l)&&l<=Number(b15[i-2].l)&&
+       l<Number(b15[i+1].l)&&l<Number(b15[i+2].l)) pivotLows.push(l);
   }
-  const levels=b15.map(b=>Number(b.l)).filter(x=>Number.isFinite(x)&&x<last);
-  if(!levels.length)return {ready:true,roomAtr:Infinity,level:null};
+
+  if(direction==="CALL"){
+    const levels=pivotHighs.filter(x=>x>last);
+    if(!levels.length)return {ready:true,roomAtr:Infinity,level:null,source:"15m-swing"};
+    const level=Math.min(...levels);
+    return {ready:true,roomAtr:(level-last)/atr,level,source:"15m-swing"};
+  }
+
+  const levels=pivotLows.filter(x=>x<last);
+  if(!levels.length)return {ready:true,roomAtr:Infinity,level:null,source:"15m-swing"};
   const level=Math.max(...levels);
-  return {ready:true,roomAtr:(last-level)/atr,level};
+  return {ready:true,roomAtr:(last-level)/atr,level,source:"15m-swing"};
+}
+
+function isHardReadyInvalidation(reason){
+  const r=String(reason||"").toLowerCase();
+  return r.includes("completed 5m direction changed") ||
+    r.includes("fractal structure failed") ||
+    r.includes("sma 5/13 stack reversed") ||
+    r.includes("strong opposite 15m trend");
 }
 
 function usdExposureSide(symbol,direction){
@@ -449,9 +473,13 @@ function score5m(ticks,bars1m,symbol){
   }
 
   const room=roomToMoveSnapshot(bars1m,last,direction,atr1.atr);
-  if(!room.ready||room.roomAtr<1.00){
-    return {ok:false,grade:"NO TRADE",reason:"insufficient room before support/resistance for 5-minute expiry",
-      roomAtr:room.roomAtr};
+  if(!room.ready){
+    return {ok:false,grade:"NO TRADE",reason:"structural room context is still building",roomAtr:room.roomAtr};
+  }
+  if(room.roomAtr<0.35){
+    return {ok:false,grade:"NO TRADE",
+      reason:`confirmed 15m structure leaves only ${Number(room.roomAtr).toFixed(2)} ATR room; need at least 0.35 ATR`,
+      roomAtr:room.roomAtr,roomLevel:room.level,roomSource:room.source};
   }
 
   const dmiGap=Math.abs(Number(dmi.plusDI)-Number(dmi.minusDI));
@@ -546,7 +574,7 @@ function score5m(ticks,bars1m,symbol){
     0.895 +
     (regime15.ready&&regime15.direction===direction?0.012:0) +
     Math.min(Math.max(dmi.adx-20,0),15)/15*0.018 +
-    Math.min(Math.max(room.roomAtr-1.00,0),0.80)/0.80*0.014 +
+    Math.min(Math.max(room.roomAtr-0.35,0),0.85)/0.85*0.014 +
     (slowSlopeAligned?0.004:0) +
     (distanceFast<=0.60?0.010:(distanceFast<=0.95?0.005:0)) +
     (Math.max(imp.upRatio,imp.downRatio)>=0.65?0.008:0) +
@@ -566,7 +594,7 @@ function score5m(ticks,bars1m,symbol){
     edge:score,coreMajor:10,microConfirmations:3,microScore:3,
     regime5:regime5.direction,regime15:regime15.ready?regime15.direction:"NOT_READY",
     regime5Efficiency:regime5.efficiency,regime15Efficiency:regime15.ready?regime15.efficiency:null,
-    roomAtr:room.roomAtr,spreadAtrRatio,spreadBps,atrRatio,rsi:rsi1.rsi,adx:dmi.adx,
+    roomAtr:room.roomAtr,roomLevel:room.level,roomSource:room.source,spreadAtrRatio,spreadBps,atrRatio,rsi:rsi1.rsi,adx:dmi.adx,
     dmiGap,smaFastPeriod:5,smaSlowPeriod:13,fractalPeriod:2,
     timeframe:"1min",expiryMinutes:5,smaFast:sma1.fast,smaSlow:sma1.slow,
     distanceFastAtr:distanceFast,atr:atr1.atr,
@@ -630,7 +658,7 @@ function preAlert5m(ticks,bars1m,symbol,direction){
   }
 
   if(reg15.ready&&reg15.direction!=="NEUTRAL"&&reg15.direction!==direction&&reg15.efficiency>=0.30){
-    return {ok:false};
+    return {ok:false,reason:"strong opposite 15m trend developed"};
   }
 
   const stack=direction==="CALL"?sma.fast>sma.slow:sma.fast<sma.slow;
@@ -666,7 +694,9 @@ function preAlert5m(ticks,bars1m,symbol,direction){
     reason:`price extension ${distanceFast.toFixed(2)} ATR exceeds the 1.25 ATR READY limit`};
 
   const room=roomToMoveSnapshot(bars1m,last,direction,atr.atr);
-  if(!room.ready||room.roomAtr<1.00)return {ok:false,reason:"room-to-move is no longer adequate for a 5-minute entry"};
+  if(!room.ready)return {ok:false,reason:"structural room context is still building"};
+  if(room.roomAtr<0.50)return {ok:false,
+    reason:`confirmed 15m structure leaves only ${Number(room.roomAtr).toFixed(2)} ATR room; READY needs at least 0.50 ATR`};
 
   const imp=tickImpulse(ticks);
   if(imp.ready){
@@ -679,7 +709,7 @@ function preAlert5m(ticks,bars1m,symbol,direction){
   const preScore=clamp(
     0.84 +
     Math.min(Math.max(dmi.adx-20,0),15)/15*0.035 +
-    Math.min(Math.max(room.roomAtr-1.00,0),0.80)/0.80*0.025 +
+    Math.min(Math.max(room.roomAtr-0.50,0),0.70)/0.70*0.025 +
     (reg15.ready&&reg15.direction===direction?0.020:0) +
     (slopeSupport?0.008:0) +
     (distanceFast<=0.65?0.015:(distanceFast<=0.95?0.008:0)),
@@ -692,6 +722,8 @@ function preAlert5m(ticks,bars1m,symbol,direction){
     direction,
     adx:dmi.adx,
     roomAtr:room.roomAtr,
+    roomLevel:room.level,
+    roomSource:room.source,
     distanceFastAtr:distanceFast,
     atrRatio,
     spreadAtrRatio:spread.spreadAtrRatio,
@@ -1640,10 +1672,22 @@ export class TickHub extends DurableObject {
     if(phase.stage==="PREPARE"){
       const pre=preAlert5m(arr,bars1m,symbol,phase.direction);
       if(!pre.ok){
-        await this.finishReadyAudit(phase.readyKey,"CANCELLED",Date.now(),pre.reason||"PREPARE setup cancelled");
+        const reason=pre.reason||"PREPARE setup temporarily not aligned";
+        // Once READY has actually been delivered, do not throw the setup away for
+        // transient issues such as room compression, momentum fading, spread,
+        // extension or a missing continuation candle. Preserve it until TTL so it
+        // can recover. Only structural invalidations cancel the READY immediately.
+        if(phase.readyAlertAt&&!isHardReadyInvalidation(reason)){
+          await this.updateReadyAuditBlocker(phase.readyKey,reason);
+          return {ok:false,grade:"NO TRADE",symbol,setupStage:"PREPARE",setupDirection:phase.direction,
+            setupCandleT:phase.setupCandleT,readyKey:phase.readyKey,preAlert:false,preScore:pre.preScore||null,
+            ticks:arr.length,receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status,
+            reason:`READY preserved — ${reason}`};
+        }
+        await this.finishReadyAudit(phase.readyKey,"CANCELLED",Date.now(),reason);
         phase=await this.setSetupStage(symbol,{stage:"SEEK",direction:null,lastBarT:Number(phase.lastBarT||0),updatedAt:Date.now()});
         return {ok:false,grade:"NO TRADE",symbol,setupStage:"SEEK",ticks:arr.length,
-          receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status,reason:pre.reason||"PREPARE setup cancelled"};
+          receiveAgeSeconds:receiveAge,marketAgeSeconds:marketAge,status,reason};
       }
 
       const final=score5m(arr,bars1m,symbol);
@@ -2472,7 +2516,7 @@ export default {
         return json({ok:false,error:String(e?.message||e)},500);
       }
     }
-    if(request.method!=="POST")return new Response("V13.5.1 five-minute auto sniper — continuation-flex",{status:200});
+    if(request.method!=="POST")return new Response("V13.5.2 five-minute auto sniper — structural-room fix",{status:200});
     if(u.pathname!=="/telegram")return new Response("Not found",{status:404});
     const secret=String(env.TELEGRAM_WEBHOOK_SECRET||"").trim();
     if(secret&&request.headers.get("X-Telegram-Bot-Api-Secret-Token")!==secret)return new Response("forbidden",{status:403});
@@ -2495,7 +2539,7 @@ export default {
       await tgSend(
         env,
         chatId,
-        "V13.5.1 — FIVE-MINUTE AUTO SNIPER. READY and final entries now allow a controlled post-pullback continuation zone instead of cancelling simply because price moved moderately away from SMA(5). The hard chase limit is 1.25 ATR. Final CALL/PUT still requires the 5m trend, SMA stack plus fast slope, fractal structure, DMI/ADX, room, 3/4 momentum, completed 1m continuation and live-tick timing. Use /readystats for exact blockers."
+        "V13.5.2 — FIVE-MINUTE AUTO SNIPER. Room-to-move now uses confirmed 15m swing structure instead of every candle wick, and an already-delivered READY is preserved through transient blockers rather than being cancelled immediately. Hard cancellation is reserved for genuine structural invalidation: 5m direction change, fractal failure, SMA-stack reversal or a strong opposite 15m trend. Final CALL/PUT still requires A-grade confirmation and live timing. Use /readystats for exact blockers."
       );
       return new Response("ok");
     }
