@@ -356,18 +356,27 @@ console.log(`Test 8: Blocker instrumentation (/blockerstats)`);
   await hub.recordBlocker("AUD/USD", "entry extension 2.80 ATR exceeds the 2.50 ATR five-minute limit");
   await hub.recordBlocker("USD/CHF", "pair cooldown active");
   await hub.recordBlocker(
+    "USD/JPY",
+    "5m efficiency 0.18 below 0.20"
+  );
+
+  await hub.recordBlocker(
     "EUR/USD",
     "trend armed — waiting for the next pullback into the SMA zone"
   );
 
   const stats = await hub.getBlockerStats();
   assert(stats.ok, "getBlockerStats returns ok");
-  assert(stats.totalEvaluations === 7, `Total evaluations recorded: ${stats.totalEvaluations}`);
+  assert(stats.totalEvaluations === 8, `Total evaluations recorded: ${stats.totalEvaluations}`);
   assert(stats.byCategory.core_structure >= 1, `Core structure failures counted: ${stats.byCategory.core_structure}`);
   assert(stats.byCategory.supporting_confirmation >= 1, `Supporting confirmation failures counted: ${stats.byCategory.supporting_confirmation}`);
   assert(stats.byCategory.transient_timing >= 1, `Transient timing failures counted: ${stats.byCategory.transient_timing}`);
   assert(stats.byCategory.redundant_gate >= 1, `Redundant gate failures counted: ${stats.byCategory.redundant_gate}`);
   assert(stats.byCategory.risk_cooldown >= 1, `Risk/cooldown failures counted: ${stats.byCategory.risk_cooldown}`);
+  assert(
+    stats.efficiencyBands.near_qualified === 1,
+    `Near-qualified efficiency failures counted: ${stats.efficiencyBands.near_qualified}`
+  );
   assert(
     stats.byCategory.setup_progression >= 1,
     `Setup progression counted: ${stats.byCategory.setup_progression}`

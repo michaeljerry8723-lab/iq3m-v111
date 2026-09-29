@@ -100,6 +100,50 @@ export function classifyBlocker(reason) {
   return "other";
 }
 
+export function classifyEfficiencyBand(reason) {
+  const r = String(reason || "");
+
+  const match = r.match(
+    /5m efficiency\s+([0-9]*\.?[0-9]+)\s+below/i
+  );
+
+  if (!match) return null;
+
+  const value = Number(match[1]);
+
+  if (!Number.isFinite(value)) return null;
+
+  if (value < 0.10) {
+    return {
+      key: "very_choppy",
+      label: "< 0.10",
+      value
+    };
+  }
+
+  if (value < 0.15) {
+    return {
+      key: "weak",
+      label: "0.10–0.149",
+      value
+    };
+  }
+
+  if (value < 0.20) {
+    return {
+      key: "near_qualified",
+      label: "0.15–0.199",
+      value
+    };
+  }
+
+  return {
+    key: "qualified",
+    label: ">= 0.20",
+    value
+  };
+}
+
 // V13.4 shadow validation only. This rule is logged and cannot admit or reject a signal.
 export const V13_4_SHADOW = Object.freeze({ id: "v13.4-frozen-dmi-adx", dmiGapMin: 20.930996673679135, adxMax: 76.22584098021053 });
 export const PRIMARY_WORKER_URL = "https://iq3m-predictor.michaeljerry8723.workers.dev";
@@ -1879,6 +1923,9 @@ export class TickHub extends DurableObject {
       bySymbol: {
         ...(stats.bySymbol || {})
       },
+      efficiencyBands: {
+        ...(stats.efficiencyBands || {})
+      },
       recent: (stats.recent || []).slice(0, 25)
     };
   }
@@ -1891,6 +1938,12 @@ export class TickHub extends DurableObject {
     );
 
     const by = stats?.byCategory || {};
+
+    const efficiency = stats?.efficiencyBands || {};
+
+    const efficiencyTotal =
+      Object.values(efficiency)
+        .reduce((sum, value) => sum + Number(value || 0), 0);
 
     const categories = [
       ["Setup Progression", "setup_progression"],
@@ -1912,12 +1965,24 @@ export class TickHub extends DurableObject {
       return `${label}: ${count} (${pct}%)`;
     });
 
+    const efficiencyLines = efficiencyTotal > 0
+      ? [
+        "",
+        "5M EFFICIENCY FAILURES",
+        `< 0.10: ${Number(efficiency.very_choppy || 0)}`,
+        `0.10–0.149: ${Number(efficiency.weak || 0)}`,
+        `0.15–0.199: ${Number(efficiency.near_qualified || 0)}`,
+        `>= 0.20: ${Number(efficiency.qualified || 0)}`
+      ]
+      : [];
+
     return [
       "SIGNAL BLOCKER STATS",
       `Strategy: ${stats?.strategyId || STRATEGY_ID}`,
       `Total evaluations: ${total}`,
       "",
-      ...lines
+      ...lines,
+      ...efficiencyLines
     ].join("\n");
   }
   formatRecentBlockersMessage(stats, limit = 20) {
@@ -1951,6 +2016,7 @@ export class TickHub extends DurableObject {
 
   async recordBlocker(symbol, reason, at = Date.now()) {
     const category = classifyBlocker(reason);
+    const efficiencyBand = classifyEfficiencyBand(reason);
     const pair = normalizeSymbol(symbol) || String(symbol || "");
 
     if (
@@ -1960,11 +2026,13 @@ export class TickHub extends DurableObject {
     ) {
       this.blockerStats = {
         strategyId: STRATEGY_ID,
+        classifierVersion: BLOCKER_CLASSIFIER_VERSION,
         startedAt: at,
         total: 0,
         byCategory: {},
         bySymbol: {},
-        recent: []
+        recent: [],
+        efficiencyBands: {}
       };
     }
 
@@ -1980,6 +2048,17 @@ export class TickHub extends DurableObject {
 
     if (!Array.isArray(this.blockerStats.recent)) {
       this.blockerStats.recent = [];
+    }
+
+    if (!this.blockerStats.efficiencyBands) {
+      this.blockerStats.efficiencyBands = {};
+    }
+
+    if (efficiencyBand) {
+      this.blockerStats.efficiencyBands[efficiencyBand.key] =
+        Number(
+          this.blockerStats.efficiencyBands[efficiencyBand.key] || 0
+        ) + 1;
     }
 
     this.blockerStats.total =
@@ -1999,7 +2078,9 @@ export class TickHub extends DurableObject {
       at,
       symbol: pair,
       category,
-      reason: String(reason || "").slice(0, 220)
+      reason: String(reason || "").slice(0, 220),
+      efficiencyBand: efficiencyBand?.key || null,
+      efficiencyValue: efficiencyBand?.value ?? null
     });
 
     this.blockerStats.recent =
