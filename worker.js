@@ -17,24 +17,27 @@ export const LOSS_CIRCUIT_BREAKER_MS = 20 * 60 * 1000;
 
 export function classifyBlocker(reason) {
   const r = String(reason || "").toLowerCase();
+
+  // Setup is valid but still progressing toward an entry.
   if (
     r.includes("trend armed") ||
     r.includes("waiting for the next pullback") ||
     r.includes("pullback recorded") ||
-    r.includes("fresh live-tick burst") ||
-    r.includes("5m efficiency") ||
-    r.includes("5m bullish sma stack") ||
-    r.includes("5m bearish sma stack") ||
-    r.includes("5m sma5/13") ||
     r.includes("waiting for a fresh 1m continuation")
   ) {
     return "setup_progression";
   }
 
+  // Structural/trend conditions.
   if (
     r.includes("waiting for a clean completed 5m trend") ||
     r.includes("5m trend is neutral") ||
+    r.includes("completed 5m trend is neutral") ||
     r.includes("5m direction changed") ||
+    r.includes("5m efficiency") ||
+    r.includes("5m bullish sma stack") ||
+    r.includes("5m bearish sma stack") ||
+    r.includes("5m sma5/13") ||
     r.includes("15m trend opposes") ||
     r.includes("opposite 15m trend") ||
     r.includes("fractal") ||
@@ -43,20 +46,29 @@ export function classifyBlocker(reason) {
   ) {
     return "core_structure";
   }
+
+  // Confirmation/strength conditions.
   if (
     r.includes("adx/dmi") ||
     r.includes("momentum confluence") ||
     r.includes("momentum is 2/4") ||
     r.includes("continuation candle is missing") ||
+    r.includes("fresh completed 1m continuation candle is missing") ||
     r.includes("candle pressure") ||
     r.includes("fast slope")
   ) {
     return "supporting_confirmation";
   }
+
+  // Short-lived market/feed/timing conditions.
   if (
     r.includes("live tick") ||
+    r.includes("fresh live-tick burst") ||
     r.includes("tick confirmation") ||
     r.includes("30s/live timing") ||
+    r.includes("live feed stale") ||
+    r.includes("tiingo quote timestamp") ||
+    r.includes("waiting for first live tiingo quote") ||
     r.includes("price moved too far") ||
     r.includes("entry quote") ||
     r.includes("spread") ||
@@ -64,16 +76,19 @@ export function classifyBlocker(reason) {
   ) {
     return "transient_timing";
   }
+
+  // Entry gates that can recover while the setup remains valid.
   if (
     r.includes("extension") ||
     r.includes("room") ||
     r.includes("pullback is no longer present") ||
-    r.includes("fresh live-tick burst") ||
     r.includes("pullback has not qualified") ||
     r.includes("final a-grade timing failed")
   ) {
     return "redundant_gate";
   }
+
+  // Risk-management restrictions.
   if (
     r.includes("cooldown") ||
     r.includes("circuit breaker") ||
@@ -81,6 +96,7 @@ export function classifyBlocker(reason) {
   ) {
     return "risk_cooldown";
   }
+
   return "other";
 }
 
