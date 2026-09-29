@@ -942,6 +942,7 @@ export class TickHub extends DurableObject {
       } else {
         this.blockerStats = {
           strategyId: STRATEGY_ID,
+          classifierVersion: BLOCKER_CLASSIFIER_VERSION,
           startedAt: Date.now(),
           total: 0,
           byCategory: {},
