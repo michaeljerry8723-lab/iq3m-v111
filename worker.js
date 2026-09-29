@@ -17,6 +17,7 @@ export const LOSS_CIRCUIT_BREAKER_MS = 20 * 60 * 1000;
 export function classifyBlocker(reason) {
   const r = String(reason || "").toLowerCase();
   if (
+    r.includes("waiting for a clean completed 5m trend") ||
     r.includes("5m trend is neutral") ||
     r.includes("5m direction changed") ||
     r.includes("15m trend opposes") ||
@@ -904,7 +905,26 @@ export class TickHub extends DurableObject {
       const storedBlockers = await this.ctx.storage.get("blockerStats");
 
       if (storedBlockers?.strategyId === STRATEGY_ID) {
-        this.blockerStats = storedBlockers;
+        this.blockerStats = {
+          ...storedBlockers,
+          total: Number(
+            storedBlockers.total ??
+            storedBlockers.totalEvaluations ??
+            0
+          ),
+          byCategory: {
+            ...(storedBlockers.byCategory || storedBlockers.counts || {})
+          },
+          bySymbol: {
+            ...(storedBlockers.bySymbol || {})
+          },
+          recent: Array.isArray(storedBlockers.recent)
+            ? storedBlockers.recent
+            : []
+        };
+
+        // Persist the normalized schema so future restarts remain compatible.
+        await this.ctx.storage.put("blockerStats", this.blockerStats);
       } else {
         this.blockerStats = {
           strategyId: STRATEGY_ID,
@@ -1835,6 +1855,10 @@ export class TickHub extends DurableObject {
 
     if (!this.blockerStats.bySymbol) {
       this.blockerStats.bySymbol = {};
+    }
+
+    if (!Array.isArray(this.blockerStats.recent)) {
+      this.blockerStats.recent = [];
     }
 
     this.blockerStats.total =
