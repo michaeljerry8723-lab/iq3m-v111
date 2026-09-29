@@ -4,6 +4,10 @@ import { DurableObject } from "cloudflare:workers";
 export const VERSION = "13.6.1-signal-audit";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
+export const SHORT_SHADOW_ID = "cruz-short-expiry-shadow-v1";
+export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
+export const SHORT_SHADOW_MAX_PENDING = 250;
+export const SHORT_SHADOW_MAX_HISTORY = 1000;
 export const CRYPTO_SYMBOLS = new Set();
 export const A_GRADE_MIN_QUALITY = 0.895;
 export const EXPIRY_SECONDS = 300;
@@ -1054,6 +1058,13 @@ export class TickHub extends DurableObject {
     this.lastStatus = "starting"; this.lastSubscribeStatus = null; this.connecting = false; this.cryptoConnecting = false; this.provider = "tiingo"; this.lastCryptoStatus = "starting"; this.lastCryptoSubscribeStatus = null; this.lastCryptoWsMessageAt = 0;
     this.lastWsMessageAt = 0; this.lastPriceReceivedAt = 0; this.lastConnectAt = 0; this.reconnectCount = 0; this.oneMinuteCache = new Map(); this.oneMinuteCacheDirty = false; this.quotaBlockedUntil = 0; this.pendingSignals = []; this.signalStats = { total: 0, wins: 0, losses: 0, draws: 0, voids: 0 }; this.signalHistory = []; this.forwardStats = null; this.alertChats = []; this.setupStates = {}; this.readyAlertClaims = {}; this.readyAudit = [];
 
+    this.shortShadowState = {
+      strategyId: SHORT_SHADOW_ID,
+      startedAt: Date.now(),
+      pending: [],
+      history: []
+    };
+
     this.blockerStats = {
       strategyId: STRATEGY_ID,
       classifierVersion: BLOCKER_CLASSIFIER_VERSION,
@@ -1072,6 +1083,38 @@ export class TickHub extends DurableObject {
         storedBlockers?.strategyId === STRATEGY_ID &&
         storedBlockers?.classifierVersion === BLOCKER_CLASSIFIER_VERSION
       ) {
+        const storedShortShadow =
+          await this.ctx.storage.get("shortShadowState");
+
+        if (
+          storedShortShadow?.strategyId === SHORT_SHADOW_ID
+        ) {
+          this.shortShadowState = {
+            strategyId: SHORT_SHADOW_ID,
+            startedAt:
+              Number(storedShortShadow.startedAt) || Date.now(),
+
+            pending: Array.isArray(storedShortShadow.pending)
+              ? storedShortShadow.pending
+              : [],
+
+            history: Array.isArray(storedShortShadow.history)
+              ? storedShortShadow.history
+              : []
+          };
+        } else {
+          this.shortShadowState = {
+            strategyId: SHORT_SHADOW_ID,
+            startedAt: Date.now(),
+            pending: [],
+            history: []
+          };
+
+          await this.ctx.storage.put(
+            "shortShadowState",
+            this.shortShadowState
+          );
+        }
         this.blockerStats = {
           ...storedBlockers,
           total: Number(
