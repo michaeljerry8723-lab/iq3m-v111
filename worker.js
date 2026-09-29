@@ -21,6 +21,11 @@ export function classifyBlocker(reason) {
     r.includes("trend armed") ||
     r.includes("waiting for the next pullback") ||
     r.includes("pullback recorded") ||
+    r.includes("fresh live-tick burst") ||
+    r.includes("5m efficiency") ||
+    r.includes("5m bullish sma stack") ||
+    r.includes("5m bearish sma stack") ||
+    r.includes("5m sma5/13") ||
     r.includes("waiting for a fresh 1m continuation")
   ) {
     return "setup_progression";
@@ -63,6 +68,7 @@ export function classifyBlocker(reason) {
     r.includes("extension") ||
     r.includes("room") ||
     r.includes("pullback is no longer present") ||
+    r.includes("fresh live-tick burst") ||
     r.includes("pullback has not qualified") ||
     r.includes("final a-grade timing failed")
   ) {
@@ -355,14 +361,80 @@ function completedAggregate(bars1m, seconds) {
   return aggregateOhlcBars(bars1m, seconds).filter(b => Number(b.t) < nowBucket);
 }
 function trendRegime(bars, fast = 5, slow = 13, minEfficiency = 0.25) {
-  if (!bars || bars.length < slow + 3) return { ready: false, direction: "NEUTRAL", efficiency: 0 };
-  const c = bars.map(b => Number(b.c)), sf = smaSeries(c, fast), ss = smaSeries(c, slow), i = c.length - 1;
-  if (![sf[i], sf[i - 1], ss[i], ss[i - 1]].every(Number.isFinite)) return { ready: false, direction: "NEUTRAL", efficiency: 0 };
-  const eff = efficiencyRatio(bars, Math.min(8, bars.length - 1));
+  if (!bars || bars.length < slow + 3) {
+    return {
+      ready: false,
+      direction: "NEUTRAL",
+      efficiency: 0,
+      reason: `completed 5m context insufficient (${bars?.length || 0}/${slow + 3} bars)`
+    };
+  }
+
+  const c = bars.map(b => Number(b.c));
+  const sf = smaSeries(c, fast);
+  const ss = smaSeries(c, slow);
+  const i = c.length - 1;
+
+  if (![sf[i], sf[i - 1], ss[i], ss[i - 1]].every(Number.isFinite)) {
+    return {
+      ready: false,
+      direction: "NEUTRAL",
+      efficiency: 0,
+      reason: "5m SMA5/13 context unavailable"
+    };
+  }
+
+  const eff = efficiencyRatio(
+    bars,
+    Math.min(8, bars.length - 1)
+  );
+
+  const fastSlope = sf[i] - sf[i - 1];
+
   let direction = "NEUTRAL";
-  if (sf[i] > ss[i] && sf[i] >= sf[i - 1] && eff >= minEfficiency) direction = "CALL";
-  if (sf[i] < ss[i] && sf[i] <= sf[i - 1] && eff >= minEfficiency) direction = "PUT";
-  return { ready: true, direction, efficiency: eff, fast: sf[i], slow: ss[i] };
+  let reason = null;
+
+  if (
+    sf[i] > ss[i] &&
+    sf[i] >= sf[i - 1] &&
+    eff >= minEfficiency
+  ) {
+    direction = "CALL";
+  } else if (
+    sf[i] < ss[i] &&
+    sf[i] <= sf[i - 1] &&
+    eff >= minEfficiency
+  ) {
+    direction = "PUT";
+  } else if (eff < minEfficiency) {
+    reason =
+      `5m efficiency ${eff.toFixed(2)} below ${minEfficiency.toFixed(2)}`;
+  } else if (
+    sf[i] > ss[i] &&
+    fastSlope < 0
+  ) {
+    reason =
+      "5m bullish SMA stack but fast SMA slope turned down";
+  } else if (
+    sf[i] < ss[i] &&
+    fastSlope > 0
+  ) {
+    reason =
+      "5m bearish SMA stack but fast SMA slope turned up";
+  } else {
+    reason =
+      "5m SMA5/13 stack is not directionally aligned";
+  }
+
+  return {
+    ready: true,
+    direction,
+    efficiency: eff,
+    fast: sf[i],
+    slow: ss[i],
+    fastSlope,
+    reason
+  };
 }
 function roomToMoveSnapshot(bars1m, last, direction, atr) {
   const b15 = completedAggregate(bars1m, 900).slice(-32);
@@ -421,13 +493,26 @@ export function setupSequenceSnapshot(bars1m) {
   const b5 = completedAggregate(bars1m, 300);
   const reg5 = trendRegime(b5, 5, 13, 0.20);
   if (!sma.ready || !fr.ready || !atr.ready || !reg5.ready) {
-    return { ready: false, direction: "NEUTRAL" };
+    return {
+      ready: false,
+      direction: "NEUTRAL",
+      trendReason: reg5.reason || "completed 5m trend context unavailable"
+    };
   }
 
   const direction = reg5.direction;
   const lastBar = bars1m.at(-1);
   if (!lastBar || direction === "NEUTRAL") {
-    return { ready: true, direction: "NEUTRAL", barT: Number(lastBar?.t || 0) };
+    return {
+      ready: true,
+      direction: "NEUTRAL",
+      barT: Number(lastBar?.t || 0),
+      trendReason: reg5.reason || "5m trend is neutral",
+      regimeEfficiency: reg5.efficiency,
+      smaFast5m: reg5.fast,
+      smaSlow5m: reg5.slow,
+      smaFast5mSlope: reg5.fastSlope
+    };
   }
 
   const last = Number(lastBar.c);
@@ -2022,7 +2107,10 @@ export class TickHub extends DurableObject {
 
     if (phase.stage !== "READY") {
       const phaseReason = phase.stage === "SEEK"
-        ? "waiting for a clean completed 5m trend"
+        ? (
+          phase.snapshot?.trendReason ||
+          "waiting for a clean completed 5m trend"
+        )
         : phase.stage === "ARMED"
           ? "trend armed — waiting for the next pullback into the SMA zone"
           : (pullbackBlocker || "pullback recorded — waiting for a fresh 1m continuation");
