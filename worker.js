@@ -2388,6 +2388,7 @@ export class TickHub extends DurableObject {
     if (u.pathname === "/stats") return json(await this.getTrackingStats());
     if (u.pathname === "/forwardstats") return json(await this.getForwardStats());
     if (u.pathname === "/blockerstats") {
+
       if (u.pathname === "/blockerrecent") {
         const stats = await this.getBlockerStats();
 
@@ -2843,40 +2844,6 @@ export default {
           return new Response("ok");
         }
         if (/^\/blockerstats$/i.test(text)) {
-          if (/^\/blockerrecent(?:\s+\d+)?$/i.test(text)) {
-            try {
-              const match = text.match(/^\/blockerrecent(?:\s+(\d+))?$/i);
-
-              const limit = Math.max(
-                1,
-                Math.min(30, Number(match?.[1]) || 15)
-              );
-
-              const st = await hub(
-                env,
-                `/blockerrecent?limit=${limit}`
-              );
-
-              await tgSend(
-                env,
-                chatId,
-                st?.message || "No recent blocker data available."
-              );
-            } catch (e) {
-              console.error(
-                "blockerrecent failed",
-                String(e?.stack || e?.message || e)
-              );
-
-              await tgSend(
-                env,
-                chatId,
-                `BLOCKER RECENT ERROR\n${String(e?.message || e).slice(0, 300)}`
-              );
-            }
-
-            return new Response("ok");
-          }
           try {
             const st = await hub(env, "/blockerstats");
 
@@ -2896,6 +2863,41 @@ export default {
               env,
               chatId,
               `BLOCKER STATS ERROR\n${String(e?.message || e).slice(0, 300)}`
+            );
+          }
+
+          return new Response("ok");
+        }
+
+        if (/^\/blockerrecent(?:\s+\d+)?$/i.test(text)) {
+          try {
+            const match = text.match(/^\/blockerrecent(?:\s+(\d+))?$/i);
+
+            const limit = Math.max(
+              1,
+              Math.min(30, Number(match?.[1]) || 15)
+            );
+
+            const st = await hub(
+              env,
+              `/blockerrecent?limit=${limit}`
+            );
+
+            await tgSend(
+              env,
+              chatId,
+              st?.message || "No recent blocker data available."
+            );
+          } catch (e) {
+            console.error(
+              "blockerrecent failed",
+              String(e?.stack || e?.message || e)
+            );
+
+            await tgSend(
+              env,
+              chatId,
+              `BLOCKER RECENT ERROR\n${String(e?.message || e).slice(0, 300)}`
             );
           }
 
