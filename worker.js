@@ -1783,6 +1783,34 @@ export class TickHub extends DurableObject {
       ...lines
     ].join("\n");
   }
+  formatRecentBlockersMessage(stats, limit = 20) {
+    const recent = Array.isArray(stats?.recent)
+      ? stats.recent.slice(0, Math.max(1, Math.min(Number(limit) || 20, 30)))
+      : [];
+
+    if (!recent.length) {
+      return "RECENT SIGNAL BLOCKERS\n\nNo blocker events recorded yet.";
+    }
+
+    const lines = recent.map((row, index) => {
+      const time = Number(row?.at)
+        ? new Date(Number(row.at)).toISOString().slice(11, 19)
+        : "n/a";
+
+      return (
+        `${index + 1}. ${row?.symbol || "UNKNOWN"} — ${row?.category || "other"}\n` +
+        `${row?.reason || "No reason"}\n` +
+        `Time: ${time} UTC`
+      );
+    });
+
+    return [
+      "RECENT SIGNAL BLOCKERS",
+      `Showing latest ${recent.length}`,
+      "",
+      ...lines
+    ].join("\n\n");
+  }
 
   async recordBlocker(symbol, reason, at = Date.now()) {
     const category = classifyBlocker(reason);
@@ -2360,6 +2388,23 @@ export class TickHub extends DurableObject {
     if (u.pathname === "/stats") return json(await this.getTrackingStats());
     if (u.pathname === "/forwardstats") return json(await this.getForwardStats());
     if (u.pathname === "/blockerstats") {
+      if (u.pathname === "/blockerrecent") {
+        const stats = await this.getBlockerStats();
+
+        const limit = Math.max(
+          1,
+          Math.min(
+            30,
+            Number(u.searchParams.get("limit")) || 20
+          )
+        );
+
+        return json({
+          ok: true,
+          recent: stats.recent.slice(0, limit),
+          message: this.formatRecentBlockersMessage(stats, limit)
+        });
+      }
       const stats = await this.getBlockerStats();
 
       return json({
@@ -2798,6 +2843,40 @@ export default {
           return new Response("ok");
         }
         if (/^\/blockerstats$/i.test(text)) {
+          if (/^\/blockerrecent(?:\s+\d+)?$/i.test(text)) {
+            try {
+              const match = text.match(/^\/blockerrecent(?:\s+(\d+))?$/i);
+
+              const limit = Math.max(
+                1,
+                Math.min(30, Number(match?.[1]) || 15)
+              );
+
+              const st = await hub(
+                env,
+                `/blockerrecent?limit=${limit}`
+              );
+
+              await tgSend(
+                env,
+                chatId,
+                st?.message || "No recent blocker data available."
+              );
+            } catch (e) {
+              console.error(
+                "blockerrecent failed",
+                String(e?.stack || e?.message || e)
+              );
+
+              await tgSend(
+                env,
+                chatId,
+                `BLOCKER RECENT ERROR\n${String(e?.message || e).slice(0, 300)}`
+              );
+            }
+
+            return new Response("ok");
+          }
           try {
             const st = await hub(env, "/blockerstats");
 
