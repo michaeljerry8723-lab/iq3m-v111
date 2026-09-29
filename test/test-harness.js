@@ -357,7 +357,7 @@ console.log(`Test 8: Blocker instrumentation (/blockerstats)`);
   await hub.recordBlocker("USD/CHF", "pair cooldown active");
   await hub.recordBlocker(
     "USD/JPY",
-    "5m efficiency 0.18 below 0.20"
+    "5m efficiency 0.185 below 0.200"
   );
 
   await hub.recordBlocker(
@@ -373,6 +373,10 @@ console.log(`Test 8: Blocker instrumentation (/blockerstats)`);
   assert(stats.byCategory.transient_timing >= 1, `Transient timing failures counted: ${stats.byCategory.transient_timing}`);
   assert(stats.byCategory.redundant_gate >= 1, `Redundant gate failures counted: ${stats.byCategory.redundant_gate}`);
   assert(stats.byCategory.risk_cooldown >= 1, `Risk/cooldown failures counted: ${stats.byCategory.risk_cooldown}`);
+  assert(
+    stats.efficiencyFineBands.near_180_189 === 1,
+    `0.180–0.189 efficiency band counted: ${stats.efficiencyFineBands.near_180_189}`
+  );
   assert(
     stats.efficiencyBands.near_qualified === 1,
     `Near-qualified efficiency failures counted: ${stats.efficiencyBands.near_qualified}`

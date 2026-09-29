@@ -110,37 +110,45 @@ export function classifyEfficiencyBand(reason) {
   if (!match) return null;
 
   const value = Number(match[1]);
-
   if (!Number.isFinite(value)) return null;
 
+  let key;
+  let label;
+
   if (value < 0.10) {
-    return {
-      key: "very_choppy",
-      label: "< 0.10",
-      value
-    };
+    key = "very_choppy";
+    label = "< 0.10";
+  } else if (value < 0.15) {
+    key = "weak";
+    label = "0.10–0.149";
+  } else {
+    key = "near_qualified";
+    label = "0.15–0.199";
   }
 
-  if (value < 0.15) {
-    return {
-      key: "weak",
-      label: "0.10–0.149",
-      value
-    };
-  }
+  let fineKey = null;
+  let fineLabel = null;
 
-  if (value < 0.20) {
-    return {
-      key: "near_qualified",
-      label: "0.15–0.199",
-      value
-    };
+  if (value >= 0.15 && value < 0.17) {
+    fineKey = "near_150_169";
+    fineLabel = "0.150–0.169";
+  } else if (value >= 0.17 && value < 0.18) {
+    fineKey = "near_170_179";
+    fineLabel = "0.170–0.179";
+  } else if (value >= 0.18 && value < 0.19) {
+    fineKey = "near_180_189";
+    fineLabel = "0.180–0.189";
+  } else if (value >= 0.19 && value < 0.20) {
+    fineKey = "near_190_199";
+    fineLabel = "0.190–0.199";
   }
 
   return {
-    key: "qualified",
-    label: ">= 0.20",
-    value
+    key,
+    label,
+    value,
+    fineKey,
+    fineLabel
   };
 }
 
@@ -468,7 +476,7 @@ function trendRegime(bars, fast = 5, slow = 13, minEfficiency = 0.25) {
     direction = "PUT";
   } else if (eff < minEfficiency) {
     reason =
-      `5m efficiency ${eff.toFixed(2)} below ${minEfficiency.toFixed(2)}`;
+      `5m efficiency ${eff.toFixed(3)} below ${minEfficiency.toFixed(3)}`;
   } else if (
     sf[i] > ss[i] &&
     fastSlope < 0
@@ -1926,6 +1934,9 @@ export class TickHub extends DurableObject {
       efficiencyBands: {
         ...(stats.efficiencyBands || {})
       },
+      efficiencyFineBands: {
+        ...(stats.efficiencyFineBands || {})
+      },
       recent: (stats.recent || []).slice(0, 25)
     };
   }
@@ -1940,6 +1951,8 @@ export class TickHub extends DurableObject {
     const by = stats?.byCategory || {};
 
     const efficiency = stats?.efficiencyBands || {};
+
+    const fineEfficiency = stats?.efficiencyFineBands || {};
 
     const efficiencyTotal =
       Object.values(efficiency)
@@ -1972,7 +1985,12 @@ export class TickHub extends DurableObject {
         `< 0.10: ${Number(efficiency.very_choppy || 0)}`,
         `0.10–0.149: ${Number(efficiency.weak || 0)}`,
         `0.15–0.199: ${Number(efficiency.near_qualified || 0)}`,
-        `>= 0.20: ${Number(efficiency.qualified || 0)}`
+        "",
+        "NEAR-QUALIFIED BREAKDOWN",
+        `0.150–0.169: ${Number(fineEfficiency.near_150_169 || 0)}`,
+        `0.170–0.179: ${Number(fineEfficiency.near_170_179 || 0)}`,
+        `0.180–0.189: ${Number(fineEfficiency.near_180_189 || 0)}`,
+        `0.190–0.199: ${Number(fineEfficiency.near_190_199 || 0)}`
       ]
       : [];
 
@@ -2032,7 +2050,8 @@ export class TickHub extends DurableObject {
         byCategory: {},
         bySymbol: {},
         recent: [],
-        efficiencyBands: {}
+        efficiencyBands: {},
+        efficiencyFineBands: {}
       };
     }
 
@@ -2052,6 +2071,9 @@ export class TickHub extends DurableObject {
 
     if (!this.blockerStats.efficiencyBands) {
       this.blockerStats.efficiencyBands = {};
+      if (!this.blockerStats.efficiencyFineBands) {
+        this.blockerStats.efficiencyFineBands = {};
+      }
     }
 
     if (efficiencyBand) {
@@ -2059,6 +2081,14 @@ export class TickHub extends DurableObject {
         Number(
           this.blockerStats.efficiencyBands[efficiencyBand.key] || 0
         ) + 1;
+
+      if (efficiencyBand?.fineKey) {
+        this.blockerStats.efficiencyFineBands[efficiencyBand.fineKey] =
+          Number(
+            this.blockerStats.efficiencyFineBands[efficiencyBand.fineKey] || 0
+          ) + 1;
+      }
+
     }
 
     this.blockerStats.total =
