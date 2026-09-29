@@ -7,6 +7,7 @@ export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const CRYPTO_SYMBOLS = new Set();
 export const A_GRADE_MIN_QUALITY = 0.895;
 export const EXPIRY_SECONDS = 300;
+export const BLOCKER_CLASSIFIER_VERSION = "v2-setup-progression";
 export const STRATEGY_ID = "v13.6-signal-only";
 export const PREPARE_TTL_MS = 10 * 60 * 1000;
 export const PULLBACK_TTL_MS = 5 * 60 * 1000;
@@ -16,6 +17,15 @@ export const LOSS_CIRCUIT_BREAKER_MS = 20 * 60 * 1000;
 
 export function classifyBlocker(reason) {
   const r = String(reason || "").toLowerCase();
+  if (
+    r.includes("trend armed") ||
+    r.includes("waiting for the next pullback") ||
+    r.includes("pullback recorded") ||
+    r.includes("waiting for a fresh 1m continuation")
+  ) {
+    return "setup_progression";
+  }
+
   if (
     r.includes("waiting for a clean completed 5m trend") ||
     r.includes("5m trend is neutral") ||
@@ -893,6 +903,7 @@ export class TickHub extends DurableObject {
 
     this.blockerStats = {
       strategyId: STRATEGY_ID,
+      classifierVersion: BLOCKER_CLASSIFIER_VERSION,
       startedAt: Date.now(),
       total: 0,
       byCategory: {},
@@ -904,7 +915,10 @@ export class TickHub extends DurableObject {
 
       const storedBlockers = await this.ctx.storage.get("blockerStats");
 
-      if (storedBlockers?.strategyId === STRATEGY_ID) {
+      if (
+        storedBlockers?.strategyId === STRATEGY_ID &&
+        storedBlockers?.classifierVersion === BLOCKER_CLASSIFIER_VERSION
+      ) {
         this.blockerStats = {
           ...storedBlockers,
           total: Number(
@@ -1777,6 +1791,7 @@ export class TickHub extends DurableObject {
     const by = stats?.byCategory || {};
 
     const categories = [
+      ["Setup Progression", "setup_progression"],
       ["Core Structure", "core_structure"],
       ["Supporting Confirmation", "supporting_confirmation"],
       ["Transient Timing", "transient_timing"],
@@ -1836,7 +1851,11 @@ export class TickHub extends DurableObject {
     const category = classifyBlocker(reason);
     const pair = normalizeSymbol(symbol) || String(symbol || "");
 
-    if (!this.blockerStats || this.blockerStats.strategyId !== STRATEGY_ID) {
+    if (
+      !this.blockerStats ||
+      this.blockerStats.strategyId !== STRATEGY_ID ||
+      this.blockerStats.classifierVersion !== BLOCKER_CLASSIFIER_VERSION
+    ) {
       this.blockerStats = {
         strategyId: STRATEGY_ID,
         startedAt: at,
