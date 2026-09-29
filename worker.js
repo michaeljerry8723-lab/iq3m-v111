@@ -2412,29 +2412,29 @@ export class TickHub extends DurableObject {
     if (u.pathname === "/stats") return json(await this.getTrackingStats());
     if (u.pathname === "/forwardstats") return json(await this.getForwardStats());
     if (u.pathname === "/blockerstats") {
-
-      if (u.pathname === "/blockerrecent") {
-        const stats = await this.getBlockerStats();
-
-        const limit = Math.max(
-          1,
-          Math.min(
-            30,
-            Number(u.searchParams.get("limit")) || 20
-          )
-        );
-
-        return json({
-          ok: true,
-          recent: stats.recent.slice(0, limit),
-          message: this.formatRecentBlockersMessage(stats, limit)
-        });
-      }
       const stats = await this.getBlockerStats();
 
       return json({
         ...stats,
         message: this.formatBlockerStatsMessage(stats)
+      });
+    }
+
+    if (u.pathname === "/blockerrecent") {
+      const stats = await this.getBlockerStats();
+
+      const limit = Math.max(
+        1,
+        Math.min(
+          30,
+          Number(u.searchParams.get("limit")) || 20
+        )
+      );
+
+      return json({
+        ok: true,
+        recent: stats.recent.slice(0, limit),
+        message: this.formatRecentBlockersMessage(stats, limit)
       });
     }
 
