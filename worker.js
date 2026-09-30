@@ -4048,7 +4048,10 @@ export class TickHub extends DurableObject {
         )
     };
 
-    const summarizeClusterPerformance = key => {
+    const summarizeClusterPerformance = (
+      key,
+      session = null
+    ) => {
       const terminal = [
         "WIN",
         "LOSS",
@@ -4058,6 +4061,11 @@ export class TickHub extends DurableObject {
 
       const rows =
         [...clusterMap.entries()]
+          .filter(
+            ([minute]) =>
+              session == null ||
+              marketWindow(minute) === session
+          )
           .map(([minute, setups]) => {
             const settled =
               setups.filter(x =>
@@ -4203,6 +4211,32 @@ export class TickHub extends DurableObject {
         )
     };
 
+    const clusterAdjustedBySession = {};
+
+    for (
+      const session of [
+        "ASIA",
+        "LONDON",
+        "OVERLAP",
+        "NEW_YORK",
+        "LATE"
+      ]
+    ) {
+      clusterAdjustedBySession[session] = {
+        expiry60:
+          summarizeClusterPerformance(
+            "result60",
+            session
+          ),
+
+        expiry120:
+          summarizeClusterPerformance(
+            "result120",
+            session
+          )
+      };
+    }
+
     const fullySettledClusters =
       Math.min(
         Number(
@@ -4284,6 +4318,7 @@ export class TickHub extends DurableObject {
         clusterStats,
 
       clusterAdjusted,
+      clusterAdjustedBySession,
       evidence,
       recent:
         history.slice(

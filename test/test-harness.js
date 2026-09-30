@@ -1323,6 +1323,56 @@ console.log("Test 17: Cruz UTC market-window statistics");
     stats.bySession.LATE.expiry60.settled === 1,
     "22:00 UTC is classified into LATE"
   );
+
+  assert(
+    stats.clusterAdjustedBySession.ASIA
+      .expiry60.settledClusters === 1 &&
+    Math.abs(
+      stats.clusterAdjustedBySession.ASIA
+        .expiry60.equalClusterWinRate - 100
+    ) < 0.001,
+    "ASIA cluster-adjusted 60s result is isolated correctly"
+  );
+
+  assert(
+    stats.clusterAdjustedBySession.LONDON
+      .expiry120.settledClusters === 1 &&
+    Math.abs(
+      stats.clusterAdjustedBySession.LONDON
+        .expiry120.equalClusterWinRate - 0
+    ) < 0.001,
+    "LONDON cluster-adjusted 120s result is isolated correctly"
+  );
+
+  assert(
+    stats.clusterAdjustedBySession.OVERLAP
+      .expiry60.settledClusters === 1 &&
+    Math.abs(
+      stats.clusterAdjustedBySession.OVERLAP
+        .expiry60.equalClusterWinRate - 0
+    ) < 0.001,
+    "OVERLAP cluster-adjusted 60s result is isolated correctly"
+  );
+
+  assert(
+    stats.clusterAdjustedBySession.NEW_YORK
+      .expiry120.settledClusters === 1 &&
+    Math.abs(
+      stats.clusterAdjustedBySession.NEW_YORK
+        .expiry120.equalClusterWinRate - 100
+    ) < 0.001,
+    "NEW YORK cluster-adjusted 120s result is isolated correctly"
+  );
+
+  assert(
+    stats.clusterAdjustedBySession.LATE
+      .expiry60.settledClusters === 1 &&
+    Math.abs(
+      stats.clusterAdjustedBySession.LATE
+        .expiry60.equalClusterWinRate - 0
+    ) < 0.001,
+    "LATE cluster-adjusted 60s result is isolated correctly"
+  );
 }
 
 console.log();
