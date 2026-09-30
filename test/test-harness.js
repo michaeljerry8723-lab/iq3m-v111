@@ -23,6 +23,7 @@ import {
   scoreShortExpiryShadow,
   setupSequenceSnapshot,
   classifyBlocker,
+  scoreCruz1mShadow,
   cruzIchimokuSnapshot,
   cruzDmiSnapshot,
   TickHub
@@ -840,6 +841,162 @@ console.log("Test 13: Cruz Ichimoku + DMI configuration");
     callDmi.diLength === 7 &&
     callDmi.adxSmoothing === 14,
     "Cruz DMI uses DI 7 / ADX smoothing 14"
+  );
+}
+
+console.log();
+
+// -----------------------------------------------------------------------------
+// Test 14: Cruz 1-minute BUY / SELL trigger
+// -----------------------------------------------------------------------------
+console.log("Test 14: Cruz 1-minute BUY / SELL trigger");
+
+{
+  const now = Date.now();
+
+  const makeCruzTriggerBars = direction => {
+    const bars = [];
+    let price = 1.10000;
+
+    // Build the market in the opposite direction first.
+    // The final candle then creates the fresh DI crossover
+    // and Ichimoku breakout visible in the Cruz examples.
+    const baseStep =
+      direction === "CALL"
+        ? -0.00005
+        : 0.00005;
+
+    for (let i = 0; i < 59; i++) {
+      const o = price;
+      const c = price + baseStep;
+
+      bars.push({
+        t: now - (60 - i) * 60000,
+        o,
+        h: Math.max(o, c) + 0.00003,
+        l: Math.min(o, c) - 0.00003,
+        c,
+        n: 20
+      });
+
+      price = c;
+    }
+
+    // Strong reversal/breakout candle.
+    const finalMove =
+      direction === "CALL"
+        ? 0.00050
+        : -0.00050;
+
+    const o = price;
+    const c = price + finalMove;
+
+    bars.push({
+      t: now - 60000,
+      o,
+      h: Math.max(o, c) + 0.00003,
+      l: Math.min(o, c) - 0.00003,
+      c,
+      n: 30
+    });
+
+    return bars;
+  };
+
+
+  // -------------------------------------------------
+  // CALL
+  // -------------------------------------------------
+
+  const callBars =
+    makeCruzTriggerBars("CALL");
+
+  const callTicks =
+    createTicks({
+      lastPrice:
+        Number(callBars.at(-1).c),
+
+      direction: "CALL",
+      count: 24,
+      aligned: true,
+      now
+    });
+
+  const call =
+    scoreCruz1mShadow(
+      callTicks,
+      callBars,
+      "EUR/USD"
+    );
+
+  console.log(
+    "CRUZ CALL RESULT:",
+    call
+  );
+
+  assert(
+    call.ok &&
+    call.direction === "CALL",
+    `Cruz detector produces CALL (${call.reason || "qualified"})`
+  );
+
+  assert(
+    call.dmi?.crossUp === true,
+    "+DI freshly crosses above -DI for CALL"
+  );
+
+  assert(
+    call.trigger?.bullishSpanBBreak === true ||
+    call.trigger?.bullishCloudBreak === true,
+    "CALL candle breaks/reclaims Ichimoku boundary"
+  );
+
+
+  // -------------------------------------------------
+  // PUT
+  // -------------------------------------------------
+
+  const putBars =
+    makeCruzTriggerBars("PUT");
+
+  const putTicks =
+    createTicks({
+      lastPrice:
+        Number(putBars.at(-1).c),
+
+      direction: "PUT",
+      count: 24,
+      aligned: true,
+      now
+    });
+
+  const put =
+    scoreCruz1mShadow(
+      putTicks,
+      putBars,
+      "GBP/USD"
+    );
+
+  console.log(
+    "CRUZ PUT RESULT:",
+    put
+  );
+
+  assert(
+    put.ok &&
+    put.direction === "PUT",
+    `Cruz detector produces PUT (${put.reason || "qualified"})`
+  );
+
+  assert(
+    put.dmi?.crossDown === true,
+    "-DI freshly crosses above +DI for PUT"
+  );
+
+  assert(
+    put.trigger?.bearishSpanBBreak === true ||
+    put.trigger?.bearishCloudBreak === true,
+    "PUT candle breaks below Ichimoku boundary"
   );
 }
 
