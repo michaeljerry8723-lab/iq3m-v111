@@ -558,6 +558,163 @@ function usdExposureSide(symbol, direction) {
   if (usdQuote.has(s)) return d === "CALL" ? "USD_SHORT" : "USD_LONG";
   return null;
 }
+function rangeMidpointAt(bars, endIndex, period) {
+  const p = Math.max(1, Math.floor(period));
+  const startIndex = endIndex - p + 1;
+
+  if (
+    !Array.isArray(bars) ||
+    startIndex < 0 ||
+    endIndex >= bars.length
+  ) {
+    return NaN;
+  }
+
+  let highest = -Infinity;
+  let lowest = Infinity;
+
+  for (let i = startIndex; i <= endIndex; i++) {
+    const high = Number(bars[i]?.h);
+    const low = Number(bars[i]?.l);
+
+    if (
+      !Number.isFinite(high) ||
+      !Number.isFinite(low)
+    ) {
+      return NaN;
+    }
+
+    highest = Math.max(highest, high);
+    lowest = Math.min(lowest, low);
+  }
+
+  return (highest + lowest) / 2;
+}
+
+
+export function cruzIchimokuSnapshot(
+  bars,
+  tenkanPeriod = 5,
+  kijunPeriod = 10,
+  spanBPeriod = 20
+) {
+  if (
+    !Array.isArray(bars) ||
+    bars.length < spanBPeriod + 2
+  ) {
+    return {
+      ready: false,
+      bars: Array.isArray(bars)
+        ? bars.length
+        : 0
+    };
+  }
+
+  const i = bars.length - 1;
+  const prev = i - 1;
+
+  const tenkan =
+    rangeMidpointAt(
+      bars,
+      i,
+      tenkanPeriod
+    );
+
+  const kijun =
+    rangeMidpointAt(
+      bars,
+      i,
+      kijunPeriod
+    );
+
+  const spanB =
+    rangeMidpointAt(
+      bars,
+      i,
+      spanBPeriod
+    );
+
+  const prevTenkan =
+    rangeMidpointAt(
+      bars,
+      prev,
+      tenkanPeriod
+    );
+
+  const prevKijun =
+    rangeMidpointAt(
+      bars,
+      prev,
+      kijunPeriod
+    );
+
+  const prevSpanB =
+    rangeMidpointAt(
+      bars,
+      prev,
+      spanBPeriod
+    );
+
+  const spanA =
+    (tenkan + kijun) / 2;
+
+  const prevSpanA =
+    (prevTenkan + prevKijun) / 2;
+
+  const values = [
+    tenkan,
+    kijun,
+    spanA,
+    spanB,
+    prevTenkan,
+    prevKijun,
+    prevSpanA,
+    prevSpanB
+  ];
+
+  if (!values.every(Number.isFinite)) {
+    return {
+      ready: false,
+      bars: bars.length
+    };
+  }
+
+  return {
+    ready: true,
+
+    tenkanPeriod,
+    kijunPeriod,
+    spanBPeriod,
+
+    tenkan,
+    kijun,
+    spanA,
+    spanB,
+
+    prevTenkan,
+    prevKijun,
+    prevSpanA,
+    prevSpanB,
+
+    cloudTop:
+      Math.max(spanA, spanB),
+
+    cloudBottom:
+      Math.min(spanA, spanB),
+
+    prevCloudTop:
+      Math.max(
+        prevSpanA,
+        prevSpanB
+      ),
+
+    prevCloudBottom:
+      Math.min(
+        prevSpanA,
+        prevSpanB
+      )
+  };
+}
 
 export function setupSequenceSnapshot(bars1m) {
   const sma = smaTrendSnapshot(bars1m, 5, 13);
