@@ -803,7 +803,7 @@ export function scoreShortExpiryShadow(ticks, bars1m, symbol) {
   // Broader 5m context is a veto only.
   // It does not create the 1–2 minute signal.
   const b5 =
-    aggregateOhlcBars(bars1m, 300);
+    completedAggregate(bars1m, 300);
 
   const broad =
     trendRegime(b5, 3, 8, 0.12);
@@ -3297,6 +3297,175 @@ export class TickHub extends DurableObject {
     };
   }
 
+  async evaluateShortShadow(symbol) {
+    symbol = normalizeSymbol(symbol);
+
+    if (!symbol || !FIXED_UNIVERSE.includes(symbol)) {
+      return {
+        ok: false,
+        error: "invalid short-shadow symbol"
+      };
+    }
+
+    // Do not overlap experimental trades on the same pair.
+    const active = (
+      this.shortShadowState?.pending || []
+    ).find(x => x.symbol === symbol);
+
+    if (active) {
+      return {
+        ok: false,
+        skipped: true,
+        symbol,
+        reason: "short-shadow position already pending on pair"
+      };
+    }
+
+    await this.subscribe(symbol);
+    await this.ensureSocket();
+    await this.refreshIfStale(symbol);
+
+    const ticks = this.ticks.get(symbol) || [];
+
+    if (ticks.length < 8) {
+      return {
+        ok: false,
+        warming: true,
+        symbol,
+        reason: `short-shadow live ticks still building (${ticks.length}/8)`
+      };
+    }
+
+    const receiveAge = this.latestReceivedAge(symbol);
+    const marketAge = this.latestMarketAge(symbol);
+
+    if (receiveAge > 8) {
+      return {
+        ok: false,
+        symbol,
+        reason:
+          `short-shadow live quote stale: ${receiveAge.toFixed(1)}s`
+      };
+    }
+
+    if (marketAge > 20) {
+      return {
+        ok: false,
+        symbol,
+        reason:
+          `short-shadow provider quote is ${marketAge.toFixed(1)}s old`
+      };
+    }
+
+    let bars1m;
+
+    try {
+      bars1m =
+        await this.fetchOneMinuteBars(symbol);
+    } catch (e) {
+      return {
+        ok: false,
+        symbol,
+        quotaExceeded:
+          Boolean(e?.quotaExceeded),
+        retryAfterMinutes:
+          Number(e?.retryAfterMinutes || 0),
+        reason:
+          `short-shadow 1m context unavailable: ${String(
+            e?.message || e
+          )}`
+      };
+    }
+
+    const candidate =
+      scoreShortExpiryShadow(
+        ticks,
+        bars1m,
+        symbol
+      );
+
+    if (!candidate.ok) {
+      return {
+        ...candidate,
+        symbol,
+        captured: false
+      };
+    }
+
+    const quote = ticks.at(-1);
+    const entryPrice = Number(quote?.p);
+
+    if (!Number.isFinite(entryPrice)) {
+      return {
+        ok: false,
+        symbol,
+        reason: "short-shadow entry quote unavailable"
+      };
+    }
+
+    const entryAt = Date.now();
+
+    const sourceKey =
+      `${SHORT_SHADOW_ID}|${symbol}|` +
+      `${candidate.direction}|` +
+      `${Math.floor(entryAt / 60000)}`;
+
+    const capture =
+      await this.captureShortShadow({
+        symbol,
+        direction: candidate.direction,
+        entryPrice,
+        entryAt,
+        sourceKey,
+
+        features: {
+          quality: candidate.quality,
+          efficiency: candidate.efficiency,
+          extensionAtr: candidate.extensionAtr,
+
+          smaFast: candidate.smaFast,
+          smaSlow: candidate.smaSlow,
+          fastSlope: candidate.fastSlope,
+
+          rsi: candidate.rsi,
+          adx: candidate.adx,
+          dmiGap: candidate.dmiGap,
+
+          tickUpRatio:
+            candidate.tickUpRatio,
+          tickDownRatio:
+            candidate.tickDownRatio,
+          tickNorm:
+            candidate.tickNorm,
+
+          confirmationCount:
+            candidate.confirmationCount,
+
+          confirmations:
+            candidate.confirmations,
+
+          broad5m:
+            candidate.broad5m
+        }
+      });
+
+    return {
+      ...candidate,
+      symbol,
+      captured:
+        Boolean(
+          capture?.ok &&
+          !capture?.duplicate
+        ),
+      duplicate:
+        Boolean(capture?.duplicate),
+      shadowId:
+        capture?.id || null,
+      entryPrice,
+      entryAt
+    };
+  }
+
   async getTrackingStats() {
     const current = this.signalHistory.filter(x => this.isCurrentStrategyRecord(x));
     const wins = current.filter(x => x.result === "WIN").length;
@@ -3387,6 +3556,13 @@ export class TickHub extends DurableObject {
 
       return json(result);
     }
+
+    if (u.pathname === "/short-shadow") {
+      return json(
+        await this.evaluateShortShadow(symbol)
+      );
+    }
+
     if (u.pathname === "/quote") {
       if (!symbol) return json({ ok: false, error: "invalid symbol" }, 400);
       await this.subscribe(symbol);
