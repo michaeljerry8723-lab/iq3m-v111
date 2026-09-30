@@ -23,6 +23,7 @@ import {
   scoreShortExpiryShadow,
   setupSequenceSnapshot,
   classifyBlocker,
+  SHORT_SHADOW_UNIVERSE,
   scoreCruz1mShadow,
   cruzIchimokuSnapshot,
   cruzDmiSnapshot,
@@ -1116,6 +1117,47 @@ console.log("Test 15: Cruz detector integrates with short-shadow capture");
     record.features?.dmi?.diLength === 7 &&
     record.features?.dmi?.adxSmoothing === 14,
     "Captured setup preserves Cruz 5/10/20 Ichimoku and 7/14 DMI settings"
+  );
+}
+
+console.log();
+
+// -----------------------------------------------------------------------------
+// Test 16: Cruz universe remains separate from 5-minute universe
+// -----------------------------------------------------------------------------
+console.log("Test 16: Cruz universe separation");
+
+{
+  assert(
+    FIXED_UNIVERSE.length === 6,
+    `5-minute universe remains 6 pairs (${FIXED_UNIVERSE.length})`
+  );
+
+  assert(
+    SHORT_SHADOW_UNIVERSE.length === 12,
+    `Cruz short-shadow universe contains 12 pairs (${SHORT_SHADOW_UNIVERSE.length})`
+  );
+
+  assert(
+    SHORT_SHADOW_UNIVERSE.every(
+      symbol =>
+        FIXED_UNIVERSE.includes(symbol) ||
+        [
+          "NZD/USD",
+          "EUR/JPY",
+          "GBP/JPY",
+          "EUR/GBP",
+          "AUD/JPY",
+          "CAD/JPY"
+        ].includes(symbol)
+    ),
+    "Cruz universe contains only approved FX pairs"
+  );
+
+  assert(
+    !FIXED_UNIVERSE.includes("GBP/JPY") &&
+    SHORT_SHADOW_UNIVERSE.includes("GBP/JPY"),
+    "Additional Cruz pairs do not leak into 5-minute universe"
   );
 }
 
