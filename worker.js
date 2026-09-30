@@ -3975,9 +3975,14 @@ async function autoScanAndAlert(env) {
       shortShadowChecked:
         Number(shortShadow?.checked || 0),
 
-      ...shortSummary
-    };
+      shortShadowCaptured:
+        Number(shortShadow?.captured || 0),
 
+      shortShadowSymbols:
+        Array.isArray(shortShadow?.symbols)
+          ? shortShadow.symbols
+          : []
+    };
     // -------------------------------------------------
     // EXISTING 5-MINUTE LIVE ENGINE
     // -------------------------------------------------
@@ -4008,12 +4013,7 @@ async function autoScanAndAlert(env) {
         reason:
           risk.reason || "risk gate",
         readyAlertsSent: 0,
-
-        shortShadowCaptured:
-          Number(shortShadow?.captured || 0),
-
-        shortShadowSymbols:
-          shortShadow?.symbols || []
+        ...shortSummary
       };
     }
 
@@ -4048,12 +4048,7 @@ async function autoScanAndAlert(env) {
         "no fully qualified setup",
 
       readyAlertsSent: 0,
-
-      shortShadowCaptured:
-        Number(shortShadow?.captured || 0),
-
-      shortShadowSymbols:
-        shortShadow?.symbols || []
+      ...shortSummary
     };
 
   } finally {
