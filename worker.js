@@ -5164,9 +5164,65 @@ export default {
                 ? "n/a"
                 : Number(st.expiry120.winRate).toFixed(1) + "%";
 
+            const formatBucket = bucket => {
+              const b = bucket || {};
+
+              const wr =
+                b.winRate == null
+                  ? "n/a"
+                  : Number(b.winRate).toFixed(1) + "%";
+
+              return `${b.wins || 0}W ${b.losses || 0}L (${wr})`;
+            };
+
+
+            const pairLines =
+              SHORT_SHADOW_UNIVERSE
+                .map(symbol => {
+                  const row =
+                    st.byPair?.[symbol] || {};
+
+                  return (
+                    `${symbol} — ` +
+                    `60s ${formatBucket(row.expiry60)} | ` +
+                    `120s ${formatBucket(row.expiry120)}` +
+                    `${Number(row.pending || 0) > 0
+                      ? ` | P:${row.pending}`
+                      : ""
+                    }`
+                  );
+                })
+                .join("\n");
+
+
+            const callStats =
+              st.byDirection?.CALL || {};
+
+            const putStats =
+              st.byDirection?.PUT || {};
+
+
+            const clusterStats =
+              st.clusters || {};
+
+            const recentClusters =
+              Array.isArray(clusterStats.recent)
+                ? clusterStats.recent
+                  .slice(0, 3)
+                  .map(c =>
+                    `${c.count || 0} setup${Number(c.count || 0) === 1 ? "" : "s"} — ` +
+                    `${Array.isArray(c.symbols)
+                      ? c.symbols.join(", ")
+                      : "n/a"
+                    }`
+                  )
+                  .join("\n")
+                : "";
+
             await tgSend(
               env,
               chatId,
+
               `SHORT-EXPIRY SHADOW\n` +
               `Strategy: ${st.strategyId}\n` +
               `Pending setups: ${st.pending || 0}\n\n` +
@@ -5186,6 +5242,27 @@ export default {
               `Draws: ${st.expiry120?.draws || 0}\n` +
               `Voids: ${st.expiry120?.voids || 0}\n` +
               `W/L win rate: ${wr120}\n\n` +
+
+              `BY DIRECTION\n` +
+              `CALL — 60s ${formatBucket(callStats.expiry60)} | ` +
+              `120s ${formatBucket(callStats.expiry120)} | ` +
+              `Pending: ${callStats.pending || 0}\n` +
+
+              `PUT — 60s ${formatBucket(putStats.expiry60)} | ` +
+              `120s ${formatBucket(putStats.expiry120)} | ` +
+              `Pending: ${putStats.pending || 0}\n\n` +
+
+              `BY PAIR\n` +
+              `${pairLines}\n\n` +
+
+              `CAPTURE CLUSTERS\n` +
+              `Total clusters: ${clusterStats.totalClusters || 0}\n` +
+              `Multi-setup clusters: ${clusterStats.multiSetupClusters || 0}\n` +
+              `Largest cluster: ${clusterStats.maxClusterSize || 0} setups\n` +
+              `${recentClusters
+                ? `Recent clusters:\n${recentClusters}\n\n`
+                : "\n"
+              }` +
 
               `Shadow mode only — no short-expiry trade alerts are being sent yet.`
             );
