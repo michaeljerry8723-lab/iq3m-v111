@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.6.3-cruz-shadow";
+export const VERSION = "13.6.4-cruz-12pair-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -2107,8 +2107,21 @@ export class TickHub extends DurableObject {
 
       // V11.2: prefer the configured warm list over old persisted symbols so a Basic/trial
       // account does not keep resubscribing to unsupported pairs from earlier builds.
-      const configured = String(env.WS_SYMBOLS || DEFAULT_SYMBOLS).split(",").map(normalizeSymbol).filter(Boolean);
-      for (const s of (configured.length ? configured : [...DEFAULT_SYMBOLS.split(",")])) if (s) this.symbols.add(s);
+      const configured = String(env.WS_SYMBOLS || "")
+        .split(",")
+        .map(normalizeSymbol)
+        .filter(Boolean);
+
+      const warmSymbols = [
+        ...new Set([
+          ...SHORT_SHADOW_UNIVERSE,
+          ...configured
+        ])
+      ];
+
+      for (const s of warmSymbols) {
+        if (s) this.symbols.add(s);
+      }
       await this.ctx.storage.put("symbols", [...this.symbols]);
       const persistedContext = (await this.ctx.storage.get("oneMinuteCacheData")) || {};
       for (const [symbol, value] of Object.entries(persistedContext)) {
@@ -2293,10 +2306,10 @@ export class TickHub extends DurableObject {
     // Fresh quotes come from the WebSocket; REST is reserved for historical context,
     // explicit /checkall health checks and settlement snapshots.
     const before = {};
-    for (const symbol of FIXED_UNIVERSE) before[symbol] = (this.ticks.get(symbol) || []).length;
+    for (const symbol of SHORT_SHADOW_UNIVERSE) before[symbol] = (this.ticks.get(symbol) || []).length;
     await this.ensureSocket();
     await sleep(ms);
-    const rows = FIXED_UNIVERSE.map(symbol => {
+    const rows = SHORT_SHADOW_UNIVERSE.map(symbol => {
       const arr = this.ticks.get(symbol) || [];
       const last = arr.at(-1);
       return {
@@ -2718,7 +2731,7 @@ export class TickHub extends DurableObject {
 
   async subscribe(symbol) {
     symbol = normalizeSymbol(symbol);
-    if (!symbol || !FIXED_UNIVERSE.includes(symbol)) return false;
+    if (!symbol || !SHORT_SHADOW_UNIVERSE.includes(symbol)) return false;
 
     if (!this.symbols.has(symbol)) {
       this.symbols.add(symbol);
@@ -2753,7 +2766,7 @@ export class TickHub extends DurableObject {
   captureSampledMinuteBars() {
     const currentMinute = Math.floor(Date.now() / 60000) * 60000;
     let changed = false;
-    for (const symbol of FIXED_UNIVERSE) {
+    for (const symbol of SHORT_SHADOW_UNIVERSE) {
       const arr = this.ticks.get(symbol) || [];
       if (!arr.length) continue;
       const sampled = buildBars(arr, 60).filter(b => Number(b.t) <= currentMinute);
@@ -3730,7 +3743,7 @@ export class TickHub extends DurableObject {
     const entryPrice = Number(body?.entryPrice);
     const entryAt = Number(body?.entryAt) || Date.now();
 
-    if (!symbol || !FIXED_UNIVERSE.includes(symbol)) {
+    if (!symbol || !SHORT_SHADOW_UNIVERSE.includes(symbol)) {
       return { ok: false, error: "invalid short-shadow symbol" };
     }
 
@@ -3970,7 +3983,7 @@ export class TickHub extends DurableObject {
   async evaluateShortShadow(symbol) {
     symbol = normalizeSymbol(symbol);
 
-    if (!symbol || !FIXED_UNIVERSE.includes(symbol)) {
+    if (!symbol || !SHORT_SHADOW_UNIVERSE.includes(symbol)) {
       return {
         ok: false,
         error: "invalid short-shadow symbol"
@@ -4577,7 +4590,7 @@ async function scanShortShadowUniverse(env) {
   const checked = [];
   const captured = [];
 
-  for (const symbol of FIXED_UNIVERSE) {
+  for (const symbol of SHORT_SHADOW_UNIVERSE) {
     try {
       const result = await hub(
         env,
@@ -5047,7 +5060,7 @@ export default {
             `Tiingo REST quota: ${quota}\n\n` +
 
             `SHORT-EXPIRY SHADOW\n` +
-            `Pairs checked last scan: ${Number(r.shortShadowChecked || 0)}/${FIXED_UNIVERSE.length}\n` +
+            `Pairs checked last scan: ${Number(r.shortShadowChecked || 0)}/${SHORT_SHADOW_UNIVERSE.length}\n` +
             `Setups captured last scan: ${Number(r.shortShadowCaptured || 0)}\n` +
             `Captured pairs: ${Array.isArray(r.shortShadowSymbols) &&
               r.shortShadowSymbols.length
