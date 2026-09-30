@@ -3685,34 +3685,58 @@ export class TickHub extends DurableObject {
       ? state.history
       : [];
 
-    const records = [...history, ...pending];
+    const records = [
+      ...history,
+      ...pending
+    ];
 
-    const summarize = key => {
-      const terminal = ["WIN", "LOSS", "DRAW", "VOID"];
 
-      const settled = records.filter(x =>
+    const summarizeSubset = (items, key) => {
+      const terminal = [
+        "WIN",
+        "LOSS",
+        "DRAW",
+        "VOID"
+      ];
+
+      const settled = items.filter(x =>
         terminal.includes(
-          String(x?.[key] || "").toUpperCase()
+          String(
+            x?.[key] || ""
+          ).toUpperCase()
         )
       );
 
       const wins = settled.filter(
-        x => String(x?.[key] || "").toUpperCase() === "WIN"
+        x =>
+          String(
+            x?.[key] || ""
+          ).toUpperCase() === "WIN"
       ).length;
 
       const losses = settled.filter(
-        x => String(x?.[key] || "").toUpperCase() === "LOSS"
+        x =>
+          String(
+            x?.[key] || ""
+          ).toUpperCase() === "LOSS"
       ).length;
 
       const draws = settled.filter(
-        x => String(x?.[key] || "").toUpperCase() === "DRAW"
+        x =>
+          String(
+            x?.[key] || ""
+          ).toUpperCase() === "DRAW"
       ).length;
 
       const voids = settled.filter(
-        x => String(x?.[key] || "").toUpperCase() === "VOID"
+        x =>
+          String(
+            x?.[key] || ""
+          ).toUpperCase() === "VOID"
       ).length;
 
-      const wl = wins + losses;
+      const wl =
+        wins + losses;
 
       return {
         settled: settled.length,
@@ -3720,20 +3744,263 @@ export class TickHub extends DurableObject {
         losses,
         draws,
         voids,
-        winRate: wl > 0
-          ? (wins / wl) * 100
-          : null
+
+        winRate:
+          wl > 0
+            ? (wins / wl) * 100
+            : null
       };
     };
 
+
+    const summarize = key =>
+      summarizeSubset(
+        records,
+        key
+      );
+
+
+    // -------------------------------------------------
+    // PERFORMANCE BY PAIR
+    // -------------------------------------------------
+
+    const byPair = {};
+
+    for (
+      const symbol
+      of SHORT_SHADOW_UNIVERSE
+    ) {
+      const pairRecords =
+        records.filter(
+          x =>
+            x?.symbol === symbol
+        );
+
+      const pairPending =
+        pending.filter(
+          x =>
+            x?.symbol === symbol
+        ).length;
+
+      byPair[symbol] = {
+        pending: pairPending,
+
+        expiry60:
+          summarizeSubset(
+            pairRecords,
+            "result60"
+          ),
+
+        expiry120:
+          summarizeSubset(
+            pairRecords,
+            "result120"
+          )
+      };
+    }
+
+
+    // -------------------------------------------------
+    // PERFORMANCE BY DIRECTION
+    // -------------------------------------------------
+
+    const byDirection = {};
+
+    for (
+      const direction
+      of ["CALL", "PUT"]
+    ) {
+      const directionRecords =
+        records.filter(
+          x =>
+            String(
+              x?.direction || ""
+            ).toUpperCase() ===
+            direction
+        );
+
+      const directionPending =
+        pending.filter(
+          x =>
+            String(
+              x?.direction || ""
+            ).toUpperCase() ===
+            direction
+        ).length;
+
+      byDirection[direction] = {
+        pending:
+          directionPending,
+
+        expiry60:
+          summarizeSubset(
+            directionRecords,
+            "result60"
+          ),
+
+        expiry120:
+          summarizeSubset(
+            directionRecords,
+            "result120"
+          )
+      };
+    }
+
+
+    // -------------------------------------------------
+    // CAPTURE CLUSTERS
+    // Same-minute captures help identify correlated
+    // multi-pair bursts.
+    // -------------------------------------------------
+
+    const clusterMap =
+      new Map();
+
+    for (const rec of records) {
+      const entryAt =
+        Number(rec?.entryAt);
+
+      if (
+        !Number.isFinite(entryAt)
+      ) {
+        continue;
+      }
+
+      const minute =
+        Math.floor(
+          entryAt / 60000
+        ) * 60000;
+
+      const list =
+        clusterMap.get(minute) || [];
+
+      list.push({
+        symbol:
+          rec.symbol,
+
+        direction:
+          rec.direction,
+
+        entryAt
+      });
+
+      clusterMap.set(
+        minute,
+        list
+      );
+    }
+
+
+    const clusterRows =
+      [...clusterMap.entries()]
+        .map(
+          ([minute, setups]) => ({
+            minute,
+
+            count:
+              setups.length,
+
+            symbols: [
+              ...new Set(
+                setups.map(
+                  x => x.symbol
+                )
+              )
+            ],
+
+            directions:
+              setups.reduce(
+                (acc, x) => {
+                  const d =
+                    String(
+                      x.direction || ""
+                    ).toUpperCase();
+
+                  if (d === "CALL") {
+                    acc.CALL++;
+                  } else if (
+                    d === "PUT"
+                  ) {
+                    acc.PUT++;
+                  }
+
+                  return acc;
+                },
+                {
+                  CALL: 0,
+                  PUT: 0
+                }
+              )
+          })
+        )
+        .sort(
+          (a, b) =>
+            Number(b.minute) -
+            Number(a.minute)
+        );
+
+
+    const clusterStats = {
+      totalClusters:
+        clusterRows.length,
+
+      multiSetupClusters:
+        clusterRows.filter(
+          x =>
+            x.count > 1
+        ).length,
+
+      maxClusterSize:
+        clusterRows.length
+          ? Math.max(
+            ...clusterRows.map(
+              x => x.count
+            )
+          )
+          : 0,
+
+      recent:
+        clusterRows.slice(
+          0,
+          10
+        )
+    };
+
+
     return {
       ok: true,
-      strategyId: SHORT_SHADOW_ID,
-      startedAt: state.startedAt || null,
-      pending: pending.length,
-      expiry60: summarize("result60"),
-      expiry120: summarize("result120"),
-      recent: history.slice(0, 20)
+
+      strategyId:
+        SHORT_SHADOW_ID,
+
+      startedAt:
+        state.startedAt || null,
+
+      pending:
+        pending.length,
+
+      expiry60:
+        summarize(
+          "result60"
+        ),
+
+      expiry120:
+        summarize(
+          "result120"
+        ),
+
+      byPair,
+
+      byDirection,
+
+      clusters:
+        clusterStats,
+
+      recent:
+        history.slice(
+          0,
+          20
+        )
     };
   }
 
