@@ -1378,6 +1378,103 @@ console.log("Test 17: Cruz UTC market-window statistics");
 console.log();
 
 // -----------------------------------------------------------------------------
+// Test 18: Failed settlement snapshot must not strand short-expiry records
+// -----------------------------------------------------------------------------
+console.log(
+  "Test 18: Failed settlement snapshot cannot strand short-expiry records"
+);
+
+{
+  const storage = new MockStorage();
+  const ctx = new MockCtx(storage);
+
+  const hub = new TickHub(ctx, {
+    WS_SYMBOLS: "EUR/USD"
+  });
+
+  await ctx.waitForInit();
+
+  const now = Date.now();
+
+  hub.shortShadowState = {
+    strategyId: SHORT_SHADOW_ID,
+    startedAt: now - 300000,
+
+    pending: [
+      {
+        id: "snapshot-failure-test",
+        sourceKey: "snapshot-failure-test",
+        strategyId: SHORT_SHADOW_ID,
+
+        symbol: "EUR/USD",
+        direction: "CALL",
+
+        entryPrice: 1.1000,
+        entryAt: now - 180000,
+
+        expiry60At: now - 120000,
+        expiry120At: now - 60000,
+
+        result60: null,
+        result120: null,
+
+        exit60Price: null,
+        exit120Price: null,
+
+        exit60TickAt: null,
+        exit120TickAt: null
+      }
+    ],
+
+    history: []
+  };
+
+  await storage.put(
+    "shortShadowState",
+    hub.shortShadowState
+  );
+
+
+  let snapshotAttempted = false;
+
+  hub.fetchTopSnapshots =
+    async () => {
+      snapshotAttempted = true;
+
+      throw new Error(
+        "synthetic settlement snapshot failure"
+      );
+    };
+
+
+  await hub.alarm();
+
+
+  assert(
+    snapshotAttempted,
+    "Settlement snapshot failure path was exercised"
+  );
+
+  assert(
+    hub.shortShadowState.pending.length === 0,
+    "Overdue short-expiry record is not left pending after snapshot failure"
+  );
+
+  assert(
+    hub.shortShadowState.history.length === 1,
+    "Completed overdue record moves into short-shadow history"
+  );
+
+  assert(
+    hub.shortShadowState.history[0].result60 === "VOID" &&
+    hub.shortShadowState.history[0].result120 === "VOID",
+    "Both overdue expiries settle VOID when no expiry tick is available"
+  );
+}
+
+console.log();
+
+// -----------------------------------------------------------------------------
 // Summary
 // -----------------------------------------------------------------------------
 console.log(`=======================================================`);

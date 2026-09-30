@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.6.9-cruz-pending-health";
+export const VERSION = "13.6.10-cruz-settlement-repair";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -2498,16 +2498,26 @@ export class TickHub extends DurableObject {
       ];
 
       if (dueSymbols.length) {
-        await this.fetchTopSnapshots(
-          dueSymbols
-        );
+        try {
+          await this.fetchTopSnapshots(
+            dueSymbols
+          );
+        } catch (e) {
+          this.lastStatus =
+            `settlement snapshot error: ${String(
+              e?.message || e
+            )}`;
+        }
       }
+
+      // Settlement must still run even when
+      // the fresh snapshot request fails.
 
       // Existing 5-minute settlement
       await this.settlePendingSignals();
 
       // Independent short-expiry settlement
-      await this.settleShortShadow();
+      await this.settleShortShadow(now);
 
     } catch (e) {
       this.lastStatus =
