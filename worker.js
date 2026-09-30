@@ -4127,6 +4127,55 @@ export class TickHub extends DurableObject {
         )
     };
 
+    const fullySettledClusters =
+      Math.min(
+        Number(
+          clusterAdjusted.expiry60
+            ?.settledClusters || 0
+        ),
+        Number(
+          clusterAdjusted.expiry120
+            ?.settledClusters || 0
+        )
+      );
+
+
+    const evidence = {
+      settledClusters:
+        fullySettledClusters,
+
+      minimumTarget:
+        50,
+
+      preferredTarget:
+        100,
+
+      minimumProgressPct:
+        Math.min(
+          100,
+          (
+            fullySettledClusters /
+            50
+          ) * 100
+        ),
+
+      preferredProgressPct:
+        Math.min(
+          100,
+          (
+            fullySettledClusters /
+            100
+          ) * 100
+        ),
+
+      status:
+        fullySettledClusters >= 100
+          ? "preferred target reached"
+          : fullySettledClusters >= 50
+            ? "minimum target reached"
+            : "collecting"
+    };
+
     return {
       ok: true,
 
@@ -4157,7 +4206,7 @@ export class TickHub extends DurableObject {
         clusterStats,
 
       clusterAdjusted,
-
+      evidence,
       recent:
         history.slice(
           0,

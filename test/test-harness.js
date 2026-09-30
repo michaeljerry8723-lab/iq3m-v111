@@ -487,6 +487,53 @@ console.log(`Test 9: Short-expiry shadow statistics`);
     Math.abs(stats.expiry120.winRate - (2 / 3) * 100) < 0.001,
     `120s W/L win rate: ${stats.expiry120.winRate}`
   );
+
+  assert(
+    stats.clusterAdjusted.expiry60.settledClusters === 2,
+    `60s cluster-adjusted settled clusters: ${stats.clusterAdjusted.expiry60.settledClusters}`
+  );
+
+  assert(
+    Math.abs(
+      stats.clusterAdjusted.expiry60.equalClusterWinRate - 50
+    ) < 0.001,
+    `60s equal-cluster win rate: ${stats.clusterAdjusted.expiry60.equalClusterWinRate}`
+  );
+
+  assert(
+    stats.clusterAdjusted.expiry120.scoredClusters === 2,
+    `120s scored clusters: ${stats.clusterAdjusted.expiry120.scoredClusters}`
+  );
+
+  assert(
+    Math.abs(
+      stats.clusterAdjusted.expiry120.equalClusterWinRate - 50
+    ) < 0.001,
+    `120s equal-cluster win rate: ${stats.clusterAdjusted.expiry120.equalClusterWinRate}`
+  );
+
+  assert(
+    stats.evidence.settledClusters === 2,
+    `Evidence counter sees 2 fully settled clusters: ${stats.evidence.settledClusters}`
+  );
+
+  assert(
+    stats.evidence.minimumTarget === 50 &&
+    stats.evidence.preferredTarget === 100,
+    "Evidence targets are 50 minimum and 100 preferred clusters"
+  );
+
+  assert(
+    Math.abs(
+      stats.evidence.minimumProgressPct - 4
+    ) < 0.001,
+    `Minimum evidence progress: ${stats.evidence.minimumProgressPct}%`
+  );
+
+  assert(
+    stats.evidence.status === "collecting",
+    `Evidence status is collecting: ${stats.evidence.status}`
+  );
 }
 console.log();
 
