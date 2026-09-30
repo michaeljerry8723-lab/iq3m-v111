@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.6.7-cruz-cluster-session-stats";
+export const VERSION = "13.6.9-cruz-pending-health";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -3685,6 +3685,57 @@ export class TickHub extends DurableObject {
       ? state.history
       : [];
 
+    const now =
+      Date.now();
+
+    const pendingHealth = {
+      total:
+        pending.length,
+
+      due60:
+        pending.filter(
+          x =>
+            Number(x?.expiry60At || 0) > 0 &&
+            now >= Number(x.expiry60At)
+        ).length,
+
+      due120:
+        pending.filter(
+          x =>
+            Number(x?.expiry120At || 0) > 0 &&
+            now >= Number(x.expiry120At)
+        ).length,
+
+      overdue120:
+        pending.filter(
+          x =>
+            Number(x?.expiry120At || 0) > 0 &&
+            now >
+            Number(x.expiry120At) +
+            15000
+        ).length,
+
+      oldestAgeSeconds:
+        pending.length
+          ? Math.max(
+            ...pending.map(
+              x =>
+                Number.isFinite(
+                  Number(x?.entryAt)
+                )
+                  ? Math.max(
+                    0,
+                    (
+                      now -
+                      Number(x.entryAt)
+                    ) / 1000
+                  )
+                  : 0
+            )
+          )
+          : 0
+    };
+
     const records = [
       ...history,
       ...pending
@@ -4297,6 +4348,8 @@ export class TickHub extends DurableObject {
 
       pending:
         pending.length,
+
+      pendingHealth,
 
       expiry60:
         summarize(
@@ -5617,6 +5670,14 @@ export default {
                   adjusted120.equalClusterWinRate
                 ).toFixed(1) + "%";
 
+            const pendingHealth =
+              st.pendingHealth || {};
+
+            const oldestPendingAge =
+              Number(
+                pendingHealth.oldestAgeSeconds || 0
+              ).toFixed(0);
+
             const evidence =
               st.evidence || {};
 
@@ -5651,6 +5712,13 @@ export default {
               `SHORT-EXPIRY SHADOW\n` +
               `Strategy: ${st.strategyId}\n` +
               `Pending setups: ${st.pending || 0}\n\n` +
+
+              `PENDING HEALTH\n` +
+              `Total: ${pendingHealth.total || 0}\n` +
+              `Due 60s: ${pendingHealth.due60 || 0}\n` +
+              `Due 120s: ${pendingHealth.due120 || 0}\n` +
+              `Overdue >15s: ${pendingHealth.overdue120 || 0}\n` +
+              `Oldest age: ${oldestPendingAge}s\n\n` +
 
               `60 SECOND\n` +
               `Settled: ${st.expiry60?.settled || 0}\n` +
