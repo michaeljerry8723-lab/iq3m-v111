@@ -3881,7 +3881,13 @@ export class TickHub extends DurableObject {
         direction:
           rec.direction,
 
-        entryAt
+        entryAt,
+
+        result60:
+          rec.result60 || null,
+
+        result120:
+          rec.result120 || null
       });
 
       clusterMap.set(
@@ -3966,6 +3972,160 @@ export class TickHub extends DurableObject {
         )
     };
 
+    const summarizeClusterPerformance = key => {
+      const terminal = [
+        "WIN",
+        "LOSS",
+        "DRAW",
+        "VOID"
+      ];
+
+      const rows =
+        [...clusterMap.entries()]
+          .map(([minute, setups]) => {
+            const settled =
+              setups.filter(x =>
+                terminal.includes(
+                  String(
+                    x?.[key] || ""
+                  ).toUpperCase()
+                )
+              );
+
+            const wins =
+              settled.filter(
+                x =>
+                  String(
+                    x?.[key] || ""
+                  ).toUpperCase() === "WIN"
+              ).length;
+
+            const losses =
+              settled.filter(
+                x =>
+                  String(
+                    x?.[key] || ""
+                  ).toUpperCase() === "LOSS"
+              ).length;
+
+            const draws =
+              settled.filter(
+                x =>
+                  String(
+                    x?.[key] || ""
+                  ).toUpperCase() === "DRAW"
+              ).length;
+
+            const voids =
+              settled.filter(
+                x =>
+                  String(
+                    x?.[key] || ""
+                  ).toUpperCase() === "VOID"
+              ).length;
+
+            const wl =
+              wins + losses;
+
+            return {
+              minute,
+
+              setupCount:
+                setups.length,
+
+              settled:
+                settled.length,
+
+              wins,
+              losses,
+              draws,
+              voids,
+
+              wl,
+
+              winRate:
+                wl > 0
+                  ? (wins / wl) * 100
+                  : null
+            };
+          })
+          .filter(
+            x =>
+              x.settled > 0
+          )
+          .sort(
+            (a, b) =>
+              Number(b.minute) -
+              Number(a.minute)
+          );
+
+
+      const scored =
+        rows.filter(
+          x => x.wl > 0
+        );
+
+
+      const equalClusterWinRate =
+        scored.length
+          ? scored.reduce(
+            (sum, x) =>
+              sum + Number(x.winRate),
+            0
+          ) / scored.length
+          : null;
+
+
+      return {
+        settledClusters:
+          rows.length,
+
+        scoredClusters:
+          scored.length,
+
+        winningClusters:
+          scored.filter(
+            x =>
+              x.wins > x.losses
+          ).length,
+
+        losingClusters:
+          scored.filter(
+            x =>
+              x.losses > x.wins
+          ).length,
+
+        tiedClusters:
+          scored.filter(
+            x =>
+              x.wins === x.losses
+          ).length,
+
+        multiSetupClusters:
+          rows.filter(
+            x =>
+              x.setupCount > 1
+          ).length,
+
+        equalClusterWinRate,
+
+        recent:
+          rows.slice(0, 10)
+      };
+    };
+
+
+    const clusterAdjusted = {
+      expiry60:
+        summarizeClusterPerformance(
+          "result60"
+        ),
+
+      expiry120:
+        summarizeClusterPerformance(
+          "result120"
+        )
+    };
 
     return {
       ok: true,
@@ -3995,6 +4155,8 @@ export class TickHub extends DurableObject {
 
       clusters:
         clusterStats,
+
+      clusterAdjusted,
 
       recent:
         history.slice(

@@ -406,6 +406,7 @@ console.log(`Test 9: Short-expiry shadow statistics`);
   const storage = new MockStorage();
   const ctx = new MockCtx(storage);
   const hub = new TickHub(ctx, { WS_SYMBOLS: "EUR/USD" });
+  const clusterBase = Date.now() - 10 * 60000;
 
   hub.shortShadowState = {
     strategyId: SHORT_SHADOW_ID,
@@ -421,17 +422,20 @@ console.log(`Test 9: Short-expiry shadow statistics`);
       {
         symbol: "EUR/USD",
         result60: "WIN",
-        result120: "WIN"
+        result120: "WIN",
+        entryAt: clusterBase
       },
       {
         symbol: "GBP/USD",
         result60: "LOSS",
-        result120: "WIN"
+        result120: "WIN",
+        entryAt: clusterBase
       },
       {
         symbol: "USD/JPY",
         result60: "DRAW",
-        result120: "LOSS"
+        result120: "LOSS",
+        entryAt: clusterBase + 60000
       }
     ]
   };
