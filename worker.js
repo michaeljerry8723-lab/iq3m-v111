@@ -1240,17 +1240,67 @@ export class TickHub extends DurableObject {
 
   async scheduleAlarm() {
     const now = Date.now();
-    if (!this.pendingSignals.length) {
-      try { await this.ctx.storage.deleteAlarm(); } catch (_) { }
+
+    const shortPending =
+      this.shortShadowState?.pending || [];
+
+    if (
+      !this.pendingSignals.length &&
+      !shortPending.length
+    ) {
+      try {
+        await this.ctx.storage.deleteAlarm();
+      } catch (_) { }
+
       return;
     }
+
     let next = Infinity;
+
+    // Existing 5-minute settlements
     for (const p of this.pendingSignals) {
       const exp = Number(p.expiresAt || 0);
-      if (exp > now) next = Math.min(next, exp);
-      else next = Math.min(next, now + 250);
+
+      if (exp > now) {
+        next = Math.min(next, exp);
+      } else {
+        next = Math.min(next, now + 250);
+      }
     }
-    await this.ctx.storage.setAlarm(Math.max(now + 250, Number.isFinite(next) ? next : now + 1000));
+
+    // Experimental 60s / 120s settlements
+    for (const p of shortPending) {
+      if (!p.result60) {
+        const exp60 = Number(p.expiry60At || 0);
+
+        next = Math.min(
+          next,
+          exp60 > now
+            ? exp60
+            : now + 2000
+        );
+      }
+
+      if (!p.result120) {
+        const exp120 = Number(p.expiry120At || 0);
+
+        next = Math.min(
+          next,
+          exp120 > now
+            ? exp120
+            : now + 2000
+        );
+      }
+    }
+
+    await this.ctx.storage.setAlarm(
+      Math.max(
+        now + 250,
+        Number.isFinite(next)
+          ? next
+          : now + 1000
+      )
+    );
   }
 
   async fetchTopSnapshots(symbols = []) {
@@ -1445,13 +1495,61 @@ export class TickHub extends DurableObject {
   async alarm() {
     try {
       const now = Date.now();
-      const due = this.pendingSignals.filter(x => Number(x.expiresAt || 0) <= now + 2000).map(x => x.symbol);
-      if (due.length) await this.fetchTopSnapshots(due);
+
+      const normalDue = this.pendingSignals
+        .filter(
+          x =>
+            Number(x.expiresAt || 0) <=
+            now + 2000
+        )
+        .map(x => x.symbol);
+
+      const shortDue = (
+        this.shortShadowState?.pending || []
+      )
+        .filter(x =>
+          (
+            !x.result60 &&
+            Number(x.expiry60At || 0) <=
+            now + 2000
+          ) ||
+          (
+            !x.result120 &&
+            Number(x.expiry120At || 0) <=
+            now + 2000
+          )
+        )
+        .map(x => x.symbol);
+
+      const dueSymbols = [
+        ...new Set([
+          ...normalDue,
+          ...shortDue
+        ])
+      ];
+
+      if (dueSymbols.length) {
+        await this.fetchTopSnapshots(
+          dueSymbols
+        );
+      }
+
+      // Existing 5-minute settlement
       await this.settlePendingSignals();
+
+      // Independent short-expiry settlement
+      await this.settleShortShadow();
+
     } catch (e) {
-      this.lastStatus = `alarm error: ${String(e?.message || e)}`;
+      this.lastStatus =
+        `alarm error: ${String(
+          e?.message || e
+        )}`;
     } finally {
-      await this.closeFeeds("alarm complete");
+      await this.closeFeeds(
+        "alarm complete"
+      );
+
       await this.scheduleAlarm();
     }
   }

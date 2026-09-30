@@ -570,6 +570,84 @@ console.log(`Test 10: Short-expiry dual settlement`);
 console.log();
 
 // -----------------------------------------------------------------------------
+// Test 11: Short-expiry alarm scheduling
+// -----------------------------------------------------------------------------
+console.log(`Test 11: Short-expiry alarm scheduling`);
+{
+  const storage = new MockStorage();
+  const ctx = new MockCtx(storage);
+
+  const hub = new TickHub(ctx, {
+    WS_SYMBOLS: "EUR/USD"
+  });
+
+  await ctx.waitForInit();
+
+  const now = Date.now();
+
+  hub.pendingSignals = [];
+
+  hub.shortShadowState = {
+    strategyId: SHORT_SHADOW_ID,
+    startedAt: now,
+    history: [],
+    pending: [
+      {
+        id: "alarm-short-1",
+        symbol: "EUR/USD",
+        direction: "CALL",
+        entryPrice: 1.10000,
+        entryAt: now,
+        expiry60At: now + 60000,
+        expiry120At: now + 120000,
+        result60: null,
+        result120: null
+      }
+    ]
+  };
+
+  await hub.scheduleAlarm();
+
+  const firstAlarm =
+    await storage.getAlarm();
+
+  assert(
+    Number.isFinite(firstAlarm),
+    "Short-shadow pending setup creates an alarm"
+  );
+
+  assert(
+    firstAlarm >= now + 59000 &&
+    firstAlarm <= now + 61000,
+    "First alarm targets the 60-second expiry"
+  );
+
+  hub.shortShadowState.pending[0].result60 =
+    "WIN";
+
+  await hub.scheduleAlarm();
+
+  const secondAlarm =
+    await storage.getAlarm();
+
+  assert(
+    secondAlarm >= now + 119000 &&
+    secondAlarm <= now + 121000,
+    "After 60s settlement, alarm advances to 120s expiry"
+  );
+
+  hub.shortShadowState.pending = [];
+
+  await hub.scheduleAlarm();
+
+  assert(
+    (await storage.getAlarm()) === null,
+    "Alarm clears when no normal or short-expiry settlements remain"
+  );
+}
+console.log();
+
+// -----------------------------------------------------------------------------
 // Summary
 // -----------------------------------------------------------------------------
 console.log(`=======================================================`);
