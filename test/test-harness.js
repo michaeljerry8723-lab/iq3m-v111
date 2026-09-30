@@ -20,6 +20,7 @@ import {
   A_GRADE_MIN_QUALITY,
   score5m,
   preAlert5m,
+  scoreShortExpiryShadow,
   setupSequenceSnapshot,
   classifyBlocker,
   TickHub
@@ -643,6 +644,93 @@ console.log(`Test 11: Short-expiry alarm scheduling`);
   assert(
     (await storage.getAlarm()) === null,
     "Alarm clears when no normal or short-expiry settlements remain"
+  );
+}
+console.log();
+
+// -----------------------------------------------------------------------------
+// Test 12: Short-expiry directional detector
+// -----------------------------------------------------------------------------
+console.log(`Test 12: Short-expiry directional detector`);
+{
+  const now = Date.now();
+
+  const callBars = createBars({
+    count: 90,
+    direction: "CALL",
+    withPullback: true,
+    withContinuation: true,
+    now
+  });
+
+  const callTicks = createTicks({
+    lastPrice: Number(callBars.at(-1).c),
+    direction: "CALL",
+    count: 24,
+    aligned: true,
+    now
+  });
+
+  const call =
+    scoreShortExpiryShadow(
+      callTicks,
+      callBars,
+      "EUR/USD"
+    );
+
+  assert(
+    call.ok,
+    `Short-expiry CALL qualifies: ${call.reason || "qualified"}`
+  );
+
+  assert(
+    call.direction === "CALL",
+    `Short-expiry direction CALL: ${call.direction}`
+  );
+
+  assert(
+    Array.isArray(call.expiryCandidates) &&
+    call.expiryCandidates.includes(60) &&
+    call.expiryCandidates.includes(120),
+    "Short detector evaluates both 60s and 120s"
+  );
+
+  assert(
+    call.quality >= 0.86,
+    `Short CALL quality: ${call.quality}`
+  );
+
+  const putBars = createBars({
+    count: 90,
+    direction: "PUT",
+    withPullback: true,
+    withContinuation: true,
+    now
+  });
+
+  const putTicks = createTicks({
+    lastPrice: Number(putBars.at(-1).c),
+    direction: "PUT",
+    count: 24,
+    aligned: true,
+    now
+  });
+
+  const put =
+    scoreShortExpiryShadow(
+      putTicks,
+      putBars,
+      "GBP/USD"
+    );
+
+  assert(
+    put.ok,
+    `Short-expiry PUT qualifies: ${put.reason || "qualified"}`
+  );
+
+  assert(
+    put.direction === "PUT",
+    `Short-expiry direction PUT: ${put.direction}`
   );
 }
 console.log();

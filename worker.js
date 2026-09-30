@@ -10,6 +10,7 @@ export const SHORT_SHADOW_MAX_PENDING = 250;
 export const SHORT_SHADOW_MAX_HISTORY = 1000;
 export const CRYPTO_SYMBOLS = new Set();
 export const A_GRADE_MIN_QUALITY = 0.895;
+export const SHORT_SHADOW_MIN_QUALITY = 0.86;
 export const EXPIRY_SECONDS = 300;
 export const BLOCKER_CLASSIFIER_VERSION = "v3-detailed-5m";
 export const STRATEGY_ID = "v13.6-signal-only";
@@ -613,6 +614,291 @@ function completedTickBars(ticks, seconds) {
   const span = seconds * 1000;
   const current = Math.floor(Date.now() / span) * span;
   return buildBars(ticks, seconds).filter(b => Number(b.t) < current);
+}
+
+export function scoreShortExpiryShadow(ticks, bars1m, symbol) {
+  const sma = smaTrendSnapshot(bars1m, 3, 8);
+  const macd = macdSnapshot(bars1m, 3, 8, 3);
+  const rsi = rsiSnapshot(bars1m, 7);
+  const dmi = dmiAdxSnapshot(bars1m, 7);
+  const pressure = candlePressure(bars1m, 2);
+  const atr = atrSnapshot(bars1m, 14);
+  const impulse = tickImpulse(ticks);
+
+  if (
+    !sma.ready ||
+    !macd.ready ||
+    !rsi.ready ||
+    !dmi.ready ||
+    !pressure.ready ||
+    !atr.ready ||
+    !impulse.ready
+  ) {
+    return {
+      ok: false,
+      reason: "short-expiry context is still building"
+    };
+  }
+
+  const lastBar = bars1m.at(-1);
+  const last = Number(ticks.at(-1)?.p);
+
+  if (!lastBar || !Number.isFinite(last)) {
+    return {
+      ok: false,
+      reason: "short-expiry live price unavailable"
+    };
+  }
+
+  const spread = spreadQualitySnapshot(
+    symbol,
+    ticks,
+    last,
+    atr.atr
+  );
+
+  if (spread.abnormal) {
+    return {
+      ok: false,
+      reason: "spread is abnormal for short-expiry entry"
+    };
+  }
+
+  let direction = "NEUTRAL";
+
+  if (
+    sma.fast > sma.slow &&
+    sma.fastSlope > 0
+  ) {
+    direction = "CALL";
+  }
+
+  if (
+    sma.fast < sma.slow &&
+    sma.fastSlope < 0
+  ) {
+    direction = "PUT";
+  }
+
+  if (direction === "NEUTRAL") {
+    return {
+      ok: false,
+      reason: "1m fast trend is not directional"
+    };
+  }
+
+  const continuation =
+    direction === "CALL"
+      ? (
+        Number(lastBar.c) > Number(lastBar.o) &&
+        Number(lastBar.c) > sma.fast
+      )
+      : (
+        Number(lastBar.c) < Number(lastBar.o) &&
+        Number(lastBar.c) < sma.fast
+      );
+
+  if (!continuation) {
+    return {
+      ok: false,
+      reason: "fresh 1m continuation candle missing"
+    };
+  }
+
+  const efficiency =
+    efficiencyRatio(bars1m, 5);
+
+  if (efficiency < 0.12) {
+    return {
+      ok: false,
+      reason:
+        `short-expiry efficiency ${efficiency.toFixed(3)} below 0.120`
+    };
+  }
+
+  const extensionAtr =
+    Math.abs(last - sma.fast) / atr.atr;
+
+  if (extensionAtr > 1.75) {
+    return {
+      ok: false,
+      reason:
+        `short-expiry entry extended ${extensionAtr.toFixed(2)} ATR`
+    };
+  }
+
+  const macdAligned =
+    direction === "CALL"
+      ? (
+        macd.macd > macd.signal &&
+        macd.hist > 0
+      )
+      : (
+        macd.macd < macd.signal &&
+        macd.hist < 0
+      );
+
+  const rsiAligned =
+    direction === "CALL"
+      ? rsi.rsi >= 50 && rsi.rsi <= 78
+      : rsi.rsi <= 50 && rsi.rsi >= 22;
+
+  const dmiGap =
+    Math.abs(dmi.plusDI - dmi.minusDI);
+
+  const dmiAligned =
+    direction === "CALL"
+      ? dmi.plusDI > dmi.minusDI
+      : dmi.minusDI > dmi.plusDI;
+
+  const dmiStrong =
+    dmiAligned &&
+    dmi.adx >= 16 &&
+    dmiGap >= 3;
+
+  const pressureAligned =
+    direction === "CALL"
+      ? pressure.bull >= 1
+      : pressure.bear >= 1;
+
+  const tickAligned =
+    direction === "CALL"
+      ? (
+        impulse.upRatio >= 0.57 &&
+        impulse.norm >= 0.08
+      )
+      : (
+        impulse.downRatio >= 0.57 &&
+        impulse.norm <= -0.08
+      );
+
+  if (!tickAligned) {
+    return {
+      ok: false,
+      reason: "live tick burst does not confirm short-expiry direction"
+    };
+  }
+
+  const confirmations = {
+    macd: macdAligned,
+    rsi: rsiAligned,
+    dmi: dmiStrong,
+    pressure: pressureAligned
+  };
+
+  const confirmationCount =
+    Object.values(confirmations)
+      .filter(Boolean)
+      .length;
+
+  if (confirmationCount < 3) {
+    return {
+      ok: false,
+      reason:
+        `short-expiry momentum ${confirmationCount}/4 — need at least 3/4`,
+      confirmations
+    };
+  }
+
+  // Broader 5m context is a veto only.
+  // It does not create the 1–2 minute signal.
+  const b5 =
+    aggregateOhlcBars(bars1m, 300);
+
+  const broad =
+    trendRegime(b5, 3, 8, 0.12);
+
+  if (
+    broad.ready &&
+    broad.direction !== "NEUTRAL" &&
+    broad.direction !== direction &&
+    broad.efficiency >= 0.30
+  ) {
+    return {
+      ok: false,
+      reason: "strong completed 5m trend opposes short-expiry entry"
+    };
+  }
+
+  let quality =
+    0.80 +
+    confirmationCount * 0.025;
+
+  if (efficiency >= 0.25) {
+    quality += 0.015;
+  }
+
+  if (dmi.adx >= 22) {
+    quality += 0.015;
+  }
+
+  if (
+    direction === "CALL"
+      ? impulse.upRatio >= 0.65
+      : impulse.downRatio >= 0.65
+  ) {
+    quality += 0.015;
+  }
+
+  if (
+    broad.ready &&
+    broad.direction === direction
+  ) {
+    quality += 0.015;
+  }
+
+  if (extensionAtr <= 0.80) {
+    quality += 0.01;
+  }
+
+  quality = clamp(
+    quality,
+    0,
+    0.97
+  );
+
+  if (quality < SHORT_SHADOW_MIN_QUALITY) {
+    return {
+      ok: false,
+      reason:
+        `short-expiry quality ${(quality * 100).toFixed(1)}% below threshold`,
+      quality
+    };
+  }
+
+  return {
+    ok: true,
+    strategyId: SHORT_SHADOW_ID,
+    direction,
+    quality,
+
+    expiryCandidates: [60, 120],
+
+    timeframe: "1m",
+
+    efficiency,
+    extensionAtr,
+
+    smaFast: sma.fast,
+    smaSlow: sma.slow,
+    fastSlope: sma.fastSlope,
+
+    rsi: rsi.rsi,
+    adx: dmi.adx,
+    dmiGap,
+
+    tickUpRatio: impulse.upRatio,
+    tickDownRatio: impulse.downRatio,
+    tickNorm: impulse.norm,
+
+    confirmationCount,
+    confirmations,
+
+    broad5m:
+      broad.ready
+        ? broad.direction
+        : "NOT_READY"
+  };
 }
 
 export function score5m(ticks, bars1m, symbol) {
