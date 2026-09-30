@@ -23,6 +23,8 @@ import {
   scoreShortExpiryShadow,
   setupSequenceSnapshot,
   classifyBlocker,
+  cruzIchimokuSnapshot,
+  cruzDmiSnapshot,
   TickHub
 } from "../worker.js";
 
@@ -733,6 +735,114 @@ console.log(`Test 12: Short-expiry directional detector`);
     `Short-expiry direction PUT: ${put.direction}`
   );
 }
+console.log();
+
+// -----------------------------------------------------------------------------
+// Test 13: Cruz Ichimoku + DMI configuration
+// -----------------------------------------------------------------------------
+console.log("Test 13: Cruz Ichimoku + DMI configuration");
+
+{
+  const now = Date.now();
+
+  const makeTrendBars = direction => {
+    const bars = [];
+    let price = 1.10000;
+
+    const step =
+      direction === "CALL"
+        ? 0.00010
+        : -0.00010;
+
+    for (let i = 0; i < 60; i++) {
+      const o = price;
+      const c = price + step;
+
+      const h =
+        Math.max(o, c) + 0.00004;
+
+      const l =
+        Math.min(o, c) - 0.00004;
+
+      bars.push({
+        t: now - (60 - i) * 60000,
+        o,
+        h,
+        l,
+        c,
+        n: 20
+      });
+
+      price = c;
+    }
+
+    return bars;
+  };
+
+  const callBars =
+    makeTrendBars("CALL");
+
+  const putBars =
+    makeTrendBars("PUT");
+
+  const callIchi =
+    cruzIchimokuSnapshot(callBars);
+
+  const putIchi =
+    cruzIchimokuSnapshot(putBars);
+
+  const callDmi =
+    cruzDmiSnapshot(callBars);
+
+  const putDmi =
+    cruzDmiSnapshot(putBars);
+
+  assert(
+    callIchi.ready,
+    "Cruz Ichimoku CALL context ready"
+  );
+
+  assert(
+    putIchi.ready,
+    "Cruz Ichimoku PUT context ready"
+  );
+
+  assert(
+    callIchi.tenkan > callIchi.kijun,
+    "Bull trend has Tenkan above Kijun"
+  );
+
+  assert(
+    putIchi.tenkan < putIchi.kijun,
+    "Bear trend has Tenkan below Kijun"
+  );
+
+  assert(
+    callIchi.tenkanPeriod === 5 &&
+    callIchi.kijunPeriod === 10 &&
+    callIchi.spanBPeriod === 20,
+    "Cruz Ichimoku uses 5/10/20"
+  );
+
+  assert(
+    callDmi.ready &&
+    callDmi.plusDI > callDmi.minusDI,
+    "Bull trend produces +DI dominance"
+  );
+
+  assert(
+    putDmi.ready &&
+    putDmi.minusDI > putDmi.plusDI,
+    "Bear trend produces -DI dominance"
+  );
+
+  assert(
+    callDmi.diLength === 7 &&
+    callDmi.adxSmoothing === 14,
+    "Cruz DMI uses DI 7 / ADX smoothing 14"
+  );
+}
+
 console.log();
 
 // -----------------------------------------------------------------------------
