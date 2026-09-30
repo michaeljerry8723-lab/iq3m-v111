@@ -5430,13 +5430,25 @@ export default {
                   adjusted60.equalClusterWinRate
                 ).toFixed(1) + "%";
 
-
             const adjustedWr120 =
               adjusted120.equalClusterWinRate == null
                 ? "n/a"
                 : Number(
                   adjusted120.equalClusterWinRate
                 ).toFixed(1) + "%";
+
+            const evidence =
+              st.evidence || {};
+
+            const minimumProgress =
+              Number(
+                evidence.minimumProgressPct || 0
+              ).toFixed(1);
+
+            const preferredProgress =
+              Number(
+                evidence.preferredProgressPct || 0
+              ).toFixed(1);
 
             const recentClusters =
               Array.isArray(clusterStats.recent)
@@ -5506,6 +5518,13 @@ export default {
               `Winning: ${adjusted120.winningClusters || 0} | ` +
               `Losing: ${adjusted120.losingClusters || 0} | ` +
               `Tied: ${adjusted120.tiedClusters || 0}\n\n` +
+              `EVIDENCE PROGRESS\n` +
+              `Settled independent clusters: ${evidence.settledClusters || 0}\n` +
+              `Minimum target: ${evidence.minimumTarget || 50}\n` +
+              `Progress to minimum: ${minimumProgress}%\n` +
+              `Preferred target: ${evidence.preferredTarget || 100}\n` +
+              `Progress to preferred: ${preferredProgress}%\n` +
+              `Status: ${evidence.status || "collecting"}\n\n` +
               `${recentClusters
                 ? `Recent clusters:\n${recentClusters}\n\n`
                 : "\n"
