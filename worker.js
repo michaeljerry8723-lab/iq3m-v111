@@ -3599,43 +3599,6 @@ export class TickHub extends DurableObject {
     if (u.pathname === "/chats") return json(await this.getAlertChats());
     if (u.pathname === "/track" && req.method === "POST") return json(await this.trackSignal(req));
     if (u.pathname === "/stats") return json(await this.getTrackingStats());
-    if (/^\/shortstats$/i.test(text)) {
-      const st = await hub(env, "/shortstats");
-
-      const wr60 = st.expiry60?.winRate == null
-        ? "n/a"
-        : Number(st.expiry60.winRate).toFixed(1) + "%";
-
-      const wr120 = st.expiry120?.winRate == null
-        ? "n/a"
-        : Number(st.expiry120.winRate).toFixed(1) + "%";
-
-      await tgSend(
-        env,
-        chatId,
-        `SHORT-EXPIRY SHADOW\n` +
-        `Strategy: ${st.strategyId}\n` +
-        `Pending setups: ${st.pending || 0}\n\n` +
-
-        `60 SECOND\n` +
-        `Settled: ${st.expiry60?.settled || 0}\n` +
-        `Wins: ${st.expiry60?.wins || 0}\n` +
-        `Losses: ${st.expiry60?.losses || 0}\n` +
-        `Draws: ${st.expiry60?.draws || 0}\n` +
-        `W/L win rate: ${wr60}\n\n` +
-
-        `120 SECOND\n` +
-        `Settled: ${st.expiry120?.settled || 0}\n` +
-        `Wins: ${st.expiry120?.wins || 0}\n` +
-        `Losses: ${st.expiry120?.losses || 0}\n` +
-        `Draws: ${st.expiry120?.draws || 0}\n` +
-        `W/L win rate: ${wr120}\n\n` +
-
-        `Shadow mode only — no short-expiry trades are being sent yet.`
-      );
-
-      return new Response("ok");
-    }
     if (u.pathname === "/forwardstats") return json(await this.getForwardStats());
     if (u.pathname === "/shortstats") {
       return json(await this.getShortShadowStats());
@@ -3921,31 +3884,160 @@ async function issueAgradeSignal(env, chatIds, candidate, sourceUpdateId = "auto
   return { ok: true, symbol, direction: result.direction, quality: result.quality };
 }
 
-async function autoScanAndAlert(env) {
-  try {
-    const chatState = await hub(env, "/chats");
-    const chats = Array.isArray(chatState?.chats) ? chatState.chats : [];
-    if (!chats.length) return { ok: false, reason: "no registered chat" };
+async function scanShortShadowUniverse(env) {
+  const checked = [];
+  const captured = [];
 
-    const risk = await hub(env, "/risk");
-    if (!risk.ok) return { ok: false, reason: risk.reason || "risk gate" };
+  for (const symbol of FIXED_UNIVERSE) {
+    try {
+      const result = await hub(
+        env,
+        `/short-shadow?symbol=${encodeURIComponent(symbol)}`
+      );
 
-    await hub(env, "/prime-live?ms=5000");
-    const scan = await scanUniverse(env);
+      const row = {
+        ...result,
+        symbol
+      };
 
-    // Signal-only mode: internal setup states are never sent to Telegram.
-    if (scan.ok) {
-      const minuteKey = Math.floor(Date.now() / 60000);
-      const signal = await issueAgradeSignal(env, chats, scan.best, `auto-${minuteKey}-${scan.best.symbol}`, true);
-      return { ...signal, readyAlertsSent: 0 };
+      checked.push(row);
+
+      if (row?.captured) {
+        captured.push(row);
+      }
+
+      // Tiingo quota is global, so do not keep hammering
+      // the remaining pairs once the quota is blocked.
+      if (row?.quotaExceeded) {
+        break;
+      }
+    } catch (e) {
+      checked.push({
+        ok: false,
+        symbol,
+        captured: false,
+        reason: String(e?.message || e)
+      });
     }
-
-    return { ok: false, reason: scan.reason || "no fully qualified setup", readyAlertsSent: 0 };
-  } finally {
-    try { await hub(env, "/sleep"); } catch (_) { }
   }
+
+  return {
+    ok: true,
+    checked: checked.length,
+    captured: captured.length,
+    symbols: captured.map(x => x.symbol),
+    rows: checked
+  };
 }
 
+async function autoScanAndAlert(env) {
+  try {
+    // Prime the live WebSocket first so both engines
+    // work from the same fresh market sample.
+    await hub(env, "/prime-live?ms=5000");
+
+    // -------------------------------------------------
+    // SHORT-EXPIRY SHADOW
+    // Runs independently of the 5-minute risk gate.
+    // It records experimental 60s/120s entries only.
+    // It NEVER sends a short-expiry Telegram trade.
+    // -------------------------------------------------
+    const shortShadow =
+      await scanShortShadowUniverse(env);
+
+    // -------------------------------------------------
+    // EXISTING 5-MINUTE LIVE ENGINE
+    // -------------------------------------------------
+    const chatState =
+      await hub(env, "/chats");
+
+    const chats =
+      Array.isArray(chatState?.chats)
+        ? chatState.chats
+        : [];
+
+    if (!chats.length) {
+      return {
+        ok: false,
+        reason: "no registered chat",
+        readyAlertsSent: 0,
+
+        shortShadowCaptured:
+          Number(shortShadow?.captured || 0),
+
+        shortShadowSymbols:
+          shortShadow?.symbols || []
+      };
+    }
+
+    const risk =
+      await hub(env, "/risk");
+
+    if (!risk.ok) {
+      return {
+        ok: false,
+        reason:
+          risk.reason || "risk gate",
+        readyAlertsSent: 0,
+
+        shortShadowCaptured:
+          Number(shortShadow?.captured || 0),
+
+        shortShadowSymbols:
+          shortShadow?.symbols || []
+      };
+    }
+
+    const scan =
+      await scanUniverse(env);
+
+    // Existing 5-minute signal-only mode.
+    if (scan.ok) {
+      const minuteKey =
+        Math.floor(Date.now() / 60000);
+
+      const signal =
+        await issueAgradeSignal(
+          env,
+          chats,
+          scan.best,
+          `auto-${minuteKey}-${scan.best.symbol}`,
+          true
+        );
+
+      return {
+        ...signal,
+        readyAlertsSent: 0,
+
+        shortShadowCaptured:
+          Number(shortShadow?.captured || 0),
+
+        shortShadowSymbols:
+          shortShadow?.symbols || []
+      };
+    }
+
+    return {
+      ok: false,
+      reason:
+        scan.reason ||
+        "no fully qualified setup",
+
+      readyAlertsSent: 0,
+
+      shortShadowCaptured:
+        Number(shortShadow?.captured || 0),
+
+      shortShadowSymbols:
+        shortShadow?.symbols || []
+    };
+
+  } finally {
+    try {
+      await hub(env, "/sleep");
+    } catch (_) { }
+  }
+}
 
 async function checkAllFeeds(env) {
   try {
@@ -4094,6 +4186,63 @@ export default {
             chatId,
             `TRACKED SIGNAL STATS\nTotal settled: ${st.total || 0}\nWins: ${st.wins || 0}\nLosses: ${st.losses || 0}\nDraws: ${st.draws || 0}\nVoids: ${st.voids || 0}\nPending: ${st.pending || 0}\nWin rate (W/L only): ${wr}\n\nResults are measured from Tiingo prices, not Pocket Option settlement prices.`
           );
+          return new Response("ok");
+        }
+        if (/^\/shortstats$/i.test(text)) {
+          try {
+            const st = await hub(env, "/shortstats");
+
+            const wr60 =
+              st.expiry60?.winRate == null
+                ? "n/a"
+                : Number(st.expiry60.winRate).toFixed(1) + "%";
+
+            const wr120 =
+              st.expiry120?.winRate == null
+                ? "n/a"
+                : Number(st.expiry120.winRate).toFixed(1) + "%";
+
+            await tgSend(
+              env,
+              chatId,
+              `SHORT-EXPIRY SHADOW\n` +
+              `Strategy: ${st.strategyId}\n` +
+              `Pending setups: ${st.pending || 0}\n\n` +
+
+              `60 SECOND\n` +
+              `Settled: ${st.expiry60?.settled || 0}\n` +
+              `Wins: ${st.expiry60?.wins || 0}\n` +
+              `Losses: ${st.expiry60?.losses || 0}\n` +
+              `Draws: ${st.expiry60?.draws || 0}\n` +
+              `Voids: ${st.expiry60?.voids || 0}\n` +
+              `W/L win rate: ${wr60}\n\n` +
+
+              `120 SECOND\n` +
+              `Settled: ${st.expiry120?.settled || 0}\n` +
+              `Wins: ${st.expiry120?.wins || 0}\n` +
+              `Losses: ${st.expiry120?.losses || 0}\n` +
+              `Draws: ${st.expiry120?.draws || 0}\n` +
+              `Voids: ${st.expiry120?.voids || 0}\n` +
+              `W/L win rate: ${wr120}\n\n` +
+
+              `Shadow mode only — no short-expiry trade alerts are being sent yet.`
+            );
+
+          } catch (e) {
+            console.error(
+              "shortstats failed",
+              String(e?.stack || e?.message || e)
+            );
+
+            await tgSend(
+              env,
+              chatId,
+              `SHORT-STATS ERROR\n${String(
+                e?.message || e
+              ).slice(0, 300)}`
+            );
+          }
+
           return new Response("ok");
         }
         if (/^\/blockerstats$/i.test(text)) {
