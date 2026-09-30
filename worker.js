@@ -4,6 +4,16 @@ import { DurableObject } from "cloudflare:workers";
 export const VERSION = "13.6.3-cruz-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
+export const SHORT_SHADOW_UNIVERSE = Object.freeze([
+  ...FIXED_UNIVERSE,
+
+  "NZD/USD",
+  "EUR/JPY",
+  "GBP/JPY",
+  "EUR/GBP",
+  "AUD/JPY",
+  "CAD/JPY"
+]);
 export const SHORT_SHADOW_ID = "cruz-1m-ichimoku-dmi-shadow-v1";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const SHORT_SHADOW_MAX_PENDING = 250;
