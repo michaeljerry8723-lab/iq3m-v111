@@ -5680,6 +5680,9 @@ export default {
               `BY UTC MARKET WINDOW\n` +
               `${sessionLines}\n\n` +
 
+              `SESSION — CLUSTER ADJUSTED\n` +
+              `${clusterSessionLines}\n\n` +
+
               `BY PAIR\n` +
               `${pairLines}\n\n` +
 
