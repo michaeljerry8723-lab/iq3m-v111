@@ -715,6 +715,198 @@ export function cruzIchimokuSnapshot(
       )
   };
 }
+function wilderRmaSeries(values, period) {
+  const p = Math.max(1, Math.floor(period));
+
+  const out = new Array(values.length).fill(NaN);
+
+  if (values.length < p) {
+    return out;
+  }
+
+  let seed = 0;
+
+  for (let i = 0; i < p; i++) {
+    seed += Number(values[i]);
+  }
+
+  seed /= p;
+  out[p - 1] = seed;
+
+  for (let i = p; i < values.length; i++) {
+    out[i] =
+      (
+        out[i - 1] * (p - 1) +
+        Number(values[i])
+      ) / p;
+  }
+
+  return out;
+}
+export function cruzDmiSnapshot(
+  bars,
+  diLength = 7,
+  adxSmoothing = 14
+) {
+  if (
+    !Array.isArray(bars) ||
+    bars.length < diLength + adxSmoothing + 3
+  ) {
+    return {
+      ready: false,
+      bars: Array.isArray(bars)
+        ? bars.length
+        : 0
+    };
+  }
+
+  const tr = [];
+  const plusDm = [];
+  const minusDm = [];
+
+  for (let i = 1; i < bars.length; i++) {
+    const high = Number(bars[i].h);
+    const low = Number(bars[i].l);
+
+    const prevHigh = Number(bars[i - 1].h);
+    const prevLow = Number(bars[i - 1].l);
+    const prevClose = Number(bars[i - 1].c);
+
+    const upMove = high - prevHigh;
+    const downMove = prevLow - low;
+
+    tr.push(
+      Math.max(
+        high - low,
+        Math.abs(high - prevClose),
+        Math.abs(low - prevClose)
+      )
+    );
+
+    plusDm.push(
+      upMove > downMove && upMove > 0
+        ? upMove
+        : 0
+    );
+
+    minusDm.push(
+      downMove > upMove && downMove > 0
+        ? downMove
+        : 0
+    );
+  }
+
+  const smoothTr =
+    wilderRmaSeries(tr, diLength);
+
+  const smoothPlus =
+    wilderRmaSeries(plusDm, diLength);
+
+  const smoothMinus =
+    wilderRmaSeries(minusDm, diLength);
+
+  const plusDI =
+    new Array(tr.length).fill(NaN);
+
+  const minusDI =
+    new Array(tr.length).fill(NaN);
+
+  const dx = [];
+
+  for (let i = 0; i < tr.length; i++) {
+    if (
+      !Number.isFinite(smoothTr[i]) ||
+      smoothTr[i] <= 0
+    ) {
+      continue;
+    }
+
+    plusDI[i] =
+      100 * smoothPlus[i] / smoothTr[i];
+
+    minusDI[i] =
+      100 * smoothMinus[i] / smoothTr[i];
+
+    const total =
+      plusDI[i] + minusDI[i];
+
+    if (total > 0) {
+      dx.push(
+        100 *
+        Math.abs(
+          plusDI[i] - minusDI[i]
+        ) /
+        total
+      );
+    }
+  }
+
+  const adxSeries =
+    wilderRmaSeries(
+      dx,
+      adxSmoothing
+    );
+
+  const currentPlus =
+    plusDI.at(-1);
+
+  const currentMinus =
+    minusDI.at(-1);
+
+  const previousPlus =
+    plusDI.at(-2);
+
+  const previousMinus =
+    minusDI.at(-2);
+
+  const adx =
+    adxSeries.at(-1);
+
+  if (
+    ![
+      currentPlus,
+      currentMinus,
+      previousPlus,
+      previousMinus
+    ].every(Number.isFinite)
+  ) {
+    return {
+      ready: false,
+      bars: bars.length
+    };
+  }
+
+  return {
+    ready: true,
+
+    diLength,
+    adxSmoothing,
+
+    plusDI: currentPlus,
+    minusDI: currentMinus,
+
+    previousPlusDI: previousPlus,
+    previousMinusDI: previousMinus,
+
+    crossUp:
+      currentPlus > currentMinus &&
+      previousPlus <= previousMinus,
+
+    crossDown:
+      currentMinus > currentPlus &&
+      previousMinus <= previousPlus,
+
+    adx:
+      Number.isFinite(adx)
+        ? adx
+        : null,
+
+    gap:
+      Math.abs(
+        currentPlus - currentMinus
+      )
+  };
+}
 
 export function setupSequenceSnapshot(bars1m) {
   const sma = smaTrendSnapshot(bars1m, 5, 13);
