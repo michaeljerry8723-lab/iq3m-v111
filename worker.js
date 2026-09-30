@@ -964,6 +964,317 @@ function completedTickBars(ticks, seconds) {
   const current = Math.floor(Date.now() / span) * span;
   return buildBars(ticks, seconds).filter(b => Number(b.t) < current);
 }
+export function scoreCruz1mShadow(
+  ticks,
+  bars1m,
+  symbol
+) {
+  if (
+    !Array.isArray(bars1m) ||
+    bars1m.length < 30
+  ) {
+    return {
+      ok: false,
+      reason: "Cruz 1m context is still building"
+    };
+  }
+
+  const ichi =
+    cruzIchimokuSnapshot(
+      bars1m,
+      5,
+      10,
+      20
+    );
+
+  const dmi =
+    cruzDmiSnapshot(
+      bars1m,
+      7,
+      14
+    );
+
+  if (!ichi.ready || !dmi.ready) {
+    return {
+      ok: false,
+      reason: "Cruz Ichimoku/DMI context is not ready"
+    };
+  }
+
+  const current =
+    bars1m.at(-1);
+
+  const previous =
+    bars1m.at(-2);
+
+  if (!current || !previous) {
+    return {
+      ok: false,
+      reason: "Cruz 1m candles unavailable"
+    };
+  }
+
+  const currentOpen =
+    Number(current.o);
+
+  const currentClose =
+    Number(current.c);
+
+  const previousClose =
+    Number(previous.c);
+
+  if (
+    ![
+      currentOpen,
+      currentClose,
+      previousClose
+    ].every(Number.isFinite)
+  ) {
+    return {
+      ok: false,
+      reason: "Cruz candle prices invalid"
+    };
+  }
+
+  const bullishCandle =
+    currentClose > currentOpen;
+
+  const bearishCandle =
+    currentClose < currentOpen;
+
+
+  // -------------------------------------------------
+  // ICHIMOKU BREAK / RECLAIM
+  // -------------------------------------------------
+
+  const bullishSpanBBreak =
+    previousClose <= ichi.prevSpanB &&
+    currentClose > ichi.spanB;
+
+  const bearishSpanBBreak =
+    previousClose >= ichi.prevSpanB &&
+    currentClose < ichi.spanB;
+
+
+  const bullishCloudBreak =
+    previousClose <= ichi.prevCloudTop &&
+    currentClose > ichi.cloudTop;
+
+  const bearishCloudBreak =
+    previousClose >= ichi.prevCloudBottom &&
+    currentClose < ichi.cloudBottom;
+
+
+  const bullishIchimokuBreak =
+    bullishSpanBBreak ||
+    bullishCloudBreak;
+
+  const bearishIchimokuBreak =
+    bearishSpanBBreak ||
+    bearishCloudBreak;
+
+
+  // -------------------------------------------------
+  // CRUZ BUY
+  // +DI crosses ABOVE -DI
+  // while price breaks/reclaims Ichimoku resistance
+  // -------------------------------------------------
+
+  const callSetup =
+    dmi.crossUp &&
+    bullishCandle &&
+    bullishIchimokuBreak;
+
+
+  // -------------------------------------------------
+  // CRUZ SELL
+  // -DI crosses ABOVE +DI
+  // while price breaks below Ichimoku support
+  // -------------------------------------------------
+
+  const putSetup =
+    dmi.crossDown &&
+    bearishCandle &&
+    bearishIchimokuBreak;
+
+
+  if (!callSetup && !putSetup) {
+    let reason =
+      "Cruz entry conditions are not aligned";
+
+    if (
+      !dmi.crossUp &&
+      !dmi.crossDown
+    ) {
+      reason =
+        "no fresh Cruz DI crossover";
+    } else if (
+      dmi.crossUp &&
+      !bullishCandle
+    ) {
+      reason =
+        "+DI crossed up but 1m candle is not bullish";
+    } else if (
+      dmi.crossDown &&
+      !bearishCandle
+    ) {
+      reason =
+        "-DI crossed up but 1m candle is not bearish";
+    } else if (
+      dmi.crossUp &&
+      !bullishIchimokuBreak
+    ) {
+      reason =
+        "+DI crossed up but bullish Ichimoku break is missing";
+    } else if (
+      dmi.crossDown &&
+      !bearishIchimokuBreak
+    ) {
+      reason =
+        "-DI crossed up but bearish Ichimoku break is missing";
+    }
+
+    return {
+      ok: false,
+      reason,
+
+      plusDI: dmi.plusDI,
+      minusDI: dmi.minusDI,
+      adx: dmi.adx,
+
+      dmiCrossUp: dmi.crossUp,
+      dmiCrossDown: dmi.crossDown,
+
+      spanB: ichi.spanB,
+      cloudTop: ichi.cloudTop,
+      cloudBottom: ichi.cloudBottom
+    };
+  }
+
+
+  const direction =
+    callSetup
+      ? "CALL"
+      : "PUT";
+
+
+  // Execution safeguard only.
+  // This is NOT part of the Cruz strategy itself.
+  const lastLive =
+    Number(ticks?.at(-1)?.p);
+
+  if (Number.isFinite(lastLive)) {
+    const atr =
+      atrSnapshot(
+        bars1m,
+        14
+      );
+
+    if (atr.ready) {
+      const spread =
+        spreadQualitySnapshot(
+          symbol,
+          ticks,
+          lastLive,
+          atr.atr
+        );
+
+      if (spread.abnormal) {
+        return {
+          ok: false,
+          reason:
+            "Cruz setup qualified but live spread is abnormal",
+          strategyQualified: true,
+          direction
+        };
+      }
+    }
+  }
+
+
+  return {
+    ok: true,
+
+    strategyId:
+      "cruz-1m-ichimoku-dmi-v1",
+
+    direction,
+
+    timeframe: "1m",
+
+    expiryCandidates: [60, 120],
+
+
+    // Exact configured indicator values
+    ichimoku: {
+      tenkanPeriod: 5,
+      kijunPeriod: 10,
+      spanBPeriod: 20,
+
+      tenkan: ichi.tenkan,
+      kijun: ichi.kijun,
+
+      spanA: ichi.spanA,
+      spanB: ichi.spanB,
+
+      cloudTop: ichi.cloudTop,
+      cloudBottom: ichi.cloudBottom
+    },
+
+
+    dmi: {
+      diLength: 7,
+      adxSmoothing: 14,
+
+      plusDI: dmi.plusDI,
+      minusDI: dmi.minusDI,
+
+      previousPlusDI:
+        dmi.previousPlusDI,
+
+      previousMinusDI:
+        dmi.previousMinusDI,
+
+      crossUp:
+        dmi.crossUp,
+
+      crossDown:
+        dmi.crossDown,
+
+      adx:
+        dmi.adx,
+
+      gap:
+        dmi.gap
+    },
+
+
+    trigger: {
+      bullishCandle,
+      bearishCandle,
+
+      bullishSpanBBreak,
+      bearishSpanBBreak,
+
+      bullishCloudBreak,
+      bearishCloudBreak
+    },
+
+
+    reasons:
+      direction === "CALL"
+        ? [
+          "+DI crossed above -DI",
+          "bullish 1m confirmation candle",
+          "bullish Ichimoku break/reclaim"
+        ]
+        : [
+          "-DI crossed above +DI",
+          "bearish 1m confirmation candle",
+          "bearish Ichimoku break/breakdown"
+        ]
+  };
+}
 
 export function scoreShortExpiryShadow(ticks, bars1m, symbol) {
   const sma = smaTrendSnapshot(bars1m, 3, 8);
