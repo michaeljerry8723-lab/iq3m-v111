@@ -23,6 +23,9 @@ import {
   scoreShortExpiryShadow,
   setupSequenceSnapshot,
   classifyBlocker,
+  scoreCruz1mShadow,
+  cruzIchimokuSnapshot,
+  cruzDmiSnapshot,
   TickHub
 } from "../worker.js";
 
@@ -733,6 +736,389 @@ console.log(`Test 12: Short-expiry directional detector`);
     `Short-expiry direction PUT: ${put.direction}`
   );
 }
+console.log();
+
+// -----------------------------------------------------------------------------
+// Test 13: Cruz Ichimoku + DMI configuration
+// -----------------------------------------------------------------------------
+console.log("Test 13: Cruz Ichimoku + DMI configuration");
+
+{
+  const now = Date.now();
+
+  const makeTrendBars = direction => {
+    const bars = [];
+    let price = 1.10000;
+
+    const step =
+      direction === "CALL"
+        ? 0.00010
+        : -0.00010;
+
+    for (let i = 0; i < 60; i++) {
+      const o = price;
+      const c = price + step;
+
+      const h =
+        Math.max(o, c) + 0.00004;
+
+      const l =
+        Math.min(o, c) - 0.00004;
+
+      bars.push({
+        t: now - (60 - i) * 60000,
+        o,
+        h,
+        l,
+        c,
+        n: 20
+      });
+
+      price = c;
+    }
+
+    return bars;
+  };
+
+  const callBars =
+    makeTrendBars("CALL");
+
+  const putBars =
+    makeTrendBars("PUT");
+
+  const callIchi =
+    cruzIchimokuSnapshot(callBars);
+
+  const putIchi =
+    cruzIchimokuSnapshot(putBars);
+
+  const callDmi =
+    cruzDmiSnapshot(callBars);
+
+  const putDmi =
+    cruzDmiSnapshot(putBars);
+
+  assert(
+    callIchi.ready,
+    "Cruz Ichimoku CALL context ready"
+  );
+
+  assert(
+    putIchi.ready,
+    "Cruz Ichimoku PUT context ready"
+  );
+
+  assert(
+    callIchi.tenkan > callIchi.kijun,
+    "Bull trend has Tenkan above Kijun"
+  );
+
+  assert(
+    putIchi.tenkan < putIchi.kijun,
+    "Bear trend has Tenkan below Kijun"
+  );
+
+  assert(
+    callIchi.tenkanPeriod === 5 &&
+    callIchi.kijunPeriod === 10 &&
+    callIchi.spanBPeriod === 20,
+    "Cruz Ichimoku uses 5/10/20"
+  );
+
+  assert(
+    callDmi.ready &&
+    callDmi.plusDI > callDmi.minusDI,
+    "Bull trend produces +DI dominance"
+  );
+
+  assert(
+    putDmi.ready &&
+    putDmi.minusDI > putDmi.plusDI,
+    "Bear trend produces -DI dominance"
+  );
+
+  assert(
+    callDmi.diLength === 7 &&
+    callDmi.adxSmoothing === 14,
+    "Cruz DMI uses DI 7 / ADX smoothing 14"
+  );
+}
+
+console.log();
+
+// -----------------------------------------------------------------------------
+// Test 14: Cruz 1-minute BUY / SELL trigger
+// -----------------------------------------------------------------------------
+console.log("Test 14: Cruz 1-minute BUY / SELL trigger");
+
+{
+  const now = Date.now();
+
+  const makeCruzTriggerBars = direction => {
+    const bars = [];
+    let price = 1.10000;
+
+    // Build the market in the opposite direction first.
+    // The final candle then creates the fresh DI crossover
+    // and Ichimoku breakout visible in the Cruz examples.
+    const baseStep =
+      direction === "CALL"
+        ? -0.00005
+        : 0.00005;
+
+    for (let i = 0; i < 59; i++) {
+      const o = price;
+      const c = price + baseStep;
+
+      bars.push({
+        t: now - (60 - i) * 60000,
+        o,
+        h: Math.max(o, c) + 0.00003,
+        l: Math.min(o, c) - 0.00003,
+        c,
+        n: 20
+      });
+
+      price = c;
+    }
+
+    // Strong reversal/breakout candle.
+    const finalMove =
+      direction === "CALL"
+        ? 0.00050
+        : -0.00050;
+
+    const o = price;
+    const c = price + finalMove;
+
+    bars.push({
+      t: now - 60000,
+      o,
+      h: Math.max(o, c) + 0.00003,
+      l: Math.min(o, c) - 0.00003,
+      c,
+      n: 30
+    });
+
+    return bars;
+  };
+
+
+  // -------------------------------------------------
+  // CALL
+  // -------------------------------------------------
+
+  const callBars =
+    makeCruzTriggerBars("CALL");
+
+  const callTicks =
+    createTicks({
+      lastPrice:
+        Number(callBars.at(-1).c),
+
+      direction: "CALL",
+      count: 24,
+      aligned: true,
+      now
+    });
+
+  const call =
+    scoreCruz1mShadow(
+      callTicks,
+      callBars,
+      "EUR/USD"
+    );
+
+  console.log(
+    "CRUZ CALL RESULT:",
+    call
+  );
+
+  assert(
+    call.ok &&
+    call.direction === "CALL",
+    `Cruz detector produces CALL (${call.reason || "qualified"})`
+  );
+
+  assert(
+    call.dmi?.crossUp === true,
+    "+DI freshly crosses above -DI for CALL"
+  );
+
+  assert(
+    call.trigger?.bullishSpanBBreak === true ||
+    call.trigger?.bullishCloudBreak === true,
+    "CALL candle breaks/reclaims Ichimoku boundary"
+  );
+
+
+  // -------------------------------------------------
+  // PUT
+  // -------------------------------------------------
+
+  const putBars =
+    makeCruzTriggerBars("PUT");
+
+  const putTicks =
+    createTicks({
+      lastPrice:
+        Number(putBars.at(-1).c),
+
+      direction: "PUT",
+      count: 24,
+      aligned: true,
+      now
+    });
+
+  const put =
+    scoreCruz1mShadow(
+      putTicks,
+      putBars,
+      "GBP/USD"
+    );
+
+  console.log(
+    "CRUZ PUT RESULT:",
+    put
+  );
+
+  assert(
+    put.ok &&
+    put.direction === "PUT",
+    `Cruz detector produces PUT (${put.reason || "qualified"})`
+  );
+
+  assert(
+    put.dmi?.crossDown === true,
+    "-DI freshly crosses above +DI for PUT"
+  );
+
+  assert(
+    put.trigger?.bearishSpanBBreak === true ||
+    put.trigger?.bearishCloudBreak === true,
+    "PUT candle breaks below Ichimoku boundary"
+  );
+}
+
+console.log();
+
+// -----------------------------------------------------------------------------
+// Test 15: Cruz detector integrates with short-shadow capture
+// -----------------------------------------------------------------------------
+console.log("Test 15: Cruz detector integrates with short-shadow capture");
+
+{
+  const now = Date.now();
+
+  const bars = [];
+  let price = 1.10000;
+
+  // Build bearish pressure first.
+  for (let i = 0; i < 59; i++) {
+    const o = price;
+    const c = price - 0.00005;
+
+    bars.push({
+      t: now - (60 - i) * 60000,
+      o,
+      h: Math.max(o, c) + 0.00003,
+      l: Math.min(o, c) - 0.00003,
+      c,
+      n: 20
+    });
+
+    price = c;
+  }
+
+  // Strong bullish Cruz reversal / breakout candle.
+  {
+    const o = price;
+    const c = price + 0.00050;
+
+    bars.push({
+      t: now - 60000,
+      o,
+      h: c + 0.00003,
+      l: o - 0.00003,
+      c,
+      n: 30
+    });
+  }
+
+  const ticks = createTicks({
+    lastPrice: Number(bars.at(-1).c),
+    direction: "CALL",
+    count: 24,
+    aligned: true,
+    now
+  });
+
+  const storage = new MockStorage();
+  const ctx = new MockCtx(storage);
+
+  const hub = new TickHub(ctx, {
+    WS_SYMBOLS: "EUR/USD"
+  });
+
+  await ctx.waitForInit();
+
+  // No external network calls during deterministic test.
+  hub.subscribe = async () => true;
+  hub.ensureSocket = async () => true;
+  hub.refreshIfStale = async () => true;
+  hub.fetchOneMinuteBars = async () => bars;
+
+  for (const tick of ticks) {
+    hub.pushTick(
+      "EUR/USD",
+      tick.t,
+      tick.p,
+      tick.bid,
+      tick.ask
+    );
+  }
+
+  const result =
+    await hub.evaluateShortShadow(
+      "EUR/USD"
+    );
+
+  assert(
+    result.ok &&
+    result.captured === true &&
+    result.direction === "CALL",
+    "Cruz CALL is captured by autonomous short-shadow evaluator"
+  );
+
+  assert(
+    hub.shortShadowState.pending.length === 1,
+    "Captured Cruz setup enters pending settlement queue"
+  );
+
+  const record =
+    hub.shortShadowState.pending[0];
+
+  assert(
+    record.strategyId === SHORT_SHADOW_ID,
+    "Captured setup uses current Cruz shadow strategy ID"
+  );
+
+  assert(
+    record.features?.model ===
+    "cruz-1m-ichimoku-dmi",
+    "Captured setup records Cruz model identity"
+  );
+
+  assert(
+    record.features?.ichimoku?.tenkanPeriod === 5 &&
+    record.features?.ichimoku?.kijunPeriod === 10 &&
+    record.features?.ichimoku?.spanBPeriod === 20 &&
+    record.features?.dmi?.diLength === 7 &&
+    record.features?.dmi?.adxSmoothing === 14,
+    "Captured setup preserves Cruz 5/10/20 Ichimoku and 7/14 DMI settings"
+  );
+}
+
 console.log();
 
 // -----------------------------------------------------------------------------

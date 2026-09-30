@@ -1,10 +1,10 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.6.2-short-shadow";
+export const VERSION = "13.6.3-cruz-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
-export const SHORT_SHADOW_ID = "cruz-short-expiry-shadow-v1";
+export const SHORT_SHADOW_ID = "cruz-1m-ichimoku-dmi-shadow-v1";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const SHORT_SHADOW_MAX_PENDING = 250;
 export const SHORT_SHADOW_MAX_HISTORY = 1000;
@@ -558,6 +558,355 @@ function usdExposureSide(symbol, direction) {
   if (usdQuote.has(s)) return d === "CALL" ? "USD_SHORT" : "USD_LONG";
   return null;
 }
+function rangeMidpointAt(bars, endIndex, period) {
+  const p = Math.max(1, Math.floor(period));
+  const startIndex = endIndex - p + 1;
+
+  if (
+    !Array.isArray(bars) ||
+    startIndex < 0 ||
+    endIndex >= bars.length
+  ) {
+    return NaN;
+  }
+
+  let highest = -Infinity;
+  let lowest = Infinity;
+
+  for (let i = startIndex; i <= endIndex; i++) {
+    const high = Number(bars[i]?.h);
+    const low = Number(bars[i]?.l);
+
+    if (
+      !Number.isFinite(high) ||
+      !Number.isFinite(low)
+    ) {
+      return NaN;
+    }
+
+    highest = Math.max(highest, high);
+    lowest = Math.min(lowest, low);
+  }
+
+  return (highest + lowest) / 2;
+}
+
+
+export function cruzIchimokuSnapshot(
+  bars,
+  tenkanPeriod = 5,
+  kijunPeriod = 10,
+  spanBPeriod = 20
+) {
+  if (
+    !Array.isArray(bars) ||
+    bars.length < spanBPeriod + 2
+  ) {
+    return {
+      ready: false,
+      bars: Array.isArray(bars)
+        ? bars.length
+        : 0
+    };
+  }
+
+  const i = bars.length - 1;
+  const prev = i - 1;
+
+  const tenkan =
+    rangeMidpointAt(
+      bars,
+      i,
+      tenkanPeriod
+    );
+
+  const kijun =
+    rangeMidpointAt(
+      bars,
+      i,
+      kijunPeriod
+    );
+
+  const spanB =
+    rangeMidpointAt(
+      bars,
+      i,
+      spanBPeriod
+    );
+
+  const prevTenkan =
+    rangeMidpointAt(
+      bars,
+      prev,
+      tenkanPeriod
+    );
+
+  const prevKijun =
+    rangeMidpointAt(
+      bars,
+      prev,
+      kijunPeriod
+    );
+
+  const prevSpanB =
+    rangeMidpointAt(
+      bars,
+      prev,
+      spanBPeriod
+    );
+
+  const spanA =
+    (tenkan + kijun) / 2;
+
+  const prevSpanA =
+    (prevTenkan + prevKijun) / 2;
+
+  const values = [
+    tenkan,
+    kijun,
+    spanA,
+    spanB,
+    prevTenkan,
+    prevKijun,
+    prevSpanA,
+    prevSpanB
+  ];
+
+  if (!values.every(Number.isFinite)) {
+    return {
+      ready: false,
+      bars: bars.length
+    };
+  }
+
+  return {
+    ready: true,
+
+    tenkanPeriod,
+    kijunPeriod,
+    spanBPeriod,
+
+    tenkan,
+    kijun,
+    spanA,
+    spanB,
+
+    prevTenkan,
+    prevKijun,
+    prevSpanA,
+    prevSpanB,
+
+    cloudTop:
+      Math.max(spanA, spanB),
+
+    cloudBottom:
+      Math.min(spanA, spanB),
+
+    prevCloudTop:
+      Math.max(
+        prevSpanA,
+        prevSpanB
+      ),
+
+    prevCloudBottom:
+      Math.min(
+        prevSpanA,
+        prevSpanB
+      )
+  };
+}
+function wilderRmaSeries(values, period) {
+  const p = Math.max(1, Math.floor(period));
+
+  const out = new Array(values.length).fill(NaN);
+
+  if (values.length < p) {
+    return out;
+  }
+
+  let seed = 0;
+
+  for (let i = 0; i < p; i++) {
+    seed += Number(values[i]);
+  }
+
+  seed /= p;
+  out[p - 1] = seed;
+
+  for (let i = p; i < values.length; i++) {
+    out[i] =
+      (
+        out[i - 1] * (p - 1) +
+        Number(values[i])
+      ) / p;
+  }
+
+  return out;
+}
+export function cruzDmiSnapshot(
+  bars,
+  diLength = 7,
+  adxSmoothing = 14
+) {
+  if (
+    !Array.isArray(bars) ||
+    bars.length < diLength + adxSmoothing + 3
+  ) {
+    return {
+      ready: false,
+      bars: Array.isArray(bars)
+        ? bars.length
+        : 0
+    };
+  }
+
+  const tr = [];
+  const plusDm = [];
+  const minusDm = [];
+
+  for (let i = 1; i < bars.length; i++) {
+    const high = Number(bars[i].h);
+    const low = Number(bars[i].l);
+
+    const prevHigh = Number(bars[i - 1].h);
+    const prevLow = Number(bars[i - 1].l);
+    const prevClose = Number(bars[i - 1].c);
+
+    const upMove = high - prevHigh;
+    const downMove = prevLow - low;
+
+    tr.push(
+      Math.max(
+        high - low,
+        Math.abs(high - prevClose),
+        Math.abs(low - prevClose)
+      )
+    );
+
+    plusDm.push(
+      upMove > downMove && upMove > 0
+        ? upMove
+        : 0
+    );
+
+    minusDm.push(
+      downMove > upMove && downMove > 0
+        ? downMove
+        : 0
+    );
+  }
+
+  const smoothTr =
+    wilderRmaSeries(tr, diLength);
+
+  const smoothPlus =
+    wilderRmaSeries(plusDm, diLength);
+
+  const smoothMinus =
+    wilderRmaSeries(minusDm, diLength);
+
+  const plusDI =
+    new Array(tr.length).fill(NaN);
+
+  const minusDI =
+    new Array(tr.length).fill(NaN);
+
+  const dx = [];
+
+  for (let i = 0; i < tr.length; i++) {
+    if (
+      !Number.isFinite(smoothTr[i]) ||
+      smoothTr[i] <= 0
+    ) {
+      continue;
+    }
+
+    plusDI[i] =
+      100 * smoothPlus[i] / smoothTr[i];
+
+    minusDI[i] =
+      100 * smoothMinus[i] / smoothTr[i];
+
+    const total =
+      plusDI[i] + minusDI[i];
+
+    if (total > 0) {
+      dx.push(
+        100 *
+        Math.abs(
+          plusDI[i] - minusDI[i]
+        ) /
+        total
+      );
+    }
+  }
+
+  const adxSeries =
+    wilderRmaSeries(
+      dx,
+      adxSmoothing
+    );
+
+  const currentPlus =
+    plusDI.at(-1);
+
+  const currentMinus =
+    minusDI.at(-1);
+
+  const previousPlus =
+    plusDI.at(-2);
+
+  const previousMinus =
+    minusDI.at(-2);
+
+  const adx =
+    adxSeries.at(-1);
+
+  if (
+    ![
+      currentPlus,
+      currentMinus,
+      previousPlus,
+      previousMinus
+    ].every(Number.isFinite)
+  ) {
+    return {
+      ready: false,
+      bars: bars.length
+    };
+  }
+
+  return {
+    ready: true,
+
+    diLength,
+    adxSmoothing,
+
+    plusDI: currentPlus,
+    minusDI: currentMinus,
+
+    previousPlusDI: previousPlus,
+    previousMinusDI: previousMinus,
+
+    crossUp:
+      currentPlus > currentMinus &&
+      previousPlus <= previousMinus,
+
+    crossDown:
+      currentMinus > currentPlus &&
+      previousMinus <= previousPlus,
+
+    adx:
+      Number.isFinite(adx)
+        ? adx
+        : null,
+
+    gap:
+      Math.abs(
+        currentPlus - currentMinus
+      )
+  };
+}
 
 export function setupSequenceSnapshot(bars1m) {
   const sma = smaTrendSnapshot(bars1m, 5, 13);
@@ -614,6 +963,317 @@ function completedTickBars(ticks, seconds) {
   const span = seconds * 1000;
   const current = Math.floor(Date.now() / span) * span;
   return buildBars(ticks, seconds).filter(b => Number(b.t) < current);
+}
+export function scoreCruz1mShadow(
+  ticks,
+  bars1m,
+  symbol
+) {
+  if (
+    !Array.isArray(bars1m) ||
+    bars1m.length < 30
+  ) {
+    return {
+      ok: false,
+      reason: "Cruz 1m context is still building"
+    };
+  }
+
+  const ichi =
+    cruzIchimokuSnapshot(
+      bars1m,
+      5,
+      10,
+      20
+    );
+
+  const dmi =
+    cruzDmiSnapshot(
+      bars1m,
+      7,
+      14
+    );
+
+  if (!ichi.ready || !dmi.ready) {
+    return {
+      ok: false,
+      reason: "Cruz Ichimoku/DMI context is not ready"
+    };
+  }
+
+  const current =
+    bars1m.at(-1);
+
+  const previous =
+    bars1m.at(-2);
+
+  if (!current || !previous) {
+    return {
+      ok: false,
+      reason: "Cruz 1m candles unavailable"
+    };
+  }
+
+  const currentOpen =
+    Number(current.o);
+
+  const currentClose =
+    Number(current.c);
+
+  const previousClose =
+    Number(previous.c);
+
+  if (
+    ![
+      currentOpen,
+      currentClose,
+      previousClose
+    ].every(Number.isFinite)
+  ) {
+    return {
+      ok: false,
+      reason: "Cruz candle prices invalid"
+    };
+  }
+
+  const bullishCandle =
+    currentClose > currentOpen;
+
+  const bearishCandle =
+    currentClose < currentOpen;
+
+
+  // -------------------------------------------------
+  // ICHIMOKU BREAK / RECLAIM
+  // -------------------------------------------------
+
+  const bullishSpanBBreak =
+    previousClose <= ichi.prevSpanB &&
+    currentClose > ichi.spanB;
+
+  const bearishSpanBBreak =
+    previousClose >= ichi.prevSpanB &&
+    currentClose < ichi.spanB;
+
+
+  const bullishCloudBreak =
+    previousClose <= ichi.prevCloudTop &&
+    currentClose > ichi.cloudTop;
+
+  const bearishCloudBreak =
+    previousClose >= ichi.prevCloudBottom &&
+    currentClose < ichi.cloudBottom;
+
+
+  const bullishIchimokuBreak =
+    bullishSpanBBreak ||
+    bullishCloudBreak;
+
+  const bearishIchimokuBreak =
+    bearishSpanBBreak ||
+    bearishCloudBreak;
+
+
+  // -------------------------------------------------
+  // CRUZ BUY
+  // +DI crosses ABOVE -DI
+  // while price breaks/reclaims Ichimoku resistance
+  // -------------------------------------------------
+
+  const callSetup =
+    dmi.crossUp &&
+    bullishCandle &&
+    bullishIchimokuBreak;
+
+
+  // -------------------------------------------------
+  // CRUZ SELL
+  // -DI crosses ABOVE +DI
+  // while price breaks below Ichimoku support
+  // -------------------------------------------------
+
+  const putSetup =
+    dmi.crossDown &&
+    bearishCandle &&
+    bearishIchimokuBreak;
+
+
+  if (!callSetup && !putSetup) {
+    let reason =
+      "Cruz entry conditions are not aligned";
+
+    if (
+      !dmi.crossUp &&
+      !dmi.crossDown
+    ) {
+      reason =
+        "no fresh Cruz DI crossover";
+    } else if (
+      dmi.crossUp &&
+      !bullishCandle
+    ) {
+      reason =
+        "+DI crossed up but 1m candle is not bullish";
+    } else if (
+      dmi.crossDown &&
+      !bearishCandle
+    ) {
+      reason =
+        "-DI crossed up but 1m candle is not bearish";
+    } else if (
+      dmi.crossUp &&
+      !bullishIchimokuBreak
+    ) {
+      reason =
+        "+DI crossed up but bullish Ichimoku break is missing";
+    } else if (
+      dmi.crossDown &&
+      !bearishIchimokuBreak
+    ) {
+      reason =
+        "-DI crossed up but bearish Ichimoku break is missing";
+    }
+
+    return {
+      ok: false,
+      reason,
+
+      plusDI: dmi.plusDI,
+      minusDI: dmi.minusDI,
+      adx: dmi.adx,
+
+      dmiCrossUp: dmi.crossUp,
+      dmiCrossDown: dmi.crossDown,
+
+      spanB: ichi.spanB,
+      cloudTop: ichi.cloudTop,
+      cloudBottom: ichi.cloudBottom
+    };
+  }
+
+
+  const direction =
+    callSetup
+      ? "CALL"
+      : "PUT";
+
+
+  // Execution safeguard only.
+  // This is NOT part of the Cruz strategy itself.
+  const lastLive =
+    Number(ticks?.at(-1)?.p);
+
+  if (Number.isFinite(lastLive)) {
+    const atr =
+      atrSnapshot(
+        bars1m,
+        14
+      );
+
+    if (atr.ready) {
+      const spread =
+        spreadQualitySnapshot(
+          symbol,
+          ticks,
+          lastLive,
+          atr.atr
+        );
+
+      if (spread.abnormal) {
+        return {
+          ok: false,
+          reason:
+            "Cruz setup qualified but live spread is abnormal",
+          strategyQualified: true,
+          direction
+        };
+      }
+    }
+  }
+
+
+  return {
+    ok: true,
+
+    strategyId:
+      "cruz-1m-ichimoku-dmi-v1",
+
+    direction,
+
+    timeframe: "1m",
+
+    expiryCandidates: [60, 120],
+
+
+    // Exact configured indicator values
+    ichimoku: {
+      tenkanPeriod: 5,
+      kijunPeriod: 10,
+      spanBPeriod: 20,
+
+      tenkan: ichi.tenkan,
+      kijun: ichi.kijun,
+
+      spanA: ichi.spanA,
+      spanB: ichi.spanB,
+
+      cloudTop: ichi.cloudTop,
+      cloudBottom: ichi.cloudBottom
+    },
+
+
+    dmi: {
+      diLength: 7,
+      adxSmoothing: 14,
+
+      plusDI: dmi.plusDI,
+      minusDI: dmi.minusDI,
+
+      previousPlusDI:
+        dmi.previousPlusDI,
+
+      previousMinusDI:
+        dmi.previousMinusDI,
+
+      crossUp:
+        dmi.crossUp,
+
+      crossDown:
+        dmi.crossDown,
+
+      adx:
+        dmi.adx,
+
+      gap:
+        dmi.gap
+    },
+
+
+    trigger: {
+      bullishCandle,
+      bearishCandle,
+
+      bullishSpanBBreak,
+      bearishSpanBBreak,
+
+      bullishCloudBreak,
+      bearishCloudBreak
+    },
+
+
+    reasons:
+      direction === "CALL"
+        ? [
+          "+DI crossed above -DI",
+          "bullish 1m confirmation candle",
+          "bullish Ichimoku break/reclaim"
+        ]
+        : [
+          "-DI crossed above +DI",
+          "bearish 1m confirmation candle",
+          "bearish Ichimoku break/breakdown"
+        ]
+  };
 }
 
 export function scoreShortExpiryShadow(ticks, bars1m, symbol) {
@@ -3378,7 +4038,7 @@ export class TickHub extends DurableObject {
     }
 
     const candidate =
-      scoreShortExpiryShadow(
+      scoreCruz1mShadow(
         ticks,
         bars1m,
         symbol
@@ -3419,33 +4079,26 @@ export class TickHub extends DurableObject {
         sourceKey,
 
         features: {
-          quality: candidate.quality,
-          efficiency: candidate.efficiency,
-          extensionAtr: candidate.extensionAtr,
+          model:
+            "cruz-1m-ichimoku-dmi",
 
-          smaFast: candidate.smaFast,
-          smaSlow: candidate.smaSlow,
-          fastSlope: candidate.fastSlope,
+          timeframe:
+            candidate.timeframe,
 
-          rsi: candidate.rsi,
-          adx: candidate.adx,
-          dmiGap: candidate.dmiGap,
+          expiryCandidates:
+            candidate.expiryCandidates,
 
-          tickUpRatio:
-            candidate.tickUpRatio,
-          tickDownRatio:
-            candidate.tickDownRatio,
-          tickNorm:
-            candidate.tickNorm,
+          ichimoku:
+            candidate.ichimoku,
 
-          confirmationCount:
-            candidate.confirmationCount,
+          dmi:
+            candidate.dmi,
 
-          confirmations:
-            candidate.confirmations,
+          trigger:
+            candidate.trigger,
 
-          broad5m:
-            candidate.broad5m
+          reasons:
+            candidate.reasons
         }
       });
 
