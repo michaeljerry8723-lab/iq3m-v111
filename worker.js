@@ -2610,13 +2610,21 @@ export class TickHub extends DurableObject {
       history: []
     };
 
+    const pending = Array.isArray(state.pending)
+      ? state.pending
+      : [];
+
     const history = Array.isArray(state.history)
       ? state.history
       : [];
 
+    const records = [...history, ...pending];
+
     const summarize = key => {
-      const settled = history.filter(x =>
-        ["WIN", "LOSS", "DRAW"].includes(
+      const terminal = ["WIN", "LOSS", "DRAW", "VOID"];
+
+      const settled = records.filter(x =>
+        terminal.includes(
           String(x?.[key] || "").toUpperCase()
         )
       );
@@ -2633,6 +2641,10 @@ export class TickHub extends DurableObject {
         x => String(x?.[key] || "").toUpperCase() === "DRAW"
       ).length;
 
+      const voids = settled.filter(
+        x => String(x?.[key] || "").toUpperCase() === "VOID"
+      ).length;
+
       const wl = wins + losses;
 
       return {
@@ -2640,6 +2652,7 @@ export class TickHub extends DurableObject {
         wins,
         losses,
         draws,
+        voids,
         winRate: wl > 0
           ? (wins / wl) * 100
           : null
@@ -2650,12 +2663,253 @@ export class TickHub extends DurableObject {
       ok: true,
       strategyId: SHORT_SHADOW_ID,
       startedAt: state.startedAt || null,
-      pending: Array.isArray(state.pending)
-        ? state.pending.length
-        : 0,
+      pending: pending.length,
       expiry60: summarize("result60"),
       expiry120: summarize("result120"),
       recent: history.slice(0, 20)
+    };
+  }
+
+  async captureShortShadow(body = {}) {
+    const symbol = normalizeSymbol(body?.symbol);
+    const direction = String(body?.direction || "").toUpperCase();
+    const entryPrice = Number(body?.entryPrice);
+    const entryAt = Number(body?.entryAt) || Date.now();
+
+    if (!symbol || !FIXED_UNIVERSE.includes(symbol)) {
+      return { ok: false, error: "invalid short-shadow symbol" };
+    }
+
+    if (!["CALL", "PUT"].includes(direction)) {
+      return { ok: false, error: "invalid short-shadow direction" };
+    }
+
+    if (!Number.isFinite(entryPrice)) {
+      return { ok: false, error: "invalid short-shadow entry price" };
+    }
+
+    if (!this.shortShadowState) {
+      this.shortShadowState = {
+        strategyId: SHORT_SHADOW_ID,
+        startedAt: Date.now(),
+        pending: [],
+        history: []
+      };
+    }
+
+    const sourceKey = String(
+      body?.sourceKey ||
+      `${symbol}|${direction}|${Math.floor(entryAt / 60000)}`
+    );
+
+    const all = [
+      ...(this.shortShadowState.pending || []),
+      ...(this.shortShadowState.history || [])
+    ];
+
+    const duplicate = all.find(
+      x => String(x?.sourceKey || "") === sourceKey
+    );
+
+    if (duplicate) {
+      return {
+        ok: true,
+        duplicate: true,
+        id: duplicate.id
+      };
+    }
+
+    const record = {
+      id: crypto.randomUUID(),
+      sourceKey,
+      strategyId: SHORT_SHADOW_ID,
+      symbol,
+      direction,
+      entryPrice,
+      entryAt,
+      expiry60At: entryAt + 60 * 1000,
+      expiry120At: entryAt + 120 * 1000,
+      result60: null,
+      result120: null,
+      exit60Price: null,
+      exit120Price: null,
+      exit60TickAt: null,
+      exit120TickAt: null,
+      features: body?.features || null,
+      capturedAt: Date.now()
+    };
+
+    this.shortShadowState.pending = [
+      record,
+      ...(this.shortShadowState.pending || [])
+    ].slice(0, SHORT_SHADOW_MAX_PENDING);
+
+    await this.ctx.storage.put(
+      "shortShadowState",
+      this.shortShadowState
+    );
+
+    await this.scheduleAlarm();
+
+    return {
+      ok: true,
+      id: record.id,
+      sourceKey,
+      symbol,
+      direction,
+      entryPrice,
+      entryAt,
+      expiry60At: record.expiry60At,
+      expiry120At: record.expiry120At
+    };
+  }
+
+  async settleShortShadow(now = Date.now()) {
+    const state = this.shortShadowState;
+
+    if (
+      !state ||
+      !Array.isArray(state.pending) ||
+      !state.pending.length
+    ) {
+      return {
+        ok: true,
+        settled60: 0,
+        settled120: 0,
+        completed: 0
+      };
+    }
+
+    let settled60 = 0;
+    let settled120 = 0;
+    let completed = 0;
+    let changed = false;
+
+    const keep = [];
+    const finished = [];
+
+    const resolveOutcome = (
+      direction,
+      entryPrice,
+      exitPrice
+    ) => {
+      const delta =
+        Number(exitPrice) - Number(entryPrice);
+
+      if (Math.abs(delta) <= 1e-12) {
+        return "DRAW";
+      }
+
+      const won =
+        direction === "CALL"
+          ? delta > 0
+          : delta < 0;
+
+      return won ? "WIN" : "LOSS";
+    };
+
+    for (const original of state.pending) {
+      const rec = { ...original };
+
+      const ticks =
+        this.ticks.get(rec.symbol) || [];
+
+      if (
+        !rec.result60 &&
+        now >= Number(rec.expiry60At)
+      ) {
+        const tick60 = ticks.find(
+          t =>
+            Number(t.r || t.t) >=
+            Number(rec.expiry60At)
+        );
+
+        if (tick60) {
+          rec.exit60Price = Number(tick60.p);
+          rec.exit60TickAt =
+            Number(tick60.r || tick60.t);
+
+          rec.result60 = resolveOutcome(
+            rec.direction,
+            rec.entryPrice,
+            rec.exit60Price
+          );
+
+          settled60++;
+          changed = true;
+        } else if (
+          now - Number(rec.expiry60At) >= 15000
+        ) {
+          rec.result60 = "VOID";
+          settled60++;
+          changed = true;
+        }
+      }
+
+      if (
+        !rec.result120 &&
+        now >= Number(rec.expiry120At)
+      ) {
+        const tick120 = ticks.find(
+          t =>
+            Number(t.r || t.t) >=
+            Number(rec.expiry120At)
+        );
+
+        if (tick120) {
+          rec.exit120Price = Number(tick120.p);
+          rec.exit120TickAt =
+            Number(tick120.r || tick120.t);
+
+          rec.result120 = resolveOutcome(
+            rec.direction,
+            rec.entryPrice,
+            rec.exit120Price
+          );
+
+          settled120++;
+          changed = true;
+        } else if (
+          now - Number(rec.expiry120At) >= 15000
+        ) {
+          rec.result120 = "VOID";
+          settled120++;
+          changed = true;
+        }
+      }
+
+      if (rec.result60 && rec.result120) {
+        rec.completedAt = now;
+
+        finished.push(rec);
+        completed++;
+        changed = true;
+      } else {
+        keep.push(rec);
+      }
+    }
+
+    state.pending = keep;
+
+    if (finished.length) {
+      state.history = [
+        ...finished,
+        ...(state.history || [])
+      ].slice(0, SHORT_SHADOW_MAX_HISTORY);
+    }
+
+    if (changed) {
+      await this.ctx.storage.put(
+        "shortShadowState",
+        state
+      );
+    }
+
+    return {
+      ok: true,
+      settled60,
+      settled120,
+      completed
     };
   }
 

@@ -482,6 +482,94 @@ console.log(`Test 9: Short-expiry shadow statistics`);
 console.log();
 
 // -----------------------------------------------------------------------------
+// Test 10: Short-expiry dual settlement
+// -----------------------------------------------------------------------------
+console.log(`Test 10: Short-expiry dual settlement`);
+{
+  const storage = new MockStorage();
+  const ctx = new MockCtx(storage);
+  const hub = new TickHub(ctx, {
+    WS_SYMBOLS: "EUR/USD"
+  });
+
+  const entryAt = Date.now() - 121000;
+
+  const captured =
+    await hub.captureShortShadow({
+      symbol: "EUR/USD",
+      direction: "CALL",
+      entryPrice: 1.10000,
+      entryAt,
+      sourceKey: "short-test-1",
+      features: {
+        test: true
+      }
+    });
+
+  assert(
+    captured.ok,
+    "Short-shadow setup captured"
+  );
+
+  assert(
+    captured.expiry60At - entryAt === 60000,
+    "60s expiry scheduled correctly"
+  );
+
+  assert(
+    captured.expiry120At - entryAt === 120000,
+    "120s expiry scheduled correctly"
+  );
+
+  hub.ticks.set("EUR/USD", [
+    {
+      t: entryAt + 60100,
+      r: entryAt + 60100,
+      p: 1.10100
+    },
+    {
+      t: entryAt + 120100,
+      r: entryAt + 120100,
+      p: 1.09900
+    }
+  ]);
+
+  const settled =
+    await hub.settleShortShadow(
+      entryAt + 121000
+    );
+
+  assert(
+    settled.completed === 1,
+    "Both expiries completed"
+  );
+
+  const stats =
+    await hub.getShortShadowStats();
+
+  assert(
+    stats.pending === 0,
+    "Completed setup removed from pending"
+  );
+
+  assert(
+    stats.expiry60.wins === 1,
+    "CALL wins at 60 seconds"
+  );
+
+  assert(
+    stats.expiry120.losses === 1,
+    "Same CALL loses at 120 seconds"
+  );
+
+  assert(
+    stats.recent.length === 1,
+    "Completed setup stored in history"
+  );
+}
+console.log();
+
+// -----------------------------------------------------------------------------
 // Summary
 // -----------------------------------------------------------------------------
 console.log(`=======================================================`);
