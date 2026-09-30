@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.6.4-cruz-12pair-shadow";
+export const VERSION = "13.6.5-cruz-cluster-stats";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -5367,6 +5367,28 @@ export default {
             const clusterStats =
               st.clusters || {};
 
+            const adjusted60 =
+              st.clusterAdjusted?.expiry60 || {};
+
+            const adjusted120 =
+              st.clusterAdjusted?.expiry120 || {};
+
+
+            const adjustedWr60 =
+              adjusted60.equalClusterWinRate == null
+                ? "n/a"
+                : Number(
+                  adjusted60.equalClusterWinRate
+                ).toFixed(1) + "%";
+
+
+            const adjustedWr120 =
+              adjusted120.equalClusterWinRate == null
+                ? "n/a"
+                : Number(
+                  adjusted120.equalClusterWinRate
+                ).toFixed(1) + "%";
+
             const recentClusters =
               Array.isArray(clusterStats.recent)
                 ? clusterStats.recent
@@ -5420,7 +5442,21 @@ export default {
               `CAPTURE CLUSTERS\n` +
               `Total clusters: ${clusterStats.totalClusters || 0}\n` +
               `Multi-setup clusters: ${clusterStats.multiSetupClusters || 0}\n` +
-              `Largest cluster: ${clusterStats.maxClusterSize || 0} setups\n` +
+              `Largest cluster: ${clusterStats.maxClusterSize || 0} setups\n\n` +
+
+              `CLUSTER-ADJUSTED PERFORMANCE\n` +
+
+              `60s — ${adjustedWr60}\n` +
+              `Settled clusters: ${adjusted60.settledClusters || 0}\n` +
+              `Winning: ${adjusted60.winningClusters || 0} | ` +
+              `Losing: ${adjusted60.losingClusters || 0} | ` +
+              `Tied: ${adjusted60.tiedClusters || 0}\n\n` +
+
+              `120s — ${adjustedWr120}\n` +
+              `Settled clusters: ${adjusted120.settledClusters || 0}\n` +
+              `Winning: ${adjusted120.winningClusters || 0} | ` +
+              `Losing: ${adjusted120.losingClusters || 0} | ` +
+              `Tied: ${adjusted120.tiedClusters || 0}\n\n` +
               `${recentClusters
                 ? `Recent clusters:\n${recentClusters}\n\n`
                 : "\n"
