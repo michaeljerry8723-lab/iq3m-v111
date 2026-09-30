@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.6.6-cruz-session-stats";
+export const VERSION = "13.6.7-cruz-cluster-session-stats";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -5499,6 +5499,24 @@ export default {
               return `${b.wins || 0}W ${b.losses || 0}L (${wr})`;
             };
 
+            const formatClusterBucket = bucket => {
+              const b = bucket || {};
+
+              const wr =
+                b.equalClusterWinRate == null
+                  ? "n/a"
+                  : Number(
+                    b.equalClusterWinRate
+                  ).toFixed(1) + "%";
+
+              return (
+                `${wr} — ` +
+                `${b.winningClusters || 0}W ` +
+                `${b.losingClusters || 0}L ` +
+                `${b.tiedClusters || 0}T ` +
+                `(${b.settledClusters || 0} clusters)`
+              );
+            };
 
             const pairLines =
               SHORT_SHADOW_UNIVERSE
@@ -5557,6 +5575,20 @@ export default {
                       ? ` | Pending: ${row.pending}`
                       : ""
                     }`
+                  );
+                })
+                .join("\n");
+
+            const clusterSessionLines =
+              Object.entries(sessionLabels)
+                .map(([key, label]) => {
+                  const row =
+                    st.clusterAdjustedBySession?.[key] || {};
+
+                  return (
+                    `${label}\n` +
+                    `60s ${formatClusterBucket(row.expiry60)}\n` +
+                    `120s ${formatClusterBucket(row.expiry120)}`
                   );
                 })
                 .join("\n");
