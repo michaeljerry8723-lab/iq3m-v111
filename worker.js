@@ -2530,26 +2530,66 @@ export class TickHub extends DurableObject {
     const base = this.forwardStats || {
       strategyId: STRATEGY_ID,
       shadowId: V13_4_SHADOW.id,
-      frozenRule: { dmiGapMin: V13_4_SHADOW.dmiGapMin, adxMax: V13_4_SHADOW.adxMax },
+      frozenRule: {
+        dmiGapMin: V13_4_SHADOW.dmiGapMin,
+        adxMax: V13_4_SHADOW.adxMax
+      },
       initializedAt: null,
       firstObservedAt: null,
       lastObservedAt: null,
-      eligible: { total: 0, wins: 0, losses: 0, draws: 0, voids: 0 },
-      nonEligible: { total: 0, wins: 0, losses: 0, draws: 0, voids: 0 }
+      eligible: {
+        total: 0,
+        wins: 0,
+        losses: 0,
+        draws: 0,
+        voids: 0
+      },
+      nonEligible: {
+        total: 0,
+        wins: 0,
+        losses: 0,
+        draws: 0,
+        voids: 0
+      }
     };
+
     const summarize = b => {
-      const x = b || { total: 0, wins: 0, losses: 0, draws: 0, voids: 0 };
-      const wl = Number(x.wins || 0) + Number(x.losses || 0);
-      return { ...x, wl, winRate: wl ? (Number(x.wins || 0) / wl) * 100 : null };
+      const x = b || {
+        total: 0,
+        wins: 0,
+        losses: 0,
+        draws: 0,
+        voids: 0
+      };
+
+      const wl =
+        Number(x.wins || 0) +
+        Number(x.losses || 0);
+
+      return {
+        ...x,
+        wl,
+        winRate: wl
+          ? (Number(x.wins || 0) / wl) * 100
+          : null
+      };
     };
+
     const pending = this.pendingSignals.filter(
-      x => this.isCurrentStrategyRecord(x) && x?.features?.v13_4Shadow?.id === V13_4_SHADOW.id && x.features.v13_4Shadow.eligible === true
+      x =>
+        this.isCurrentStrategyRecord(x) &&
+        x?.features?.v13_4Shadow?.id === V13_4_SHADOW.id &&
+        x.features.v13_4Shadow.eligible === true
     ).length;
+
     return {
       ok: true,
       strategyId: STRATEGY_ID,
       shadowId: V13_4_SHADOW.id,
-      frozenRule: { dmiGapMin: V13_4_SHADOW.dmiGapMin, adxMax: V13_4_SHADOW.adxMax },
+      frozenRule: {
+        dmiGapMin: V13_4_SHADOW.dmiGapMin,
+        adxMax: V13_4_SHADOW.adxMax
+      },
       initializedAt: base.initializedAt || null,
       firstObservedAt: base.firstObservedAt || null,
       lastObservedAt: base.lastObservedAt || null,
@@ -2559,6 +2599,63 @@ export class TickHub extends DurableObject {
       targetMinimum: 50,
       targetPreferred: 100,
       persistence: "durable-object-aggregate"
+    };
+  }
+
+  async getShortShadowStats() {
+    const state = this.shortShadowState || {
+      strategyId: SHORT_SHADOW_ID,
+      startedAt: null,
+      pending: [],
+      history: []
+    };
+
+    const history = Array.isArray(state.history)
+      ? state.history
+      : [];
+
+    const summarize = key => {
+      const settled = history.filter(x =>
+        ["WIN", "LOSS", "DRAW"].includes(
+          String(x?.[key] || "").toUpperCase()
+        )
+      );
+
+      const wins = settled.filter(
+        x => String(x?.[key] || "").toUpperCase() === "WIN"
+      ).length;
+
+      const losses = settled.filter(
+        x => String(x?.[key] || "").toUpperCase() === "LOSS"
+      ).length;
+
+      const draws = settled.filter(
+        x => String(x?.[key] || "").toUpperCase() === "DRAW"
+      ).length;
+
+      const wl = wins + losses;
+
+      return {
+        settled: settled.length,
+        wins,
+        losses,
+        draws,
+        winRate: wl > 0
+          ? (wins / wl) * 100
+          : null
+      };
+    };
+
+    return {
+      ok: true,
+      strategyId: SHORT_SHADOW_ID,
+      startedAt: state.startedAt || null,
+      pending: Array.isArray(state.pending)
+        ? state.pending.length
+        : 0,
+      expiry60: summarize("result60"),
+      expiry120: summarize("result120"),
+      recent: history.slice(0, 20)
     };
   }
 
@@ -2688,7 +2785,47 @@ export class TickHub extends DurableObject {
     if (u.pathname === "/chats") return json(await this.getAlertChats());
     if (u.pathname === "/track" && req.method === "POST") return json(await this.trackSignal(req));
     if (u.pathname === "/stats") return json(await this.getTrackingStats());
+    if (/^\/shortstats$/i.test(text)) {
+      const st = await hub(env, "/shortstats");
+
+      const wr60 = st.expiry60?.winRate == null
+        ? "n/a"
+        : Number(st.expiry60.winRate).toFixed(1) + "%";
+
+      const wr120 = st.expiry120?.winRate == null
+        ? "n/a"
+        : Number(st.expiry120.winRate).toFixed(1) + "%";
+
+      await tgSend(
+        env,
+        chatId,
+        `SHORT-EXPIRY SHADOW\n` +
+        `Strategy: ${st.strategyId}\n` +
+        `Pending setups: ${st.pending || 0}\n\n` +
+
+        `60 SECOND\n` +
+        `Settled: ${st.expiry60?.settled || 0}\n` +
+        `Wins: ${st.expiry60?.wins || 0}\n` +
+        `Losses: ${st.expiry60?.losses || 0}\n` +
+        `Draws: ${st.expiry60?.draws || 0}\n` +
+        `W/L win rate: ${wr60}\n\n` +
+
+        `120 SECOND\n` +
+        `Settled: ${st.expiry120?.settled || 0}\n` +
+        `Wins: ${st.expiry120?.wins || 0}\n` +
+        `Losses: ${st.expiry120?.losses || 0}\n` +
+        `Draws: ${st.expiry120?.draws || 0}\n` +
+        `W/L win rate: ${wr120}\n\n` +
+
+        `Shadow mode only — no short-expiry trades are being sent yet.`
+      );
+
+      return new Response("ok");
+    }
     if (u.pathname === "/forwardstats") return json(await this.getForwardStats());
+    if (u.pathname === "/shortstats") {
+      return json(await this.getShortShadowStats());
+    }
     if (u.pathname === "/blockerstats") {
       const stats = await this.getBlockerStats();
 

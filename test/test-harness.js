@@ -15,6 +15,7 @@ import { createBars, createTicks } from "./market-generator.js";
 import {
   VERSION,
   STRATEGY_ID,
+  SHORT_SHADOW_ID,
   FIXED_UNIVERSE,
   A_GRADE_MIN_QUALITY,
   score5m,
@@ -389,6 +390,94 @@ console.log(`Test 8: Blocker instrumentation (/blockerstats)`);
   const formatted = hub.formatBlockerStatsMessage(stats);
   assert(formatted.includes("BLOCKER STATS"), "Formatted message includes header");
   assert(formatted.includes("Core Structure"), "Formatted message includes categories");
+}
+console.log();
+
+// -----------------------------------------------------------------------------
+// Test 9: Short-expiry shadow statistics
+// -----------------------------------------------------------------------------
+console.log(`Test 9: Short-expiry shadow statistics`);
+{
+  const storage = new MockStorage();
+  const ctx = new MockCtx(storage);
+  const hub = new TickHub(ctx, { WS_SYMBOLS: "EUR/USD" });
+
+  hub.shortShadowState = {
+    strategyId: SHORT_SHADOW_ID,
+    startedAt: Date.now(),
+    pending: [
+      {
+        id: "pending-1",
+        symbol: "EUR/USD",
+        direction: "CALL"
+      }
+    ],
+    history: [
+      {
+        symbol: "EUR/USD",
+        result60: "WIN",
+        result120: "WIN"
+      },
+      {
+        symbol: "GBP/USD",
+        result60: "LOSS",
+        result120: "WIN"
+      },
+      {
+        symbol: "USD/JPY",
+        result60: "DRAW",
+        result120: "LOSS"
+      }
+    ]
+  };
+
+  const stats = await hub.getShortShadowStats();
+
+  assert(stats.ok, "Short-shadow stats return ok");
+
+  assert(
+    stats.strategyId === SHORT_SHADOW_ID,
+    "Short-shadow strategy ID is isolated"
+  );
+
+  assert(
+    stats.pending === 1,
+    `Short-shadow pending count: ${stats.pending}`
+  );
+
+  assert(
+    stats.expiry60.settled === 3,
+    `60s settled count: ${stats.expiry60.settled}`
+  );
+
+  assert(
+    stats.expiry60.wins === 1 &&
+    stats.expiry60.losses === 1 &&
+    stats.expiry60.draws === 1,
+    "60s outcomes counted correctly"
+  );
+
+  assert(
+    Math.abs(stats.expiry60.winRate - 50) < 0.001,
+    `60s W/L win rate: ${stats.expiry60.winRate}`
+  );
+
+  assert(
+    stats.expiry120.settled === 3,
+    `120s settled count: ${stats.expiry120.settled}`
+  );
+
+  assert(
+    stats.expiry120.wins === 2 &&
+    stats.expiry120.losses === 1 &&
+    stats.expiry120.draws === 0,
+    "120s outcomes counted correctly"
+  );
+
+  assert(
+    Math.abs(stats.expiry120.winRate - (2 / 3) * 100) < 0.001,
+    `120s W/L win rate: ${stats.expiry120.winRate}`
+  );
 }
 console.log();
 
