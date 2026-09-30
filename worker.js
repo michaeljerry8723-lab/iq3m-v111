@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.6.5-cruz-cluster-stats";
+export const VERSION = "13.6.6-cruz-session-stats";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -3845,7 +3845,83 @@ export class TickHub extends DurableObject {
           )
       };
     }
+    // -------------------------------------------------
+    // PERFORMANCE BY UTC MARKET WINDOW
+    // Observational only — does not affect entries.
+    // -------------------------------------------------
 
+    const marketWindow = entryAt => {
+      const t = Number(entryAt);
+
+      if (!Number.isFinite(t)) {
+        return "UNKNOWN";
+      }
+
+      const hour =
+        new Date(t).getUTCHours();
+
+      if (hour >= 0 && hour < 7) {
+        return "ASIA";
+      }
+
+      if (hour >= 7 && hour < 13) {
+        return "LONDON";
+      }
+
+      if (hour >= 13 && hour < 17) {
+        return "OVERLAP";
+      }
+
+      if (hour >= 17 && hour < 21) {
+        return "NEW_YORK";
+      }
+
+      return "LATE";
+    };
+
+
+    const bySession = {};
+
+    for (
+      const session of [
+        "ASIA",
+        "LONDON",
+        "OVERLAP",
+        "NEW_YORK",
+        "LATE"
+      ]
+    ) {
+      const sessionRecords =
+        records.filter(
+          x =>
+            marketWindow(x?.entryAt) ===
+            session
+        );
+
+      const sessionPending =
+        pending.filter(
+          x =>
+            marketWindow(x?.entryAt) ===
+            session
+        ).length;
+
+      bySession[session] = {
+        pending:
+          sessionPending,
+
+        expiry60:
+          summarizeSubset(
+            sessionRecords,
+            "result60"
+          ),
+
+        expiry120:
+          summarizeSubset(
+            sessionRecords,
+            "result120"
+          )
+      };
+    }
 
     // -------------------------------------------------
     // CAPTURE CLUSTERS
@@ -4201,6 +4277,8 @@ export class TickHub extends DurableObject {
       byPair,
 
       byDirection,
+
+      bySession,
 
       clusters:
         clusterStats,
@@ -5412,6 +5490,41 @@ export default {
             const putStats =
               st.byDirection?.PUT || {};
 
+            const sessionLabels = {
+              ASIA:
+                "ASIA 00:00-06:59 UTC",
+
+              LONDON:
+                "LONDON 07:00-12:59 UTC",
+
+              OVERLAP:
+                "OVERLAP 13:00-16:59 UTC",
+
+              NEW_YORK:
+                "NEW YORK 17:00-20:59 UTC",
+
+              LATE:
+                "LATE 21:00-23:59 UTC"
+            };
+
+
+            const sessionLines =
+              Object.entries(sessionLabels)
+                .map(([key, label]) => {
+                  const row =
+                    st.bySession?.[key] || {};
+
+                  return (
+                    `${label}\n` +
+                    `60s ${formatBucket(row.expiry60)} | ` +
+                    `120s ${formatBucket(row.expiry120)}` +
+                    `${Number(row.pending || 0) > 0
+                      ? ` | Pending: ${row.pending}`
+                      : ""
+                    }`
+                  );
+                })
+                .join("\n");
 
             const clusterStats =
               st.clusters || {};
@@ -5496,6 +5609,9 @@ export default {
               `PUT — 60s ${formatBucket(putStats.expiry60)} | ` +
               `120s ${formatBucket(putStats.expiry120)} | ` +
               `Pending: ${putStats.pending || 0}\n\n` +
+
+              `BY UTC MARKET WINDOW\n` +
+              `${sessionLines}\n\n` +
 
               `BY PAIR\n` +
               `${pairLines}\n\n` +

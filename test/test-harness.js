@@ -1215,6 +1215,119 @@ console.log("Test 16: Cruz universe separation");
 console.log();
 
 // -----------------------------------------------------------------------------
+// Test 17: Cruz UTC market-window statistics
+// -----------------------------------------------------------------------------
+console.log("Test 17: Cruz UTC market-window statistics");
+
+{
+  const storage = new MockStorage();
+  const ctx = new MockCtx(storage);
+  const hub = new TickHub(ctx, {
+    WS_SYMBOLS: "EUR/USD"
+  });
+
+  await ctx.waitForInit();
+
+  const day = {
+    asia:
+      Date.UTC(2026, 8, 30, 2, 0, 0),
+
+    london:
+      Date.UTC(2026, 8, 30, 9, 0, 0),
+
+    overlap:
+      Date.UTC(2026, 8, 30, 14, 0, 0),
+
+    newYork:
+      Date.UTC(2026, 8, 30, 18, 0, 0),
+
+    late:
+      Date.UTC(2026, 8, 30, 22, 0, 0)
+  };
+
+  hub.shortShadowState = {
+    strategyId: SHORT_SHADOW_ID,
+    startedAt:
+      Date.UTC(2026, 8, 30, 0, 0, 0),
+
+    pending: [],
+
+    history: [
+      {
+        symbol: "USD/JPY",
+        direction: "CALL",
+        entryAt: day.asia,
+        result60: "WIN",
+        result120: "WIN"
+      },
+
+      {
+        symbol: "GBP/USD",
+        direction: "PUT",
+        entryAt: day.london,
+        result60: "WIN",
+        result120: "LOSS"
+      },
+
+      {
+        symbol: "EUR/USD",
+        direction: "CALL",
+        entryAt: day.overlap,
+        result60: "LOSS",
+        result120: "WIN"
+      },
+
+      {
+        symbol: "USD/CAD",
+        direction: "PUT",
+        entryAt: day.newYork,
+        result60: "WIN",
+        result120: "WIN"
+      },
+
+      {
+        symbol: "AUD/USD",
+        direction: "CALL",
+        entryAt: day.late,
+        result60: "LOSS",
+        result120: "LOSS"
+      }
+    ]
+  };
+
+  const stats =
+    await hub.getShortShadowStats();
+
+
+  assert(
+    stats.bySession.ASIA.expiry60.settled === 1,
+    "02:00 UTC is classified into ASIA"
+  );
+
+  assert(
+    stats.bySession.LONDON.expiry60.settled === 1,
+    "09:00 UTC is classified into LONDON"
+  );
+
+  assert(
+    stats.bySession.OVERLAP.expiry60.settled === 1,
+    "14:00 UTC is classified into OVERLAP"
+  );
+
+  assert(
+    stats.bySession.NEW_YORK.expiry60.settled === 1,
+    "18:00 UTC is classified into NEW_YORK"
+  );
+
+  assert(
+    stats.bySession.LATE.expiry60.settled === 1,
+    "22:00 UTC is classified into LATE"
+  );
+}
+
+console.log();
+
+// -----------------------------------------------------------------------------
 // Summary
 // -----------------------------------------------------------------------------
 console.log(`=======================================================`);
