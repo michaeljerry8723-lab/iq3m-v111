@@ -15,10 +15,12 @@ import { createBars, createTicks } from "./market-generator.js";
 import {
   VERSION,
   STRATEGY_ID,
+  SHORT_SHADOW_ID,
   FIXED_UNIVERSE,
   A_GRADE_MIN_QUALITY,
   score5m,
   preAlert5m,
+  scoreShortExpiryShadow,
   setupSequenceSnapshot,
   classifyBlocker,
   TickHub
@@ -389,6 +391,347 @@ console.log(`Test 8: Blocker instrumentation (/blockerstats)`);
   const formatted = hub.formatBlockerStatsMessage(stats);
   assert(formatted.includes("BLOCKER STATS"), "Formatted message includes header");
   assert(formatted.includes("Core Structure"), "Formatted message includes categories");
+}
+console.log();
+
+// -----------------------------------------------------------------------------
+// Test 9: Short-expiry shadow statistics
+// -----------------------------------------------------------------------------
+console.log(`Test 9: Short-expiry shadow statistics`);
+{
+  const storage = new MockStorage();
+  const ctx = new MockCtx(storage);
+  const hub = new TickHub(ctx, { WS_SYMBOLS: "EUR/USD" });
+
+  hub.shortShadowState = {
+    strategyId: SHORT_SHADOW_ID,
+    startedAt: Date.now(),
+    pending: [
+      {
+        id: "pending-1",
+        symbol: "EUR/USD",
+        direction: "CALL"
+      }
+    ],
+    history: [
+      {
+        symbol: "EUR/USD",
+        result60: "WIN",
+        result120: "WIN"
+      },
+      {
+        symbol: "GBP/USD",
+        result60: "LOSS",
+        result120: "WIN"
+      },
+      {
+        symbol: "USD/JPY",
+        result60: "DRAW",
+        result120: "LOSS"
+      }
+    ]
+  };
+
+  const stats = await hub.getShortShadowStats();
+
+  assert(stats.ok, "Short-shadow stats return ok");
+
+  assert(
+    stats.strategyId === SHORT_SHADOW_ID,
+    "Short-shadow strategy ID is isolated"
+  );
+
+  assert(
+    stats.pending === 1,
+    `Short-shadow pending count: ${stats.pending}`
+  );
+
+  assert(
+    stats.expiry60.settled === 3,
+    `60s settled count: ${stats.expiry60.settled}`
+  );
+
+  assert(
+    stats.expiry60.wins === 1 &&
+    stats.expiry60.losses === 1 &&
+    stats.expiry60.draws === 1,
+    "60s outcomes counted correctly"
+  );
+
+  assert(
+    Math.abs(stats.expiry60.winRate - 50) < 0.001,
+    `60s W/L win rate: ${stats.expiry60.winRate}`
+  );
+
+  assert(
+    stats.expiry120.settled === 3,
+    `120s settled count: ${stats.expiry120.settled}`
+  );
+
+  assert(
+    stats.expiry120.wins === 2 &&
+    stats.expiry120.losses === 1 &&
+    stats.expiry120.draws === 0,
+    "120s outcomes counted correctly"
+  );
+
+  assert(
+    Math.abs(stats.expiry120.winRate - (2 / 3) * 100) < 0.001,
+    `120s W/L win rate: ${stats.expiry120.winRate}`
+  );
+}
+console.log();
+
+// -----------------------------------------------------------------------------
+// Test 10: Short-expiry dual settlement
+// -----------------------------------------------------------------------------
+console.log(`Test 10: Short-expiry dual settlement`);
+{
+  const storage = new MockStorage();
+  const ctx = new MockCtx(storage);
+  const hub = new TickHub(ctx, {
+    WS_SYMBOLS: "EUR/USD"
+  });
+
+  const entryAt = Date.now() - 121000;
+
+  const captured =
+    await hub.captureShortShadow({
+      symbol: "EUR/USD",
+      direction: "CALL",
+      entryPrice: 1.10000,
+      entryAt,
+      sourceKey: "short-test-1",
+      features: {
+        test: true
+      }
+    });
+
+  assert(
+    captured.ok,
+    "Short-shadow setup captured"
+  );
+
+  assert(
+    captured.expiry60At - entryAt === 60000,
+    "60s expiry scheduled correctly"
+  );
+
+  assert(
+    captured.expiry120At - entryAt === 120000,
+    "120s expiry scheduled correctly"
+  );
+
+  hub.ticks.set("EUR/USD", [
+    {
+      t: entryAt + 60100,
+      r: entryAt + 60100,
+      p: 1.10100
+    },
+    {
+      t: entryAt + 120100,
+      r: entryAt + 120100,
+      p: 1.09900
+    }
+  ]);
+
+  const settled =
+    await hub.settleShortShadow(
+      entryAt + 121000
+    );
+
+  assert(
+    settled.completed === 1,
+    "Both expiries completed"
+  );
+
+  const stats =
+    await hub.getShortShadowStats();
+
+  assert(
+    stats.pending === 0,
+    "Completed setup removed from pending"
+  );
+
+  assert(
+    stats.expiry60.wins === 1,
+    "CALL wins at 60 seconds"
+  );
+
+  assert(
+    stats.expiry120.losses === 1,
+    "Same CALL loses at 120 seconds"
+  );
+
+  assert(
+    stats.recent.length === 1,
+    "Completed setup stored in history"
+  );
+}
+console.log();
+
+// -----------------------------------------------------------------------------
+// Test 11: Short-expiry alarm scheduling
+// -----------------------------------------------------------------------------
+console.log(`Test 11: Short-expiry alarm scheduling`);
+{
+  const storage = new MockStorage();
+  const ctx = new MockCtx(storage);
+
+  const hub = new TickHub(ctx, {
+    WS_SYMBOLS: "EUR/USD"
+  });
+
+  await ctx.waitForInit();
+
+  const now = Date.now();
+
+  hub.pendingSignals = [];
+
+  hub.shortShadowState = {
+    strategyId: SHORT_SHADOW_ID,
+    startedAt: now,
+    history: [],
+    pending: [
+      {
+        id: "alarm-short-1",
+        symbol: "EUR/USD",
+        direction: "CALL",
+        entryPrice: 1.10000,
+        entryAt: now,
+        expiry60At: now + 60000,
+        expiry120At: now + 120000,
+        result60: null,
+        result120: null
+      }
+    ]
+  };
+
+  await hub.scheduleAlarm();
+
+  const firstAlarm =
+    await storage.getAlarm();
+
+  assert(
+    Number.isFinite(firstAlarm),
+    "Short-shadow pending setup creates an alarm"
+  );
+
+  assert(
+    firstAlarm >= now + 59000 &&
+    firstAlarm <= now + 61000,
+    "First alarm targets the 60-second expiry"
+  );
+
+  hub.shortShadowState.pending[0].result60 =
+    "WIN";
+
+  await hub.scheduleAlarm();
+
+  const secondAlarm =
+    await storage.getAlarm();
+
+  assert(
+    secondAlarm >= now + 119000 &&
+    secondAlarm <= now + 121000,
+    "After 60s settlement, alarm advances to 120s expiry"
+  );
+
+  hub.shortShadowState.pending = [];
+
+  await hub.scheduleAlarm();
+
+  assert(
+    (await storage.getAlarm()) === null,
+    "Alarm clears when no normal or short-expiry settlements remain"
+  );
+}
+console.log();
+
+// -----------------------------------------------------------------------------
+// Test 12: Short-expiry directional detector
+// -----------------------------------------------------------------------------
+console.log(`Test 12: Short-expiry directional detector`);
+{
+  const now = Date.now();
+
+  const callBars = createBars({
+    count: 90,
+    direction: "CALL",
+    withPullback: true,
+    withContinuation: true,
+    now
+  });
+
+  const callTicks = createTicks({
+    lastPrice: Number(callBars.at(-1).c),
+    direction: "CALL",
+    count: 24,
+    aligned: true,
+    now
+  });
+
+  const call =
+    scoreShortExpiryShadow(
+      callTicks,
+      callBars,
+      "EUR/USD"
+    );
+
+  assert(
+    call.ok,
+    `Short-expiry CALL qualifies: ${call.reason || "qualified"}`
+  );
+
+  assert(
+    call.direction === "CALL",
+    `Short-expiry direction CALL: ${call.direction}`
+  );
+
+  assert(
+    Array.isArray(call.expiryCandidates) &&
+    call.expiryCandidates.includes(60) &&
+    call.expiryCandidates.includes(120),
+    "Short detector evaluates both 60s and 120s"
+  );
+
+  assert(
+    call.quality >= 0.86,
+    `Short CALL quality: ${call.quality}`
+  );
+
+  const putBars = createBars({
+    count: 90,
+    direction: "PUT",
+    withPullback: true,
+    withContinuation: true,
+    now
+  });
+
+  const putTicks = createTicks({
+    lastPrice: Number(putBars.at(-1).c),
+    direction: "PUT",
+    count: 24,
+    aligned: true,
+    now
+  });
+
+  const put =
+    scoreShortExpiryShadow(
+      putTicks,
+      putBars,
+      "GBP/USD"
+    );
+
+  assert(
+    put.ok,
+    `Short-expiry PUT qualifies: ${put.reason || "qualified"}`
+  );
+
+  assert(
+    put.direction === "PUT",
+    `Short-expiry direction PUT: ${put.direction}`
+  );
 }
 console.log();
 

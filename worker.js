@@ -1,11 +1,16 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.6.1-signal-audit";
+export const VERSION = "13.6.2-short-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
+export const SHORT_SHADOW_ID = "cruz-short-expiry-shadow-v1";
+export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
+export const SHORT_SHADOW_MAX_PENDING = 250;
+export const SHORT_SHADOW_MAX_HISTORY = 1000;
 export const CRYPTO_SYMBOLS = new Set();
 export const A_GRADE_MIN_QUALITY = 0.895;
+export const SHORT_SHADOW_MIN_QUALITY = 0.86;
 export const EXPIRY_SECONDS = 300;
 export const BLOCKER_CLASSIFIER_VERSION = "v3-detailed-5m";
 export const STRATEGY_ID = "v13.6-signal-only";
@@ -611,6 +616,291 @@ function completedTickBars(ticks, seconds) {
   return buildBars(ticks, seconds).filter(b => Number(b.t) < current);
 }
 
+export function scoreShortExpiryShadow(ticks, bars1m, symbol) {
+  const sma = smaTrendSnapshot(bars1m, 3, 8);
+  const macd = macdSnapshot(bars1m, 3, 8, 3);
+  const rsi = rsiSnapshot(bars1m, 7);
+  const dmi = dmiAdxSnapshot(bars1m, 7);
+  const pressure = candlePressure(bars1m, 2);
+  const atr = atrSnapshot(bars1m, 14);
+  const impulse = tickImpulse(ticks);
+
+  if (
+    !sma.ready ||
+    !macd.ready ||
+    !rsi.ready ||
+    !dmi.ready ||
+    !pressure.ready ||
+    !atr.ready ||
+    !impulse.ready
+  ) {
+    return {
+      ok: false,
+      reason: "short-expiry context is still building"
+    };
+  }
+
+  const lastBar = bars1m.at(-1);
+  const last = Number(ticks.at(-1)?.p);
+
+  if (!lastBar || !Number.isFinite(last)) {
+    return {
+      ok: false,
+      reason: "short-expiry live price unavailable"
+    };
+  }
+
+  const spread = spreadQualitySnapshot(
+    symbol,
+    ticks,
+    last,
+    atr.atr
+  );
+
+  if (spread.abnormal) {
+    return {
+      ok: false,
+      reason: "spread is abnormal for short-expiry entry"
+    };
+  }
+
+  let direction = "NEUTRAL";
+
+  if (
+    sma.fast > sma.slow &&
+    sma.fastSlope > 0
+  ) {
+    direction = "CALL";
+  }
+
+  if (
+    sma.fast < sma.slow &&
+    sma.fastSlope < 0
+  ) {
+    direction = "PUT";
+  }
+
+  if (direction === "NEUTRAL") {
+    return {
+      ok: false,
+      reason: "1m fast trend is not directional"
+    };
+  }
+
+  const continuation =
+    direction === "CALL"
+      ? (
+        Number(lastBar.c) > Number(lastBar.o) &&
+        Number(lastBar.c) > sma.fast
+      )
+      : (
+        Number(lastBar.c) < Number(lastBar.o) &&
+        Number(lastBar.c) < sma.fast
+      );
+
+  if (!continuation) {
+    return {
+      ok: false,
+      reason: "fresh 1m continuation candle missing"
+    };
+  }
+
+  const efficiency =
+    efficiencyRatio(bars1m, 5);
+
+  if (efficiency < 0.12) {
+    return {
+      ok: false,
+      reason:
+        `short-expiry efficiency ${efficiency.toFixed(3)} below 0.120`
+    };
+  }
+
+  const extensionAtr =
+    Math.abs(last - sma.fast) / atr.atr;
+
+  if (extensionAtr > 1.75) {
+    return {
+      ok: false,
+      reason:
+        `short-expiry entry extended ${extensionAtr.toFixed(2)} ATR`
+    };
+  }
+
+  const macdAligned =
+    direction === "CALL"
+      ? (
+        macd.macd > macd.signal &&
+        macd.hist > 0
+      )
+      : (
+        macd.macd < macd.signal &&
+        macd.hist < 0
+      );
+
+  const rsiAligned =
+    direction === "CALL"
+      ? rsi.rsi >= 50 && rsi.rsi <= 78
+      : rsi.rsi <= 50 && rsi.rsi >= 22;
+
+  const dmiGap =
+    Math.abs(dmi.plusDI - dmi.minusDI);
+
+  const dmiAligned =
+    direction === "CALL"
+      ? dmi.plusDI > dmi.minusDI
+      : dmi.minusDI > dmi.plusDI;
+
+  const dmiStrong =
+    dmiAligned &&
+    dmi.adx >= 16 &&
+    dmiGap >= 3;
+
+  const pressureAligned =
+    direction === "CALL"
+      ? pressure.bull >= 1
+      : pressure.bear >= 1;
+
+  const tickAligned =
+    direction === "CALL"
+      ? (
+        impulse.upRatio >= 0.57 &&
+        impulse.norm >= 0.08
+      )
+      : (
+        impulse.downRatio >= 0.57 &&
+        impulse.norm <= -0.08
+      );
+
+  if (!tickAligned) {
+    return {
+      ok: false,
+      reason: "live tick burst does not confirm short-expiry direction"
+    };
+  }
+
+  const confirmations = {
+    macd: macdAligned,
+    rsi: rsiAligned,
+    dmi: dmiStrong,
+    pressure: pressureAligned
+  };
+
+  const confirmationCount =
+    Object.values(confirmations)
+      .filter(Boolean)
+      .length;
+
+  if (confirmationCount < 3) {
+    return {
+      ok: false,
+      reason:
+        `short-expiry momentum ${confirmationCount}/4 — need at least 3/4`,
+      confirmations
+    };
+  }
+
+  // Broader 5m context is a veto only.
+  // It does not create the 1–2 minute signal.
+  const b5 =
+    completedAggregate(bars1m, 300);
+
+  const broad =
+    trendRegime(b5, 3, 8, 0.12);
+
+  if (
+    broad.ready &&
+    broad.direction !== "NEUTRAL" &&
+    broad.direction !== direction &&
+    broad.efficiency >= 0.30
+  ) {
+    return {
+      ok: false,
+      reason: "strong completed 5m trend opposes short-expiry entry"
+    };
+  }
+
+  let quality =
+    0.80 +
+    confirmationCount * 0.025;
+
+  if (efficiency >= 0.25) {
+    quality += 0.015;
+  }
+
+  if (dmi.adx >= 22) {
+    quality += 0.015;
+  }
+
+  if (
+    direction === "CALL"
+      ? impulse.upRatio >= 0.65
+      : impulse.downRatio >= 0.65
+  ) {
+    quality += 0.015;
+  }
+
+  if (
+    broad.ready &&
+    broad.direction === direction
+  ) {
+    quality += 0.015;
+  }
+
+  if (extensionAtr <= 0.80) {
+    quality += 0.01;
+  }
+
+  quality = clamp(
+    quality,
+    0,
+    0.97
+  );
+
+  if (quality < SHORT_SHADOW_MIN_QUALITY) {
+    return {
+      ok: false,
+      reason:
+        `short-expiry quality ${(quality * 100).toFixed(1)}% below threshold`,
+      quality
+    };
+  }
+
+  return {
+    ok: true,
+    strategyId: SHORT_SHADOW_ID,
+    direction,
+    quality,
+
+    expiryCandidates: [60, 120],
+
+    timeframe: "1m",
+
+    efficiency,
+    extensionAtr,
+
+    smaFast: sma.fast,
+    smaSlow: sma.slow,
+    fastSlope: sma.fastSlope,
+
+    rsi: rsi.rsi,
+    adx: dmi.adx,
+    dmiGap,
+
+    tickUpRatio: impulse.upRatio,
+    tickDownRatio: impulse.downRatio,
+    tickNorm: impulse.norm,
+
+    confirmationCount,
+    confirmations,
+
+    broad5m:
+      broad.ready
+        ? broad.direction
+        : "NOT_READY"
+  };
+}
+
 export function score5m(ticks, bars1m, symbol) {
   const sma1 = smaTrendSnapshot(bars1m, 5, 13);
   const fr1 = fractalSnapshot(bars1m, 2);
@@ -1054,6 +1344,13 @@ export class TickHub extends DurableObject {
     this.lastStatus = "starting"; this.lastSubscribeStatus = null; this.connecting = false; this.cryptoConnecting = false; this.provider = "tiingo"; this.lastCryptoStatus = "starting"; this.lastCryptoSubscribeStatus = null; this.lastCryptoWsMessageAt = 0;
     this.lastWsMessageAt = 0; this.lastPriceReceivedAt = 0; this.lastConnectAt = 0; this.reconnectCount = 0; this.oneMinuteCache = new Map(); this.oneMinuteCacheDirty = false; this.quotaBlockedUntil = 0; this.pendingSignals = []; this.signalStats = { total: 0, wins: 0, losses: 0, draws: 0, voids: 0 }; this.signalHistory = []; this.forwardStats = null; this.alertChats = []; this.setupStates = {}; this.readyAlertClaims = {}; this.readyAudit = [];
 
+    this.shortShadowState = {
+      strategyId: SHORT_SHADOW_ID,
+      startedAt: Date.now(),
+      pending: [],
+      history: []
+    };
+
     this.blockerStats = {
       strategyId: STRATEGY_ID,
       classifierVersion: BLOCKER_CLASSIFIER_VERSION,
@@ -1072,6 +1369,38 @@ export class TickHub extends DurableObject {
         storedBlockers?.strategyId === STRATEGY_ID &&
         storedBlockers?.classifierVersion === BLOCKER_CLASSIFIER_VERSION
       ) {
+        const storedShortShadow =
+          await this.ctx.storage.get("shortShadowState");
+
+        if (
+          storedShortShadow?.strategyId === SHORT_SHADOW_ID
+        ) {
+          this.shortShadowState = {
+            strategyId: SHORT_SHADOW_ID,
+            startedAt:
+              Number(storedShortShadow.startedAt) || Date.now(),
+
+            pending: Array.isArray(storedShortShadow.pending)
+              ? storedShortShadow.pending
+              : [],
+
+            history: Array.isArray(storedShortShadow.history)
+              ? storedShortShadow.history
+              : []
+          };
+        } else {
+          this.shortShadowState = {
+            strategyId: SHORT_SHADOW_ID,
+            startedAt: Date.now(),
+            pending: [],
+            history: []
+          };
+
+          await this.ctx.storage.put(
+            "shortShadowState",
+            this.shortShadowState
+          );
+        }
         this.blockerStats = {
           ...storedBlockers,
           total: Number(
@@ -1197,17 +1526,67 @@ export class TickHub extends DurableObject {
 
   async scheduleAlarm() {
     const now = Date.now();
-    if (!this.pendingSignals.length) {
-      try { await this.ctx.storage.deleteAlarm(); } catch (_) { }
+
+    const shortPending =
+      this.shortShadowState?.pending || [];
+
+    if (
+      !this.pendingSignals.length &&
+      !shortPending.length
+    ) {
+      try {
+        await this.ctx.storage.deleteAlarm();
+      } catch (_) { }
+
       return;
     }
+
     let next = Infinity;
+
+    // Existing 5-minute settlements
     for (const p of this.pendingSignals) {
       const exp = Number(p.expiresAt || 0);
-      if (exp > now) next = Math.min(next, exp);
-      else next = Math.min(next, now + 250);
+
+      if (exp > now) {
+        next = Math.min(next, exp);
+      } else {
+        next = Math.min(next, now + 250);
+      }
     }
-    await this.ctx.storage.setAlarm(Math.max(now + 250, Number.isFinite(next) ? next : now + 1000));
+
+    // Experimental 60s / 120s settlements
+    for (const p of shortPending) {
+      if (!p.result60) {
+        const exp60 = Number(p.expiry60At || 0);
+
+        next = Math.min(
+          next,
+          exp60 > now
+            ? exp60
+            : now + 2000
+        );
+      }
+
+      if (!p.result120) {
+        const exp120 = Number(p.expiry120At || 0);
+
+        next = Math.min(
+          next,
+          exp120 > now
+            ? exp120
+            : now + 2000
+        );
+      }
+    }
+
+    await this.ctx.storage.setAlarm(
+      Math.max(
+        now + 250,
+        Number.isFinite(next)
+          ? next
+          : now + 1000
+      )
+    );
   }
 
   async fetchTopSnapshots(symbols = []) {
@@ -1402,13 +1781,61 @@ export class TickHub extends DurableObject {
   async alarm() {
     try {
       const now = Date.now();
-      const due = this.pendingSignals.filter(x => Number(x.expiresAt || 0) <= now + 2000).map(x => x.symbol);
-      if (due.length) await this.fetchTopSnapshots(due);
+
+      const normalDue = this.pendingSignals
+        .filter(
+          x =>
+            Number(x.expiresAt || 0) <=
+            now + 2000
+        )
+        .map(x => x.symbol);
+
+      const shortDue = (
+        this.shortShadowState?.pending || []
+      )
+        .filter(x =>
+          (
+            !x.result60 &&
+            Number(x.expiry60At || 0) <=
+            now + 2000
+          ) ||
+          (
+            !x.result120 &&
+            Number(x.expiry120At || 0) <=
+            now + 2000
+          )
+        )
+        .map(x => x.symbol);
+
+      const dueSymbols = [
+        ...new Set([
+          ...normalDue,
+          ...shortDue
+        ])
+      ];
+
+      if (dueSymbols.length) {
+        await this.fetchTopSnapshots(
+          dueSymbols
+        );
+      }
+
+      // Existing 5-minute settlement
       await this.settlePendingSignals();
+
+      // Independent short-expiry settlement
+      await this.settleShortShadow();
+
     } catch (e) {
-      this.lastStatus = `alarm error: ${String(e?.message || e)}`;
+      this.lastStatus =
+        `alarm error: ${String(
+          e?.message || e
+        )}`;
     } finally {
-      await this.closeFeeds("alarm complete");
+      await this.closeFeeds(
+        "alarm complete"
+      );
+
       await this.scheduleAlarm();
     }
   }
@@ -2487,26 +2914,66 @@ export class TickHub extends DurableObject {
     const base = this.forwardStats || {
       strategyId: STRATEGY_ID,
       shadowId: V13_4_SHADOW.id,
-      frozenRule: { dmiGapMin: V13_4_SHADOW.dmiGapMin, adxMax: V13_4_SHADOW.adxMax },
+      frozenRule: {
+        dmiGapMin: V13_4_SHADOW.dmiGapMin,
+        adxMax: V13_4_SHADOW.adxMax
+      },
       initializedAt: null,
       firstObservedAt: null,
       lastObservedAt: null,
-      eligible: { total: 0, wins: 0, losses: 0, draws: 0, voids: 0 },
-      nonEligible: { total: 0, wins: 0, losses: 0, draws: 0, voids: 0 }
+      eligible: {
+        total: 0,
+        wins: 0,
+        losses: 0,
+        draws: 0,
+        voids: 0
+      },
+      nonEligible: {
+        total: 0,
+        wins: 0,
+        losses: 0,
+        draws: 0,
+        voids: 0
+      }
     };
+
     const summarize = b => {
-      const x = b || { total: 0, wins: 0, losses: 0, draws: 0, voids: 0 };
-      const wl = Number(x.wins || 0) + Number(x.losses || 0);
-      return { ...x, wl, winRate: wl ? (Number(x.wins || 0) / wl) * 100 : null };
+      const x = b || {
+        total: 0,
+        wins: 0,
+        losses: 0,
+        draws: 0,
+        voids: 0
+      };
+
+      const wl =
+        Number(x.wins || 0) +
+        Number(x.losses || 0);
+
+      return {
+        ...x,
+        wl,
+        winRate: wl
+          ? (Number(x.wins || 0) / wl) * 100
+          : null
+      };
     };
+
     const pending = this.pendingSignals.filter(
-      x => this.isCurrentStrategyRecord(x) && x?.features?.v13_4Shadow?.id === V13_4_SHADOW.id && x.features.v13_4Shadow.eligible === true
+      x =>
+        this.isCurrentStrategyRecord(x) &&
+        x?.features?.v13_4Shadow?.id === V13_4_SHADOW.id &&
+        x.features.v13_4Shadow.eligible === true
     ).length;
+
     return {
       ok: true,
       strategyId: STRATEGY_ID,
       shadowId: V13_4_SHADOW.id,
-      frozenRule: { dmiGapMin: V13_4_SHADOW.dmiGapMin, adxMax: V13_4_SHADOW.adxMax },
+      frozenRule: {
+        dmiGapMin: V13_4_SHADOW.dmiGapMin,
+        adxMax: V13_4_SHADOW.adxMax
+      },
       initializedAt: base.initializedAt || null,
       firstObservedAt: base.firstObservedAt || null,
       lastObservedAt: base.lastObservedAt || null,
@@ -2516,6 +2983,486 @@ export class TickHub extends DurableObject {
       targetMinimum: 50,
       targetPreferred: 100,
       persistence: "durable-object-aggregate"
+    };
+  }
+
+  async getShortShadowStats() {
+    const state = this.shortShadowState || {
+      strategyId: SHORT_SHADOW_ID,
+      startedAt: null,
+      pending: [],
+      history: []
+    };
+
+    const pending = Array.isArray(state.pending)
+      ? state.pending
+      : [];
+
+    const history = Array.isArray(state.history)
+      ? state.history
+      : [];
+
+    const records = [...history, ...pending];
+
+    const summarize = key => {
+      const terminal = ["WIN", "LOSS", "DRAW", "VOID"];
+
+      const settled = records.filter(x =>
+        terminal.includes(
+          String(x?.[key] || "").toUpperCase()
+        )
+      );
+
+      const wins = settled.filter(
+        x => String(x?.[key] || "").toUpperCase() === "WIN"
+      ).length;
+
+      const losses = settled.filter(
+        x => String(x?.[key] || "").toUpperCase() === "LOSS"
+      ).length;
+
+      const draws = settled.filter(
+        x => String(x?.[key] || "").toUpperCase() === "DRAW"
+      ).length;
+
+      const voids = settled.filter(
+        x => String(x?.[key] || "").toUpperCase() === "VOID"
+      ).length;
+
+      const wl = wins + losses;
+
+      return {
+        settled: settled.length,
+        wins,
+        losses,
+        draws,
+        voids,
+        winRate: wl > 0
+          ? (wins / wl) * 100
+          : null
+      };
+    };
+
+    return {
+      ok: true,
+      strategyId: SHORT_SHADOW_ID,
+      startedAt: state.startedAt || null,
+      pending: pending.length,
+      expiry60: summarize("result60"),
+      expiry120: summarize("result120"),
+      recent: history.slice(0, 20)
+    };
+  }
+
+  async captureShortShadow(body = {}) {
+    const symbol = normalizeSymbol(body?.symbol);
+    const direction = String(body?.direction || "").toUpperCase();
+    const entryPrice = Number(body?.entryPrice);
+    const entryAt = Number(body?.entryAt) || Date.now();
+
+    if (!symbol || !FIXED_UNIVERSE.includes(symbol)) {
+      return { ok: false, error: "invalid short-shadow symbol" };
+    }
+
+    if (!["CALL", "PUT"].includes(direction)) {
+      return { ok: false, error: "invalid short-shadow direction" };
+    }
+
+    if (!Number.isFinite(entryPrice)) {
+      return { ok: false, error: "invalid short-shadow entry price" };
+    }
+
+    if (!this.shortShadowState) {
+      this.shortShadowState = {
+        strategyId: SHORT_SHADOW_ID,
+        startedAt: Date.now(),
+        pending: [],
+        history: []
+      };
+    }
+
+    const sourceKey = String(
+      body?.sourceKey ||
+      `${symbol}|${direction}|${Math.floor(entryAt / 60000)}`
+    );
+
+    const all = [
+      ...(this.shortShadowState.pending || []),
+      ...(this.shortShadowState.history || [])
+    ];
+
+    const duplicate = all.find(
+      x => String(x?.sourceKey || "") === sourceKey
+    );
+
+    if (duplicate) {
+      return {
+        ok: true,
+        duplicate: true,
+        id: duplicate.id
+      };
+    }
+
+    const record = {
+      id: crypto.randomUUID(),
+      sourceKey,
+      strategyId: SHORT_SHADOW_ID,
+      symbol,
+      direction,
+      entryPrice,
+      entryAt,
+      expiry60At: entryAt + 60 * 1000,
+      expiry120At: entryAt + 120 * 1000,
+      result60: null,
+      result120: null,
+      exit60Price: null,
+      exit120Price: null,
+      exit60TickAt: null,
+      exit120TickAt: null,
+      features: body?.features || null,
+      capturedAt: Date.now()
+    };
+
+    this.shortShadowState.pending = [
+      record,
+      ...(this.shortShadowState.pending || [])
+    ].slice(0, SHORT_SHADOW_MAX_PENDING);
+
+    await this.ctx.storage.put(
+      "shortShadowState",
+      this.shortShadowState
+    );
+
+    await this.scheduleAlarm();
+
+    return {
+      ok: true,
+      id: record.id,
+      sourceKey,
+      symbol,
+      direction,
+      entryPrice,
+      entryAt,
+      expiry60At: record.expiry60At,
+      expiry120At: record.expiry120At
+    };
+  }
+
+  async settleShortShadow(now = Date.now()) {
+    const state = this.shortShadowState;
+
+    if (
+      !state ||
+      !Array.isArray(state.pending) ||
+      !state.pending.length
+    ) {
+      return {
+        ok: true,
+        settled60: 0,
+        settled120: 0,
+        completed: 0
+      };
+    }
+
+    let settled60 = 0;
+    let settled120 = 0;
+    let completed = 0;
+    let changed = false;
+
+    const keep = [];
+    const finished = [];
+
+    const resolveOutcome = (
+      direction,
+      entryPrice,
+      exitPrice
+    ) => {
+      const delta =
+        Number(exitPrice) - Number(entryPrice);
+
+      if (Math.abs(delta) <= 1e-12) {
+        return "DRAW";
+      }
+
+      const won =
+        direction === "CALL"
+          ? delta > 0
+          : delta < 0;
+
+      return won ? "WIN" : "LOSS";
+    };
+
+    for (const original of state.pending) {
+      const rec = { ...original };
+
+      const ticks =
+        this.ticks.get(rec.symbol) || [];
+
+      if (
+        !rec.result60 &&
+        now >= Number(rec.expiry60At)
+      ) {
+        const tick60 = ticks.find(
+          t =>
+            Number(t.r || t.t) >=
+            Number(rec.expiry60At)
+        );
+
+        if (tick60) {
+          rec.exit60Price = Number(tick60.p);
+          rec.exit60TickAt =
+            Number(tick60.r || tick60.t);
+
+          rec.result60 = resolveOutcome(
+            rec.direction,
+            rec.entryPrice,
+            rec.exit60Price
+          );
+
+          settled60++;
+          changed = true;
+        } else if (
+          now - Number(rec.expiry60At) >= 15000
+        ) {
+          rec.result60 = "VOID";
+          settled60++;
+          changed = true;
+        }
+      }
+
+      if (
+        !rec.result120 &&
+        now >= Number(rec.expiry120At)
+      ) {
+        const tick120 = ticks.find(
+          t =>
+            Number(t.r || t.t) >=
+            Number(rec.expiry120At)
+        );
+
+        if (tick120) {
+          rec.exit120Price = Number(tick120.p);
+          rec.exit120TickAt =
+            Number(tick120.r || tick120.t);
+
+          rec.result120 = resolveOutcome(
+            rec.direction,
+            rec.entryPrice,
+            rec.exit120Price
+          );
+
+          settled120++;
+          changed = true;
+        } else if (
+          now - Number(rec.expiry120At) >= 15000
+        ) {
+          rec.result120 = "VOID";
+          settled120++;
+          changed = true;
+        }
+      }
+
+      if (rec.result60 && rec.result120) {
+        rec.completedAt = now;
+
+        finished.push(rec);
+        completed++;
+        changed = true;
+      } else {
+        keep.push(rec);
+      }
+    }
+
+    state.pending = keep;
+
+    if (finished.length) {
+      state.history = [
+        ...finished,
+        ...(state.history || [])
+      ].slice(0, SHORT_SHADOW_MAX_HISTORY);
+    }
+
+    if (changed) {
+      await this.ctx.storage.put(
+        "shortShadowState",
+        state
+      );
+    }
+
+    return {
+      ok: true,
+      settled60,
+      settled120,
+      completed
+    };
+  }
+
+  async evaluateShortShadow(symbol) {
+    symbol = normalizeSymbol(symbol);
+
+    if (!symbol || !FIXED_UNIVERSE.includes(symbol)) {
+      return {
+        ok: false,
+        error: "invalid short-shadow symbol"
+      };
+    }
+
+    // Do not overlap experimental trades on the same pair.
+    const active = (
+      this.shortShadowState?.pending || []
+    ).find(x => x.symbol === symbol);
+
+    if (active) {
+      return {
+        ok: false,
+        skipped: true,
+        symbol,
+        reason: "short-shadow position already pending on pair"
+      };
+    }
+
+    await this.subscribe(symbol);
+    await this.ensureSocket();
+    await this.refreshIfStale(symbol);
+
+    const ticks = this.ticks.get(symbol) || [];
+
+    if (ticks.length < 8) {
+      return {
+        ok: false,
+        warming: true,
+        symbol,
+        reason: `short-shadow live ticks still building (${ticks.length}/8)`
+      };
+    }
+
+    const receiveAge = this.latestReceivedAge(symbol);
+    const marketAge = this.latestMarketAge(symbol);
+
+    if (receiveAge > 8) {
+      return {
+        ok: false,
+        symbol,
+        reason:
+          `short-shadow live quote stale: ${receiveAge.toFixed(1)}s`
+      };
+    }
+
+    if (marketAge > 20) {
+      return {
+        ok: false,
+        symbol,
+        reason:
+          `short-shadow provider quote is ${marketAge.toFixed(1)}s old`
+      };
+    }
+
+    let bars1m;
+
+    try {
+      bars1m =
+        await this.fetchOneMinuteBars(symbol);
+    } catch (e) {
+      return {
+        ok: false,
+        symbol,
+        quotaExceeded:
+          Boolean(e?.quotaExceeded),
+        retryAfterMinutes:
+          Number(e?.retryAfterMinutes || 0),
+        reason:
+          `short-shadow 1m context unavailable: ${String(
+            e?.message || e
+          )}`
+      };
+    }
+
+    const candidate =
+      scoreShortExpiryShadow(
+        ticks,
+        bars1m,
+        symbol
+      );
+
+    if (!candidate.ok) {
+      return {
+        ...candidate,
+        symbol,
+        captured: false
+      };
+    }
+
+    const quote = ticks.at(-1);
+    const entryPrice = Number(quote?.p);
+
+    if (!Number.isFinite(entryPrice)) {
+      return {
+        ok: false,
+        symbol,
+        reason: "short-shadow entry quote unavailable"
+      };
+    }
+
+    const entryAt = Date.now();
+
+    const sourceKey =
+      `${SHORT_SHADOW_ID}|${symbol}|` +
+      `${candidate.direction}|` +
+      `${Math.floor(entryAt / 60000)}`;
+
+    const capture =
+      await this.captureShortShadow({
+        symbol,
+        direction: candidate.direction,
+        entryPrice,
+        entryAt,
+        sourceKey,
+
+        features: {
+          quality: candidate.quality,
+          efficiency: candidate.efficiency,
+          extensionAtr: candidate.extensionAtr,
+
+          smaFast: candidate.smaFast,
+          smaSlow: candidate.smaSlow,
+          fastSlope: candidate.fastSlope,
+
+          rsi: candidate.rsi,
+          adx: candidate.adx,
+          dmiGap: candidate.dmiGap,
+
+          tickUpRatio:
+            candidate.tickUpRatio,
+          tickDownRatio:
+            candidate.tickDownRatio,
+          tickNorm:
+            candidate.tickNorm,
+
+          confirmationCount:
+            candidate.confirmationCount,
+
+          confirmations:
+            candidate.confirmations,
+
+          broad5m:
+            candidate.broad5m
+        }
+      });
+
+    return {
+      ...candidate,
+      symbol,
+      captured:
+        Boolean(
+          capture?.ok &&
+          !capture?.duplicate
+        ),
+      duplicate:
+        Boolean(capture?.duplicate),
+      shadowId:
+        capture?.id || null,
+      entryPrice,
+      entryAt
     };
   }
 
@@ -2560,13 +3507,26 @@ export class TickHub extends DurableObject {
       const body = await req.json().catch(() => ({}));
       const result = body?.result || null;
       const summary = result ? {
-        ok: Boolean(result.ok), ready: Boolean(result.ready), symbol: result.symbol || null,
-        direction: result.direction || null, reason: result.reason || null,
-        readyAlertsSent: Number(result.readyAlertsSent || 0)
+        ok: Boolean(result.ok),
+        ready: Boolean(result.ready),
+        symbol: result.symbol || null,
+        direction: result.direction || null,
+        reason: result.reason || null,
+
+        readyAlertsSent:
+          Number(result.readyAlertsSent || 0),
+
+        shortShadowChecked:
+          Number(result.shortShadowChecked || 0),
+
+        shortShadowCaptured:
+          Number(result.shortShadowCaptured || 0),
+
+        shortShadowSymbols:
+          Array.isArray(result.shortShadowSymbols)
+            ? result.shortShadowSymbols.slice(0, 6)
+            : []
       } : null;
-      await this.ctx.storage.put("lastCronResultAt", Date.now());
-      await this.ctx.storage.put("lastCronResult", summary);
-      return json({ ok: true });
     }
 
     if (u.pathname === "/cronstatus") {
@@ -2609,6 +3569,13 @@ export class TickHub extends DurableObject {
 
       return json(result);
     }
+
+    if (u.pathname === "/short-shadow") {
+      return json(
+        await this.evaluateShortShadow(symbol)
+      );
+    }
+
     if (u.pathname === "/quote") {
       if (!symbol) return json({ ok: false, error: "invalid symbol" }, 400);
       await this.subscribe(symbol);
@@ -2646,6 +3613,9 @@ export class TickHub extends DurableObject {
     if (u.pathname === "/track" && req.method === "POST") return json(await this.trackSignal(req));
     if (u.pathname === "/stats") return json(await this.getTrackingStats());
     if (u.pathname === "/forwardstats") return json(await this.getForwardStats());
+    if (u.pathname === "/shortstats") {
+      return json(await this.getShortShadowStats());
+    }
     if (u.pathname === "/blockerstats") {
       const stats = await this.getBlockerStats();
 
@@ -2927,31 +3897,169 @@ async function issueAgradeSignal(env, chatIds, candidate, sourceUpdateId = "auto
   return { ok: true, symbol, direction: result.direction, quality: result.quality };
 }
 
-async function autoScanAndAlert(env) {
-  try {
-    const chatState = await hub(env, "/chats");
-    const chats = Array.isArray(chatState?.chats) ? chatState.chats : [];
-    if (!chats.length) return { ok: false, reason: "no registered chat" };
+async function scanShortShadowUniverse(env) {
+  const checked = [];
+  const captured = [];
 
-    const risk = await hub(env, "/risk");
-    if (!risk.ok) return { ok: false, reason: risk.reason || "risk gate" };
+  for (const symbol of FIXED_UNIVERSE) {
+    try {
+      const result = await hub(
+        env,
+        `/short-shadow?symbol=${encodeURIComponent(symbol)}`
+      );
 
-    await hub(env, "/prime-live?ms=5000");
-    const scan = await scanUniverse(env);
+      const row = {
+        ...result,
+        symbol
+      };
 
-    // Signal-only mode: internal setup states are never sent to Telegram.
-    if (scan.ok) {
-      const minuteKey = Math.floor(Date.now() / 60000);
-      const signal = await issueAgradeSignal(env, chats, scan.best, `auto-${minuteKey}-${scan.best.symbol}`, true);
-      return { ...signal, readyAlertsSent: 0 };
+      checked.push(row);
+
+      if (row?.captured) {
+        captured.push(row);
+      }
+
+      // Tiingo quota is global, so do not keep hammering
+      // the remaining pairs once the quota is blocked.
+      if (row?.quotaExceeded) {
+        break;
+      }
+    } catch (e) {
+      checked.push({
+        ok: false,
+        symbol,
+        captured: false,
+        reason: String(e?.message || e)
+      });
     }
-
-    return { ok: false, reason: scan.reason || "no fully qualified setup", readyAlertsSent: 0 };
-  } finally {
-    try { await hub(env, "/sleep"); } catch (_) { }
   }
+
+  return {
+    ok: true,
+    checked: checked.length,
+    captured: captured.length,
+    symbols: captured.map(x => x.symbol),
+    rows: checked
+  };
 }
 
+async function autoScanAndAlert(env) {
+  try {
+    // Prime the live WebSocket first so both engines
+    // work from the same fresh market sample.
+    await hub(env, "/prime-live?ms=5000");
+
+    // -------------------------------------------------
+    // SHORT-EXPIRY SHADOW
+    // Runs independently of the 5-minute risk gate.
+    // It records experimental 60s/120s entries only.
+    // It NEVER sends a short-expiry Telegram trade.
+    // -------------------------------------------------
+    const shortShadow =
+      await scanShortShadowUniverse(env);
+
+    const shortSummary = {
+      shortShadowChecked:
+        Number(shortShadow?.checked || 0),
+
+      shortShadowCaptured:
+        Number(shortShadow?.captured || 0),
+
+      shortShadowSymbols:
+        Array.isArray(shortShadow?.symbols)
+          ? shortShadow.symbols
+          : []
+    };
+
+    // -------------------------------------------------
+    // EXISTING 5-MINUTE LIVE ENGINE
+    // -------------------------------------------------
+    const chatState =
+      await hub(env, "/chats");
+
+    const chats =
+      Array.isArray(chatState?.chats)
+        ? chatState.chats
+        : [];
+
+    if (!chats.length) {
+      return {
+        ok: false,
+        reason: "no registered chat",
+        readyAlertsSent: 0,
+
+        ...shortSummary
+      };
+    }
+
+    const risk =
+      await hub(env, "/risk");
+
+    if (!risk.ok) {
+      return {
+        ok: false,
+        reason:
+          risk.reason || "risk gate",
+        readyAlertsSent: 0,
+
+        shortShadowCaptured:
+          Number(shortShadow?.captured || 0),
+
+        shortShadowSymbols:
+          shortShadow?.symbols || []
+      };
+    }
+
+    const scan =
+      await scanUniverse(env);
+
+    // Existing 5-minute signal-only mode.
+    if (scan.ok) {
+      const minuteKey =
+        Math.floor(Date.now() / 60000);
+
+      const signal =
+        await issueAgradeSignal(
+          env,
+          chats,
+          scan.best,
+          `auto-${minuteKey}-${scan.best.symbol}`,
+          true
+        );
+
+      return {
+        ...signal,
+        readyAlertsSent: 0,
+
+        shortShadowCaptured:
+          Number(shortShadow?.captured || 0),
+
+        shortShadowSymbols:
+          shortShadow?.symbols || []
+      };
+    }
+
+    return {
+      ok: false,
+      reason:
+        scan.reason ||
+        "no fully qualified setup",
+
+      readyAlertsSent: 0,
+
+      shortShadowCaptured:
+        Number(shortShadow?.captured || 0),
+
+      shortShadowSymbols:
+        shortShadow?.symbols || []
+    };
+
+  } finally {
+    try {
+      await hub(env, "/sleep");
+    } catch (_) { }
+  }
+}
 
 async function checkAllFeeds(env) {
   try {
@@ -3102,6 +4210,63 @@ export default {
           );
           return new Response("ok");
         }
+        if (/^\/shortstats$/i.test(text)) {
+          try {
+            const st = await hub(env, "/shortstats");
+
+            const wr60 =
+              st.expiry60?.winRate == null
+                ? "n/a"
+                : Number(st.expiry60.winRate).toFixed(1) + "%";
+
+            const wr120 =
+              st.expiry120?.winRate == null
+                ? "n/a"
+                : Number(st.expiry120.winRate).toFixed(1) + "%";
+
+            await tgSend(
+              env,
+              chatId,
+              `SHORT-EXPIRY SHADOW\n` +
+              `Strategy: ${st.strategyId}\n` +
+              `Pending setups: ${st.pending || 0}\n\n` +
+
+              `60 SECOND\n` +
+              `Settled: ${st.expiry60?.settled || 0}\n` +
+              `Wins: ${st.expiry60?.wins || 0}\n` +
+              `Losses: ${st.expiry60?.losses || 0}\n` +
+              `Draws: ${st.expiry60?.draws || 0}\n` +
+              `Voids: ${st.expiry60?.voids || 0}\n` +
+              `W/L win rate: ${wr60}\n\n` +
+
+              `120 SECOND\n` +
+              `Settled: ${st.expiry120?.settled || 0}\n` +
+              `Wins: ${st.expiry120?.wins || 0}\n` +
+              `Losses: ${st.expiry120?.losses || 0}\n` +
+              `Draws: ${st.expiry120?.draws || 0}\n` +
+              `Voids: ${st.expiry120?.voids || 0}\n` +
+              `W/L win rate: ${wr120}\n\n` +
+
+              `Shadow mode only — no short-expiry trade alerts are being sent yet.`
+            );
+
+          } catch (e) {
+            console.error(
+              "shortstats failed",
+              String(e?.stack || e?.message || e)
+            );
+
+            await tgSend(
+              env,
+              chatId,
+              `SHORT-STATS ERROR\n${String(
+                e?.message || e
+              ).slice(0, 300)}`
+            );
+          }
+
+          return new Response("ok");
+        }
         if (/^\/blockerstats$/i.test(text)) {
           try {
             const st = await hub(env, "/blockerstats");
@@ -3210,8 +4375,36 @@ export default {
           const next = sch.nextAlarmAt ? Math.max(0, Math.ceil((Number(sch.nextAlarmAt) - Date.now()) / 1000)) + "s" : "n/a";
           const source = schedulerError ? "NOT ARMED" : (sch.enabled ? "Durable Object alarm" : "NOT ARMED");
           const quota = Number(st.quotaRetryMinutes || 0) > 0 ? `BLOCKED — about ${st.quotaRetryMinutes}m to reset` : "OK";
-          await tgSend(env, chatId, `AUTO-SCAN STATUS\nVersion: ${VERSION}\nScheduler: ${source}\nLast scan: ${age} ago\nScans recorded: ${st.count || 0}\nNext scheduler wake: ${next}\nTiingo REST quota: ${quota}\nLast result: ${r.ok ? "qualified/handled" : (r.reason || "no qualified setup")}\nREADY alerts in last scan: ${r.readyAlertsSent || 0}${r.symbol ? `\nSymbol: ${r.symbol}` : ""}${schedulerError ? `\nScheduler error: ${schedulerError}` : ""}${sch.lastError ? `\nAlarm error: ${sch.lastError}` : ""}`);
-          return new Response("ok");
+          await tgSend(
+            env,
+            chatId,
+            `AUTO-SCAN STATUS\n` +
+            `Version: ${VERSION}\n` +
+            `Scheduler: ${source}\n` +
+            `Last scan: ${age} ago\n` +
+            `Scans recorded: ${st.count || 0}\n` +
+            `Next scheduler wake: ${next}\n` +
+            `Tiingo REST quota: ${quota}\n\n` +
+
+            `SHORT-EXPIRY SHADOW\n` +
+            `Pairs checked last scan: ${Number(r.shortShadowChecked || 0)}/${FIXED_UNIVERSE.length}\n` +
+            `Setups captured last scan: ${Number(r.shortShadowCaptured || 0)}\n` +
+            `Captured pairs: ${Array.isArray(r.shortShadowSymbols) &&
+              r.shortShadowSymbols.length
+              ? r.shortShadowSymbols.join(", ")
+              : "none"
+            }\n\n` +
+
+            `5-MINUTE ENGINE\n` +
+            `Last result: ${r.ok
+              ? "qualified/handled"
+              : (r.reason || "no qualified setup")
+            }\n` +
+            `READY alerts: ${r.readyAlertsSent || 0}` +
+            `${r.symbol ? `\nSymbol: ${r.symbol}` : ""}` +
+            `${schedulerError ? `\nScheduler error: ${schedulerError}` : ""}` +
+            `${sch.lastError ? `\nAlarm error: ${sch.lastError}` : ""}`
+          );
         }
         if (/^\/reconnect$/i.test(text)) {
           const st = await hub(env, "/reconnect");
