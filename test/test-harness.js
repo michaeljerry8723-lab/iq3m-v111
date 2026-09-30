@@ -513,8 +513,8 @@ console.log(`Test 9: Short-expiry shadow statistics`);
   );
 
   assert(
-    stats.evidence.settledClusters === 2,
-    `Evidence counter sees 2 fully settled clusters: ${stats.evidence.settledClusters}`
+    stats.evidence.settledClusters === 1,
+    `Evidence counter sees 1 fully scored cluster: ${stats.evidence.settledClusters}`
   );
 
   assert(
@@ -525,7 +525,7 @@ console.log(`Test 9: Short-expiry shadow statistics`);
 
   assert(
     Math.abs(
-      stats.evidence.minimumProgressPct - 4
+      stats.evidence.minimumProgressPct - 2
     ) < 0.001,
     `Minimum evidence progress: ${stats.evidence.minimumProgressPct}%`
   );

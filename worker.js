@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.6.11-cruz-scheduler-settlement";
+export const VERSION = "13.6.12-cruz-scored-evidence";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -4298,22 +4298,35 @@ export class TickHub extends DurableObject {
       };
     }
 
-    const fullySettledClusters =
-      Math.min(
-        Number(
-          clusterAdjusted.expiry60
-            ?.settledClusters || 0
-        ),
-        Number(
-          clusterAdjusted.expiry120
-            ?.settledClusters || 0
-        )
-      );
+    const fullyScoredClusters =
+      [...clusterMap.values()]
+        .filter(setups => {
+          const wl60 =
+            setups.some(x =>
+              ["WIN", "LOSS"].includes(
+                String(
+                  x?.result60 || ""
+                ).toUpperCase()
+              )
+            );
+
+          const wl120 =
+            setups.some(x =>
+              ["WIN", "LOSS"].includes(
+                String(
+                  x?.result120 || ""
+                ).toUpperCase()
+              )
+            );
+
+          return wl60 && wl120;
+        })
+        .length;
 
 
     const evidence = {
       settledClusters:
-        fullySettledClusters,
+        fullyScoredClusters,
 
       minimumTarget:
         50,
@@ -4325,7 +4338,7 @@ export class TickHub extends DurableObject {
         Math.min(
           100,
           (
-            fullySettledClusters /
+            fullyScoredClusters /
             50
           ) * 100
         ),
@@ -4334,15 +4347,15 @@ export class TickHub extends DurableObject {
         Math.min(
           100,
           (
-            fullySettledClusters /
+            fullyScoredClusters /
             100
           ) * 100
         ),
 
       status:
-        fullySettledClusters >= 100
+        fullyScoredClusters >= 100
           ? "preferred target reached"
-          : fullySettledClusters >= 50
+          : fullyScoredClusters >= 50
             ? "minimum target reached"
             : "collecting"
     };
@@ -5801,7 +5814,7 @@ export default {
               `Losing: ${adjusted120.losingClusters || 0} | ` +
               `Tied: ${adjusted120.tiedClusters || 0}\n\n` +
               `EVIDENCE PROGRESS\n` +
-              `Settled independent clusters: ${evidence.settledClusters || 0}\n` +
+              `Scored independent clusters: ${evidence.settledClusters || 0}\n` +
               `Minimum target: ${evidence.minimumTarget || 50}\n` +
               `Progress to minimum: ${minimumProgress}%\n` +
               `Preferred target: ${evidence.preferredTarget || 100}\n` +
