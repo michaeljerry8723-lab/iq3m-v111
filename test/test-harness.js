@@ -1475,6 +1475,98 @@ console.log(
 console.log();
 
 // -----------------------------------------------------------------------------
+// Test 19: Scheduler settlement endpoint clears overdue short-expiry records
+// -----------------------------------------------------------------------------
+console.log(
+  "Test 19: Scheduler settlement endpoint clears overdue short-expiry records"
+);
+
+{
+  const storage = new MockStorage();
+  const ctx = new MockCtx(storage);
+
+  const hub = new TickHub(ctx, {
+    WS_SYMBOLS: "EUR/USD"
+  });
+
+  await ctx.waitForInit();
+
+  const now = Date.now();
+
+  hub.shortShadowState = {
+    strategyId: SHORT_SHADOW_ID,
+    startedAt: now - 300000,
+
+    pending: [
+      {
+        id: "scheduler-settlement-test",
+        sourceKey: "scheduler-settlement-test",
+        strategyId: SHORT_SHADOW_ID,
+
+        symbol: "EUR/USD",
+        direction: "CALL",
+
+        entryPrice: 1.1000,
+        entryAt: now - 180000,
+
+        expiry60At: now - 120000,
+        expiry120At: now - 60000,
+
+        result60: null,
+        result120: null,
+
+        exit60Price: null,
+        exit120Price: null,
+
+        exit60TickAt: null,
+        exit120TickAt: null
+      }
+    ],
+
+    history: []
+  };
+
+  await storage.put(
+    "shortShadowState",
+    hub.shortShadowState
+  );
+
+  const response =
+    await hub.fetch(
+      new Request(
+        "https://tickhub/settle-short-shadow"
+      )
+    );
+
+  const result =
+    await response.json();
+
+  assert(
+    result.ok === true,
+    "Scheduler settlement endpoint returns ok"
+  );
+
+  assert(
+    result.completed === 1,
+    "Scheduler settlement endpoint completes overdue record"
+  );
+
+  assert(
+    hub.shortShadowState.pending.length === 0,
+    "Scheduler settlement endpoint clears overdue pending record"
+  );
+
+  assert(
+    hub.shortShadowState.history.length === 1 &&
+    hub.shortShadowState.history[0].result60 === "VOID" &&
+    hub.shortShadowState.history[0].result120 === "VOID",
+    "Scheduler settlement endpoint moves overdue record to history as VOID"
+  );
+}
+
+console.log();
+
+// -----------------------------------------------------------------------------
 // Summary
 // -----------------------------------------------------------------------------
 console.log(`=======================================================`);

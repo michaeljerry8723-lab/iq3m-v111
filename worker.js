@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.6.10-cruz-settlement-repair";
+export const VERSION = "13.6.11-cruz-scheduler-settlement";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -4913,6 +4913,17 @@ export class TickHub extends DurableObject {
       return json(result);
     }
 
+    if (u.pathname === "/settle-short-shadow") {
+      const result =
+        await this.settleShortShadow(
+          Date.now()
+        );
+
+      await this.scheduleAlarm();
+
+      return json(result);
+    }
+
     if (u.pathname === "/short-shadow") {
       return json(
         await this.evaluateShortShadow(symbol)
@@ -5290,6 +5301,13 @@ async function autoScanAndAlert(env) {
   try {
     // Prime the live WebSocket first so both engines
     // work from the same fresh market sample.
+    // Guaranteed short-expiry settlement pass.
+    // The one-minute AutoScheduler is already proven
+    // to be running continuously in production.
+    await hub(
+      env,
+      "/settle-short-shadow"
+    );
     await hub(env, "/prime-live?ms=5000");
 
     // -------------------------------------------------
