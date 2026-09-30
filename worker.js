@@ -3506,6 +3506,7 @@ export class TickHub extends DurableObject {
     if (u.pathname === "/cron-result" && req.method === "POST") {
       const body = await req.json().catch(() => ({}));
       const result = body?.result || null;
+
       const summary = result ? {
         ok: Boolean(result.ok),
         ready: Boolean(result.ready),
@@ -3527,6 +3528,18 @@ export class TickHub extends DurableObject {
             ? result.shortShadowSymbols.slice(0, 6)
             : []
       } : null;
+
+      await this.ctx.storage.put(
+        "lastCronResultAt",
+        Date.now()
+      );
+
+      await this.ctx.storage.put(
+        "lastCronResult",
+        summary
+      );
+
+      return json({ ok: true });
     }
 
     if (u.pathname === "/cronstatus") {
@@ -3962,13 +3975,7 @@ async function autoScanAndAlert(env) {
       shortShadowChecked:
         Number(shortShadow?.checked || 0),
 
-      shortShadowCaptured:
-        Number(shortShadow?.captured || 0),
-
-      shortShadowSymbols:
-        Array.isArray(shortShadow?.symbols)
-          ? shortShadow.symbols
-          : []
+      ...shortSummary
     };
 
     // -------------------------------------------------
@@ -4030,12 +4037,7 @@ async function autoScanAndAlert(env) {
       return {
         ...signal,
         readyAlertsSent: 0,
-
-        shortShadowCaptured:
-          Number(shortShadow?.captured || 0),
-
-        shortShadowSymbols:
-          shortShadow?.symbols || []
+        ...shortSummary
       };
     }
 
