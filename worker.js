@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.6.1-signal-audit";
+export const VERSION = "13.6.2-short-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_ID = "cruz-short-expiry-shadow-v1";
@@ -3507,13 +3507,26 @@ export class TickHub extends DurableObject {
       const body = await req.json().catch(() => ({}));
       const result = body?.result || null;
       const summary = result ? {
-        ok: Boolean(result.ok), ready: Boolean(result.ready), symbol: result.symbol || null,
-        direction: result.direction || null, reason: result.reason || null,
-        readyAlertsSent: Number(result.readyAlertsSent || 0)
+        ok: Boolean(result.ok),
+        ready: Boolean(result.ready),
+        symbol: result.symbol || null,
+        direction: result.direction || null,
+        reason: result.reason || null,
+
+        readyAlertsSent:
+          Number(result.readyAlertsSent || 0),
+
+        shortShadowChecked:
+          Number(result.shortShadowChecked || 0),
+
+        shortShadowCaptured:
+          Number(result.shortShadowCaptured || 0),
+
+        shortShadowSymbols:
+          Array.isArray(result.shortShadowSymbols)
+            ? result.shortShadowSymbols.slice(0, 6)
+            : []
       } : null;
-      await this.ctx.storage.put("lastCronResultAt", Date.now());
-      await this.ctx.storage.put("lastCronResult", summary);
-      return json({ ok: true });
     }
 
     if (u.pathname === "/cronstatus") {
@@ -3945,6 +3958,19 @@ async function autoScanAndAlert(env) {
     const shortShadow =
       await scanShortShadowUniverse(env);
 
+    const shortSummary = {
+      shortShadowChecked:
+        Number(shortShadow?.checked || 0),
+
+      shortShadowCaptured:
+        Number(shortShadow?.captured || 0),
+
+      shortShadowSymbols:
+        Array.isArray(shortShadow?.symbols)
+          ? shortShadow.symbols
+          : []
+    };
+
     // -------------------------------------------------
     // EXISTING 5-MINUTE LIVE ENGINE
     // -------------------------------------------------
@@ -3962,11 +3988,7 @@ async function autoScanAndAlert(env) {
         reason: "no registered chat",
         readyAlertsSent: 0,
 
-        shortShadowCaptured:
-          Number(shortShadow?.captured || 0),
-
-        shortShadowSymbols:
-          shortShadow?.symbols || []
+        ...shortSummary
       };
     }
 
@@ -4353,8 +4375,36 @@ export default {
           const next = sch.nextAlarmAt ? Math.max(0, Math.ceil((Number(sch.nextAlarmAt) - Date.now()) / 1000)) + "s" : "n/a";
           const source = schedulerError ? "NOT ARMED" : (sch.enabled ? "Durable Object alarm" : "NOT ARMED");
           const quota = Number(st.quotaRetryMinutes || 0) > 0 ? `BLOCKED — about ${st.quotaRetryMinutes}m to reset` : "OK";
-          await tgSend(env, chatId, `AUTO-SCAN STATUS\nVersion: ${VERSION}\nScheduler: ${source}\nLast scan: ${age} ago\nScans recorded: ${st.count || 0}\nNext scheduler wake: ${next}\nTiingo REST quota: ${quota}\nLast result: ${r.ok ? "qualified/handled" : (r.reason || "no qualified setup")}\nREADY alerts in last scan: ${r.readyAlertsSent || 0}${r.symbol ? `\nSymbol: ${r.symbol}` : ""}${schedulerError ? `\nScheduler error: ${schedulerError}` : ""}${sch.lastError ? `\nAlarm error: ${sch.lastError}` : ""}`);
-          return new Response("ok");
+          await tgSend(
+            env,
+            chatId,
+            `AUTO-SCAN STATUS\n` +
+            `Version: ${VERSION}\n` +
+            `Scheduler: ${source}\n` +
+            `Last scan: ${age} ago\n` +
+            `Scans recorded: ${st.count || 0}\n` +
+            `Next scheduler wake: ${next}\n` +
+            `Tiingo REST quota: ${quota}\n\n` +
+
+            `SHORT-EXPIRY SHADOW\n` +
+            `Pairs checked last scan: ${Number(r.shortShadowChecked || 0)}/${FIXED_UNIVERSE.length}\n` +
+            `Setups captured last scan: ${Number(r.shortShadowCaptured || 0)}\n` +
+            `Captured pairs: ${Array.isArray(r.shortShadowSymbols) &&
+              r.shortShadowSymbols.length
+              ? r.shortShadowSymbols.join(", ")
+              : "none"
+            }\n\n` +
+
+            `5-MINUTE ENGINE\n` +
+            `Last result: ${r.ok
+              ? "qualified/handled"
+              : (r.reason || "no qualified setup")
+            }\n` +
+            `READY alerts: ${r.readyAlertsSent || 0}` +
+            `${r.symbol ? `\nSymbol: ${r.symbol}` : ""}` +
+            `${schedulerError ? `\nScheduler error: ${schedulerError}` : ""}` +
+            `${sch.lastError ? `\nAlarm error: ${sch.lastError}` : ""}`
+          );
         }
         if (/^\/reconnect$/i.test(text)) {
           const st = await hub(env, "/reconnect");
