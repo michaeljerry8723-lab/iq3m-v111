@@ -1,10 +1,10 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.6.2-short-shadow";
+export const VERSION = "13.6.3-cruz-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
-export const SHORT_SHADOW_ID = "cruz-short-expiry-shadow-v1";
+export const SHORT_SHADOW_ID = "cruz-1m-ichimoku-dmi-shadow-v1";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const SHORT_SHADOW_MAX_PENDING = 250;
 export const SHORT_SHADOW_MAX_HISTORY = 1000;
@@ -4038,7 +4038,7 @@ export class TickHub extends DurableObject {
     }
 
     const candidate =
-      scoreShortExpiryShadow(
+      scoreCruz1mShadow(
         ticks,
         bars1m,
         symbol
@@ -4079,33 +4079,26 @@ export class TickHub extends DurableObject {
         sourceKey,
 
         features: {
-          quality: candidate.quality,
-          efficiency: candidate.efficiency,
-          extensionAtr: candidate.extensionAtr,
+          model:
+            "cruz-1m-ichimoku-dmi",
 
-          smaFast: candidate.smaFast,
-          smaSlow: candidate.smaSlow,
-          fastSlope: candidate.fastSlope,
+          timeframe:
+            candidate.timeframe,
 
-          rsi: candidate.rsi,
-          adx: candidate.adx,
-          dmiGap: candidate.dmiGap,
+          expiryCandidates:
+            candidate.expiryCandidates,
 
-          tickUpRatio:
-            candidate.tickUpRatio,
-          tickDownRatio:
-            candidate.tickDownRatio,
-          tickNorm:
-            candidate.tickNorm,
+          ichimoku:
+            candidate.ichimoku,
 
-          confirmationCount:
-            candidate.confirmationCount,
+          dmi:
+            candidate.dmi,
 
-          confirmations:
-            candidate.confirmations,
+          trigger:
+            candidate.trigger,
 
-          broad5m:
-            candidate.broad5m
+          reasons:
+            candidate.reasons
         }
       });
 

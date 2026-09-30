@@ -1003,6 +1003,125 @@ console.log("Test 14: Cruz 1-minute BUY / SELL trigger");
 console.log();
 
 // -----------------------------------------------------------------------------
+// Test 15: Cruz detector integrates with short-shadow capture
+// -----------------------------------------------------------------------------
+console.log("Test 15: Cruz detector integrates with short-shadow capture");
+
+{
+  const now = Date.now();
+
+  const bars = [];
+  let price = 1.10000;
+
+  // Build bearish pressure first.
+  for (let i = 0; i < 59; i++) {
+    const o = price;
+    const c = price - 0.00005;
+
+    bars.push({
+      t: now - (60 - i) * 60000,
+      o,
+      h: Math.max(o, c) + 0.00003,
+      l: Math.min(o, c) - 0.00003,
+      c,
+      n: 20
+    });
+
+    price = c;
+  }
+
+  // Strong bullish Cruz reversal / breakout candle.
+  {
+    const o = price;
+    const c = price + 0.00050;
+
+    bars.push({
+      t: now - 60000,
+      o,
+      h: c + 0.00003,
+      l: o - 0.00003,
+      c,
+      n: 30
+    });
+  }
+
+  const ticks = createTicks({
+    lastPrice: Number(bars.at(-1).c),
+    direction: "CALL",
+    count: 24,
+    aligned: true,
+    now
+  });
+
+  const storage = new MockStorage();
+  const ctx = new MockCtx(storage);
+
+  const hub = new TickHub(ctx, {
+    WS_SYMBOLS: "EUR/USD"
+  });
+
+  await ctx.waitForInit();
+
+  // No external network calls during deterministic test.
+  hub.subscribe = async () => true;
+  hub.ensureSocket = async () => true;
+  hub.refreshIfStale = async () => true;
+  hub.fetchOneMinuteBars = async () => bars;
+
+  for (const tick of ticks) {
+    hub.pushTick(
+      "EUR/USD",
+      tick.t,
+      tick.p,
+      tick.bid,
+      tick.ask
+    );
+  }
+
+  const result =
+    await hub.evaluateShortShadow(
+      "EUR/USD"
+    );
+
+  assert(
+    result.ok &&
+    result.captured === true &&
+    result.direction === "CALL",
+    "Cruz CALL is captured by autonomous short-shadow evaluator"
+  );
+
+  assert(
+    hub.shortShadowState.pending.length === 1,
+    "Captured Cruz setup enters pending settlement queue"
+  );
+
+  const record =
+    hub.shortShadowState.pending[0];
+
+  assert(
+    record.strategyId === SHORT_SHADOW_ID,
+    "Captured setup uses current Cruz shadow strategy ID"
+  );
+
+  assert(
+    record.features?.model ===
+    "cruz-1m-ichimoku-dmi",
+    "Captured setup records Cruz model identity"
+  );
+
+  assert(
+    record.features?.ichimoku?.tenkanPeriod === 5 &&
+    record.features?.ichimoku?.kijunPeriod === 10 &&
+    record.features?.ichimoku?.spanBPeriod === 20 &&
+    record.features?.dmi?.diLength === 7 &&
+    record.features?.dmi?.adxSmoothing === 14,
+    "Captured setup preserves Cruz 5/10/20 Ichimoku and 7/14 DMI settings"
+  );
+}
+
+console.log();
+
+// -----------------------------------------------------------------------------
 // Summary
 // -----------------------------------------------------------------------------
 console.log(`=======================================================`);
