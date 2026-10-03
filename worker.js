@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.6.12-cruz-scored-evidence";
+export const VERSION = "13.7.0-cruz-aroon-osma-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -14,7 +14,8 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "AUD/JPY",
   "CAD/JPY"
 ]);
-export const SHORT_SHADOW_ID = "cruz-1m-ichimoku-dmi-shadow-v1";
+export const SHORT_SHADOW_ID =
+  "cruz-30s-aroon10-osma10-20-10-shadow-v2";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const SHORT_SHADOW_MAX_PENDING = 250;
 export const SHORT_SHADOW_MAX_HISTORY = 1000;
@@ -180,6 +181,32 @@ function normalizeSymbol(input) {
   if (/^[A-Z]{6}$/.test(s)) s = s.slice(0, 3) + "/" + s.slice(3);
   return /^[A-Z0-9]{2,10}\/[A-Z0-9]{2,10}$/.test(s) ? s : null;
 }
+function toOandaSymbol(symbol) {
+  const s =
+    normalizeSymbol(symbol);
+
+  if (!s) {
+    return null;
+  }
+
+  return s.replace(
+    "/",
+    "_"
+  );
+}
+function toMassiveForexTicker(symbol) {
+  const s =
+    normalizeSymbol(symbol);
+
+  if (!s) {
+    return null;
+  }
+
+  return (
+    "C:" +
+    s.replace("/", "")
+  );
+}
 function toTiingoSymbol(symbol) {
   const s = normalizeSymbol(symbol);
   return s ? s.replace("/", "").toLowerCase() : null;
@@ -294,6 +321,848 @@ function aroonSnapshot(bars, p = 7) {
   xs.forEach((b, i) => { if (Number(b.h) >= hi) { hi = Number(b.h); hiIdx = i; } if (Number(b.l) <= lo) { lo = Number(b.l); loIdx = i; } });
   const sinceHi = p - 1 - hiIdx, sinceLo = p - 1 - loIdx;
   return { ready: true, up: 100 * (p - sinceHi) / p, down: 100 * (p - sinceLo) / p, spread: 100 * ((p - sinceHi) - (p - sinceLo)) / p };
+}
+export function cruzAroonSnapshot(
+  bars,
+  period = 10
+) {
+  const p =
+    Math.max(
+      1,
+      Math.floor(period)
+    );
+
+  if (
+    !Array.isArray(bars) ||
+    bars.length < p + 2
+  ) {
+    return {
+      ready: false,
+      period: p,
+      bars: Array.isArray(bars)
+        ? bars.length
+        : 0
+    };
+  }
+
+  const calculateAt = endIndex => {
+    const startIndex =
+      endIndex - p;
+
+    if (startIndex < 0) {
+      return null;
+    }
+
+    let highest =
+      -Infinity;
+
+    let lowest =
+      Infinity;
+
+    let highestIndex =
+      startIndex;
+
+    let lowestIndex =
+      startIndex;
+
+
+    for (
+      let i = startIndex;
+      i <= endIndex;
+      i++
+    ) {
+      const high =
+        Number(bars[i]?.h);
+
+      const low =
+        Number(bars[i]?.l);
+
+      if (
+        !Number.isFinite(high) ||
+        !Number.isFinite(low)
+      ) {
+        return null;
+      }
+
+
+      // Use the most recent occurrence
+      // when equal highs/lows exist.
+      if (high >= highest) {
+        highest = high;
+        highestIndex = i;
+      }
+
+      if (low <= lowest) {
+        lowest = low;
+        lowestIndex = i;
+      }
+    }
+
+
+    const periodsSinceHigh =
+      endIndex -
+      highestIndex;
+
+    const periodsSinceLow =
+      endIndex -
+      lowestIndex;
+
+
+    const up =
+      100 *
+      (
+        p -
+        periodsSinceHigh
+      ) /
+      p;
+
+    const down =
+      100 *
+      (
+        p -
+        periodsSinceLow
+      ) /
+      p;
+
+
+    return {
+      up,
+      down,
+
+      periodsSinceHigh,
+      periodsSinceLow,
+
+      highest,
+      lowest
+    };
+  };
+
+
+  const current =
+    calculateAt(
+      bars.length - 1
+    );
+
+  const previous =
+    calculateAt(
+      bars.length - 2
+    );
+
+
+  if (
+    !current ||
+    !previous ||
+    ![
+      current.up,
+      current.down,
+      previous.up,
+      previous.down
+    ].every(Number.isFinite)
+  ) {
+    return {
+      ready: false,
+      period: p,
+      bars: bars.length
+    };
+  }
+
+
+  return {
+    ready: true,
+
+    period: p,
+
+    up:
+      current.up,
+
+    down:
+      current.down,
+
+    previousUp:
+      previous.up,
+
+    previousDown:
+      previous.down,
+
+    crossUp:
+      current.up >
+      current.down &&
+      previous.up <=
+      previous.down,
+
+    crossDown:
+      current.down >
+      current.up &&
+      previous.down <=
+      previous.up,
+
+    periodsSinceHigh:
+      current.periodsSinceHigh,
+
+    periodsSinceLow:
+      current.periodsSinceLow,
+
+    highest:
+      current.highest,
+
+    lowest:
+      current.lowest
+  };
+}
+export function cruzOsmaSnapshot(
+  bars,
+  fastPeriod = 10,
+  slowPeriod = 20,
+  signalPeriod = 10
+) {
+  const fast =
+    Math.max(
+      2,
+      Math.floor(fastPeriod)
+    );
+
+  const slow =
+    Math.max(
+      fast + 1,
+      Math.floor(slowPeriod)
+    );
+
+  const signal =
+    Math.max(
+      2,
+      Math.floor(signalPeriod)
+    );
+
+
+  if (
+    !Array.isArray(bars) ||
+    bars.length <
+    slow + signal + 1
+  ) {
+    return {
+      ready: false,
+
+      fastPeriod: fast,
+      slowPeriod: slow,
+      signalPeriod: signal,
+
+      bars:
+        Array.isArray(bars)
+          ? bars.length
+          : 0
+    };
+  }
+
+
+  const closes =
+    bars.map(
+      b => Number(b?.c)
+    );
+
+
+  if (
+    !closes.every(
+      Number.isFinite
+    )
+  ) {
+    return {
+      ready: false,
+
+      fastPeriod: fast,
+      slowPeriod: slow,
+      signalPeriod: signal,
+
+      bars: bars.length
+    };
+  }
+
+
+  const fastEma =
+    emaSeries(
+      closes,
+      fast
+    );
+
+  const slowEma =
+    emaSeries(
+      closes,
+      slow
+    );
+
+
+  const macdValues = [];
+
+  for (
+    let i = 0;
+    i < closes.length;
+    i++
+  ) {
+    if (
+      Number.isFinite(
+        fastEma[i]
+      ) &&
+      Number.isFinite(
+        slowEma[i]
+      )
+    ) {
+      macdValues.push(
+        fastEma[i] -
+        slowEma[i]
+      );
+    }
+  }
+
+
+  if (
+    macdValues.length <
+    signal + 2
+  ) {
+    return {
+      ready: false,
+
+      fastPeriod: fast,
+      slowPeriod: slow,
+      signalPeriod: signal,
+
+      bars: bars.length
+    };
+  }
+
+
+  const signalValues =
+    smaSeries(
+      macdValues,
+      signal
+    );
+
+
+  const i =
+    macdValues.length - 1;
+
+  const previousIndex =
+    i - 1;
+
+
+  const macd =
+    macdValues[i];
+
+  const previousMacd =
+    macdValues[
+    previousIndex
+    ];
+
+  const signalValue =
+    signalValues[i];
+
+  const previousSignal =
+    signalValues[
+    previousIndex
+    ];
+
+
+  if (
+    ![
+      macd,
+      previousMacd,
+      signalValue,
+      previousSignal
+    ].every(Number.isFinite)
+  ) {
+    return {
+      ready: false,
+
+      fastPeriod: fast,
+      slowPeriod: slow,
+      signalPeriod: signal,
+
+      bars: bars.length
+    };
+  }
+
+
+  const osma =
+    macd -
+    signalValue;
+
+  const previousOsma =
+    previousMacd -
+    previousSignal;
+
+
+  return {
+    ready: true,
+
+    fastPeriod: fast,
+    slowPeriod: slow,
+    signalPeriod: signal,
+
+    macd,
+    signal:
+      signalValue,
+
+    osma,
+
+    previousMacd,
+
+    previousSignal,
+
+    previousOsma,
+
+    bullishZeroCross:
+      osma > 0 &&
+      previousOsma <= 0,
+
+    bearishZeroCross:
+      osma < 0 &&
+      previousOsma >= 0,
+
+    bullish:
+      osma > 0,
+
+    bearish:
+      osma < 0
+  };
+}
+export function scoreCruz30sAroonOsma(
+  bars30,
+  ticks,
+  symbol
+) {
+  if (
+    !Array.isArray(bars30) ||
+    bars30.length < 32
+  ) {
+    return {
+      ok: false,
+      reason:
+        "Cruz V2 30s context is still building",
+      bars30:
+        Array.isArray(bars30)
+          ? bars30.length
+          : 0
+    };
+  }
+
+
+  const aroonNow =
+    cruzAroonSnapshot(
+      bars30,
+      10
+    );
+
+  const osmaNow =
+    cruzOsmaSnapshot(
+      bars30,
+      10,
+      20,
+      10
+    );
+
+
+  // Previous completed 30s candle.
+  // This lets the two confirmations occur
+  // on adjacent candles rather than forcing
+  // an unrealistically exact simultaneous cross.
+  const previousBars =
+    bars30.slice(0, -1);
+
+
+  const aroonPrevious =
+    cruzAroonSnapshot(
+      previousBars,
+      10
+    );
+
+  const osmaPrevious =
+    cruzOsmaSnapshot(
+      previousBars,
+      10,
+      20,
+      10
+    );
+
+
+  if (
+    !aroonNow.ready ||
+    !osmaNow.ready
+  ) {
+    return {
+      ok: false,
+      reason:
+        "Cruz V2 Aroon/OsMA context is not ready"
+    };
+  }
+
+
+  // -------------------------------------------------
+  // FRESH AROON CROSS
+  // -------------------------------------------------
+
+  const bullishAroonNow =
+    aroonNow.crossUp === true;
+
+  const bearishAroonNow =
+    aroonNow.crossDown === true;
+
+  const bullishAroonPrevious =
+    aroonPrevious.ready &&
+    aroonPrevious.crossUp === true;
+
+  const bearishAroonPrevious =
+    aroonPrevious.ready &&
+    aroonPrevious.crossDown === true;
+
+
+  // -------------------------------------------------
+  // FRESH OsMA ZERO-LINE TRANSITION
+  // -------------------------------------------------
+
+  const bullishOsmaNow =
+    osmaNow.bullishZeroCross === true;
+
+  const bearishOsmaNow =
+    osmaNow.bearishZeroCross === true;
+
+  const bullishOsmaPrevious =
+    osmaPrevious.ready &&
+    osmaPrevious.bullishZeroCross === true;
+
+  const bearishOsmaPrevious =
+    osmaPrevious.ready &&
+    osmaPrevious.bearishZeroCross === true;
+
+
+  // -------------------------------------------------
+  // CRUZ V2 CALL
+  //
+  // Aroon-Up crosses above Aroon-Down
+  // AND OsMA crosses bullish through zero.
+  //
+  // Both confirmations must occur either:
+  // - on the same completed 30s candle, or
+  // - within one completed 30s candle of each other.
+  // -------------------------------------------------
+
+  const callSetup =
+    (
+      bullishAroonNow &&
+      (
+        bullishOsmaNow ||
+        bullishOsmaPrevious
+      )
+    ) ||
+    (
+      bullishOsmaNow &&
+      bullishAroonPrevious
+    );
+
+
+  // -------------------------------------------------
+  // CRUZ V2 PUT
+  //
+  // Aroon-Down crosses above Aroon-Up
+  // AND OsMA crosses bearish through zero.
+  // -------------------------------------------------
+
+  const putSetup =
+    (
+      bearishAroonNow &&
+      (
+        bearishOsmaNow ||
+        bearishOsmaPrevious
+      )
+    ) ||
+    (
+      bearishOsmaNow &&
+      bearishAroonPrevious
+    );
+
+
+  if (!callSetup && !putSetup) {
+    let reason =
+      "Cruz V2 entry conditions are not aligned";
+
+    const freshAroon =
+      bullishAroonNow ||
+      bearishAroonNow ||
+      bullishAroonPrevious ||
+      bearishAroonPrevious;
+
+    const freshOsma =
+      bullishOsmaNow ||
+      bearishOsmaNow ||
+      bullishOsmaPrevious ||
+      bearishOsmaPrevious;
+
+
+    if (!freshAroon) {
+      reason =
+        "no fresh Aroon(10) crossover";
+    } else if (!freshOsma) {
+      reason =
+        "no fresh OsMA(10,20,10) zero-line transition";
+    } else {
+      reason =
+        "Aroon and OsMA fresh signals disagree on direction";
+    }
+
+
+    return {
+      ok: false,
+      reason,
+
+      aroon: {
+        up:
+          aroonNow.up,
+
+        down:
+          aroonNow.down,
+
+        crossUp:
+          bullishAroonNow,
+
+        crossDown:
+          bearishAroonNow
+      },
+
+      osma: {
+        value:
+          osmaNow.osma,
+
+        previous:
+          osmaNow.previousOsma,
+
+        bullishZeroCross:
+          bullishOsmaNow,
+
+        bearishZeroCross:
+          bearishOsmaNow
+      }
+    };
+  }
+
+
+  const direction =
+    callSetup
+      ? "CALL"
+      : "PUT";
+
+
+  // -------------------------------------------------
+  // EXECUTION SAFEGUARD ONLY
+  // Not part of Cruz's indicator strategy.
+  // -------------------------------------------------
+
+  const lastLive =
+    Number(
+      ticks?.at(-1)?.p
+    );
+
+  if (
+    Number.isFinite(lastLive) &&
+    Array.isArray(ticks) &&
+    ticks.length
+  ) {
+    const atr =
+      atrSnapshot(
+        bars30,
+        14
+      );
+
+    if (atr.ready) {
+      const spread =
+        spreadQualitySnapshot(
+          symbol,
+          ticks,
+          lastLive,
+          atr.atr
+        );
+
+      if (spread.abnormal) {
+        return {
+          ok: false,
+
+          reason:
+            "Cruz V2 qualified but live spread is abnormal",
+
+          strategyQualified:
+            true,
+
+          direction
+        };
+      }
+    }
+  }
+
+
+  return {
+    ok: true,
+
+    strategyId:
+      "cruz-30s-aroon-osma-v2",
+
+    direction,
+
+    timeframe:
+      "30s",
+
+    primaryExpirySeconds:
+      120,
+
+    expiryCandidates:
+      [60, 120],
+
+
+    aroon: {
+      period: 10,
+
+      up:
+        aroonNow.up,
+
+      down:
+        aroonNow.down,
+
+      previousUp:
+        aroonNow.previousUp,
+
+      previousDown:
+        aroonNow.previousDown,
+
+      crossUp:
+        bullishAroonNow,
+
+      crossDown:
+        bearishAroonNow,
+
+      previousBarCrossUp:
+        bullishAroonPrevious,
+
+      previousBarCrossDown:
+        bearishAroonPrevious
+    },
+
+
+    osma: {
+      fastPeriod: 10,
+      slowPeriod: 20,
+      signalPeriod: 10,
+
+      value:
+        osmaNow.osma,
+
+      previous:
+        osmaNow.previousOsma,
+
+      macd:
+        osmaNow.macd,
+
+      signal:
+        osmaNow.signal,
+
+      bullishZeroCross:
+        bullishOsmaNow,
+
+      bearishZeroCross:
+        bearishOsmaNow,
+
+      previousBarBullishZeroCross:
+        bullishOsmaPrevious,
+
+      previousBarBearishZeroCross:
+        bearishOsmaPrevious
+    },
+
+
+    trigger: {
+      sameOrAdjacent30s:
+        true,
+
+      bullishAroon:
+        bullishAroonNow ||
+        bullishAroonPrevious,
+
+      bearishAroon:
+        bearishAroonNow ||
+        bearishAroonPrevious,
+
+      bullishOsma:
+        bullishOsmaNow ||
+        bullishOsmaPrevious,
+
+      bearishOsma:
+        bearishOsmaNow ||
+        bearishOsmaPrevious
+    },
+
+
+    reasons:
+      direction === "CALL"
+        ? [
+          "Aroon-Up crossed above Aroon-Down",
+          "OsMA crossed bullish through zero",
+          "Aroon and OsMA confirmations occurred within one 30s candle"
+        ]
+        : [
+          "Aroon-Down crossed above Aroon-Up",
+          "OsMA crossed bearish through zero",
+          "Aroon and OsMA confirmations occurred within one 30s candle"
+        ]
+  };
+}
+export function cruzS30SettlementPrice(
+  bars,
+  expiryAt
+) {
+  const target =
+    Number(expiryAt);
+
+  if (
+    !Array.isArray(bars) ||
+    !Number.isFinite(target)
+  ) {
+    return null;
+  }
+
+
+  // OANDA S30 candle timestamp is the
+  // candle OPEN time.
+  //
+  // Therefore:
+  // candle.t + 30s = candle close time.
+  //
+  // For an entry made at a completed
+  // 30s candle close, the binary expiry
+  // also lands exactly on a 30s boundary.
+  const exact =
+    bars.find(bar =>
+      Number.isFinite(
+        Number(bar?.t)
+      ) &&
+      Number(bar.t) +
+      30000 ===
+      target &&
+      Number.isFinite(
+        Number(bar?.c)
+      )
+    );
+
+
+  if (!exact) {
+    return null;
+  }
+
+
+  return {
+    price:
+      Number(exact.c),
+
+    candleOpenAt:
+      Number(exact.t),
+
+    candleCloseAt:
+      Number(exact.t) +
+      30000
+  };
 }
 function fractalSnapshot(bars, p = 2) {
   p = Math.max(1, Math.floor(p));
@@ -1953,9 +2822,25 @@ export class AutoScheduler extends DurableObject {
     const now = Date.now();
     let alarm = null;
     try { alarm = await this.ctx.storage.getAlarm(); } catch (_) { }
-    if (!alarm || Number(alarm) < now + 15000 || Number(alarm) > now + 90000) {
-      await this.ctx.storage.setAlarm(now + 5000);
-      alarm = now + 5000;
+    if (
+      !alarm ||
+      Number(alarm) < now ||
+      Number(alarm) > now + 45000
+    ) {
+      const next30SecondBoundary =
+        (
+          Math.floor(
+            now / 30000
+          ) + 1
+        ) * 30000;
+
+      alarm =
+        next30SecondBoundary +
+        1000;
+
+      await this.ctx.storage.setAlarm(
+        alarm
+      );
     }
     await this.ctx.storage.put("enabled", true);
     return { ok: true, enabled: true, nextAlarmAt: Number(alarm) };
@@ -1995,7 +2880,21 @@ export class AutoScheduler extends DurableObject {
     } catch (e) {
       await this.ctx.storage.put("lastError", String(e?.message || e).slice(0, 300));
     } finally {
-      await this.ctx.storage.setAlarm(Date.now() + 60000);
+      const now =
+        Date.now();
+
+      const next30SecondBoundary =
+        (
+          Math.floor(
+            now / 30000
+          ) + 1
+        ) * 30000;
+
+      // Wake one second after :00 / :30 so the
+      // just-finished 30s candle is safely complete.
+      await this.ctx.storage.setAlarm(
+        next30SecondBoundary + 1000
+      );
     }
   }
 
@@ -2826,6 +3725,372 @@ export class TickHub extends DurableObject {
   quotaRetryMinutes() {
     const left = Math.max(0, this.quotaBlockedUntil - Date.now());
     return Math.max(1, Math.ceil(left / 60000));
+  }
+
+  async fetchCruz30SecondBars(
+    symbol,
+    count = 60
+  ) {
+    symbol =
+      normalizeSymbol(symbol);
+
+    if (
+      !symbol ||
+      !SHORT_SHADOW_UNIVERSE.includes(symbol)
+    ) {
+      throw new Error(
+        "invalid Cruz V2 symbol"
+      );
+    }
+
+
+    const token =
+      String(
+        this.env.OANDA_API_TOKEN || ""
+      ).trim();
+
+    if (!token) {
+      throw new Error(
+        "OANDA_API_TOKEN is missing"
+      );
+    }
+
+    const instrument =
+      toOandaSymbol(symbol);
+
+    if (!instrument) {
+      throw new Error(
+        "invalid OANDA instrument"
+      );
+    }
+
+
+    const environment =
+      String(
+        this.env.OANDA_ENV || "practice"
+      )
+        .trim()
+        .toLowerCase();
+
+
+    const baseUrl =
+      environment === "live"
+        ? "https://api-fxtrade.oanda.com"
+        : "https://api-fxpractice.oanda.com";
+
+
+    const safeCount =
+      Math.max(
+        40,
+        Math.min(
+          200,
+          Number(count) || 60
+        )
+      );
+
+    const url =
+      new URL(
+        `${baseUrl}/v3/instruments/` +
+        `${encodeURIComponent(instrument)}/` +
+        `candles`
+      );
+
+    url.searchParams.set(
+      "price",
+      "M"
+    );
+
+    url.searchParams.set(
+      "granularity",
+      "S30"
+    );
+
+    url.searchParams.set(
+      "count",
+      String(safeCount)
+    );
+
+    url.searchParams.set(
+      "smooth",
+      "false"
+    );
+
+
+    const response =
+      await fetch(
+        url.toString(),
+        {
+          headers: {
+            Authorization:
+              `Bearer ${token}`,
+
+            Accept:
+              "application/json"
+          }
+        }
+      );
+
+
+    const data =
+      await response
+        .json()
+        .catch(() => null);
+
+
+    if (
+      !response.ok ||
+      !Array.isArray(data?.candles)
+    ) {
+      throw new Error(
+        String(
+          data?.errorMessage ||
+          data?.errorCode ||
+          `OANDA S30 request failed (${response.status})`
+        )
+      );
+    }
+
+
+    const bars =
+      data.candles
+        .filter(
+          candle =>
+            candle?.complete === true &&
+            candle?.mid
+        )
+        .map(candle => ({
+          t:
+            Date.parse(
+              String(candle.time || "")
+            ),
+
+          o:
+            Number(candle.mid.o),
+
+          h:
+            Number(candle.mid.h),
+
+          l:
+            Number(candle.mid.l),
+
+          c:
+            Number(candle.mid.c),
+
+          n:
+            Number(candle.volume || 0)
+        }))
+        .filter(bar =>
+          Number.isFinite(bar.t) &&
+          Number.isFinite(bar.o) &&
+          Number.isFinite(bar.h) &&
+          Number.isFinite(bar.l) &&
+          Number.isFinite(bar.c)
+        )
+        .sort(
+          (a, b) =>
+            Number(a.t) -
+            Number(b.t)
+        );
+
+
+    if (bars.length < 32) {
+      throw new Error(
+        `only ${bars.length} completed OANDA S30 candles available for ${symbol}`
+      );
+    }
+
+
+    return bars;
+  }
+  async fetchMassive30SecondBars(
+    symbol,
+    count = 80
+  ) {
+    symbol =
+      normalizeSymbol(symbol);
+
+
+    if (
+      !symbol ||
+      !SHORT_SHADOW_UNIVERSE.includes(symbol)
+    ) {
+      throw new Error(
+        "invalid Cruz V2 symbol"
+      );
+    }
+
+
+    const apiKey =
+      String(
+        this.env.MASSIVE_API_KEY || ""
+      ).trim();
+
+
+    if (!apiKey) {
+      throw new Error(
+        "MASSIVE_API_KEY is missing"
+      );
+    }
+
+
+    const ticker =
+      toMassiveForexTicker(
+        symbol
+      );
+
+
+    if (!ticker) {
+      throw new Error(
+        "invalid Massive Forex ticker"
+      );
+    }
+
+
+    const safeCount =
+      Math.max(
+        40,
+        Math.min(
+          200,
+          Number(count) || 80
+        )
+      );
+
+
+    const now =
+      Date.now();
+
+
+    // Two hours provides much more than the
+    // minimum history needed for:
+    // Aroon(10)
+    // OsMA(10,20,10)
+    //
+    // Missing Forex quote intervals may produce
+    // no bar, so we deliberately request extra history.
+    const from =
+      now -
+      2 * 60 * 60 * 1000;
+
+
+    const to =
+      now;
+
+
+    const url =
+      new URL(
+        `https://api.massive.com/v2/aggs/ticker/` +
+        `${encodeURIComponent(ticker)}/` +
+        `range/30/second/` +
+        `${from}/${to}`
+      );
+
+
+    url.searchParams.set(
+      "adjusted",
+      "true"
+    );
+
+    url.searchParams.set(
+      "sort",
+      "asc"
+    );
+
+    url.searchParams.set(
+      "limit",
+      "5000"
+    );
+
+
+    const response =
+      await fetch(
+        url.toString(),
+        {
+          headers: {
+            Authorization:
+              `Bearer ${apiKey}`,
+
+            Accept:
+              "application/json"
+          }
+        }
+      );
+
+
+    const data =
+      await response
+        .json()
+        .catch(() => null);
+
+
+    if (
+      !response.ok ||
+      !Array.isArray(data?.results)
+    ) {
+      throw new Error(
+        String(
+          data?.error ||
+          data?.message ||
+          `Massive S30 request failed (${response.status})`
+        )
+      );
+    }
+
+
+    // Massive aggregate timestamp is the
+    // beginning of the aggregate window.
+    //
+    // Therefore an S30 candle is completed when:
+    // t + 30,000 <= now.
+    const bars =
+      data.results
+        .map(row => ({
+          t:
+            Number(row?.t),
+
+          o:
+            Number(row?.o),
+
+          h:
+            Number(row?.h),
+
+          l:
+            Number(row?.l),
+
+          c:
+            Number(row?.c),
+
+          n:
+            Number(
+              row?.n ??
+              row?.v ??
+              0
+            )
+        }))
+        .filter(bar =>
+          Number.isFinite(bar.t) &&
+          Number.isFinite(bar.o) &&
+          Number.isFinite(bar.h) &&
+          Number.isFinite(bar.l) &&
+          Number.isFinite(bar.c) &&
+          bar.t + 30000 <= now
+        )
+        .sort(
+          (a, b) =>
+            a.t - b.t
+        )
+        .slice(
+          -safeCount
+        );
+
+
+    if (bars.length < 32) {
+      throw new Error(
+        `only ${bars.length} completed Massive S30 candles available for ${symbol}`
+      );
+    }
+
+
+    return bars;
   }
 
   async fetchOneMinuteBars(symbol) {
@@ -4646,6 +5911,560 @@ export class TickHub extends DurableObject {
       completed
     };
   }
+  async settleShortShadowV2(
+    now = Date.now()
+  ) {
+    const state =
+      this.shortShadowState;
+
+
+    if (
+      !state ||
+      !Array.isArray(state.pending) ||
+      !state.pending.length
+    ) {
+      return {
+        ok: true,
+        settled60: 0,
+        settled120: 0,
+        completed: 0
+      };
+    }
+
+
+    const resolveOutcome = (
+      direction,
+      entryPrice,
+      exitPrice
+    ) => {
+      const delta =
+        Number(exitPrice) -
+        Number(entryPrice);
+
+      if (
+        Math.abs(delta) <=
+        1e-12
+      ) {
+        return "DRAW";
+      }
+
+      const won =
+        direction === "CALL"
+          ? delta > 0
+          : delta < 0;
+
+      return won
+        ? "WIN"
+        : "LOSS";
+    };
+
+
+    // -------------------------------------------------
+    // Fetch OANDA S30 context only for pairs
+    // that actually have an expiry due.
+    // -------------------------------------------------
+
+    const dueSymbols = [
+      ...new Set(
+        state.pending
+          .filter(rec =>
+            (
+              !rec.result60 &&
+              now >=
+              Number(
+                rec.expiry60At
+              )
+            ) ||
+            (
+              !rec.result120 &&
+              now >=
+              Number(
+                rec.expiry120At
+              )
+            )
+          )
+          .map(
+            rec =>
+              normalizeSymbol(
+                rec.symbol
+              )
+          )
+          .filter(Boolean)
+      )
+    ];
+
+
+    const barsBySymbol =
+      new Map();
+
+
+    for (
+      const symbol
+      of dueSymbols
+    ) {
+      try {
+        const bars =
+          await this
+            .fetchMassive30SecondBars(
+              symbol,
+              80
+            );
+
+        barsBySymbol.set(
+          symbol,
+          bars
+        );
+      } catch (_) {
+        // Do not fail the entire settlement pass
+        // because one pair's OANDA request failed.
+      }
+    }
+
+
+    let settled60 = 0;
+    let settled120 = 0;
+    let completed = 0;
+    let changed = false;
+
+    const keep = [];
+    const finished = [];
+
+
+    for (
+      const original
+      of state.pending
+    ) {
+      const rec = {
+        ...original
+      };
+
+      const symbol =
+        normalizeSymbol(
+          rec.symbol
+        );
+
+      const bars =
+        barsBySymbol.get(
+          symbol
+        ) || [];
+
+
+      // -------------------------------------------------
+      // 60-SECOND DIAGNOSTIC EXPIRY
+      // -------------------------------------------------
+
+      if (
+        !rec.result60 &&
+        now >=
+        Number(
+          rec.expiry60At
+        )
+      ) {
+        const settlement =
+          cruzS30SettlementPrice(
+            bars,
+            rec.expiry60At
+          );
+
+
+        if (settlement) {
+          rec.exit60Price =
+            settlement.price;
+
+          rec.exit60TickAt =
+            settlement.candleCloseAt;
+
+          rec.result60 =
+            resolveOutcome(
+              rec.direction,
+              rec.entryPrice,
+              settlement.price
+            );
+
+          settled60++;
+          changed = true;
+        } else if (
+          now -
+          Number(
+            rec.expiry60At
+          ) >=
+          15000
+        ) {
+          rec.result60 =
+            "VOID";
+
+          settled60++;
+          changed = true;
+        }
+      }
+
+
+      // -------------------------------------------------
+      // 120-SECOND PRIMARY EXPIRY
+      // -------------------------------------------------
+
+      if (
+        !rec.result120 &&
+        now >=
+        Number(
+          rec.expiry120At
+        )
+      ) {
+        const settlement =
+          cruzS30SettlementPrice(
+            bars,
+            rec.expiry120At
+          );
+
+
+        if (settlement) {
+          rec.exit120Price =
+            settlement.price;
+
+          rec.exit120TickAt =
+            settlement.candleCloseAt;
+
+          rec.result120 =
+            resolveOutcome(
+              rec.direction,
+              rec.entryPrice,
+              settlement.price
+            );
+
+          settled120++;
+          changed = true;
+        } else if (
+          now -
+          Number(
+            rec.expiry120At
+          ) >=
+          15000
+        ) {
+          rec.result120 =
+            "VOID";
+
+          settled120++;
+          changed = true;
+        }
+      }
+
+
+      if (
+        rec.result60 &&
+        rec.result120
+      ) {
+        rec.completedAt =
+          now;
+
+        finished.push(
+          rec
+        );
+
+        completed++;
+        changed = true;
+      } else {
+        keep.push(
+          rec
+        );
+      }
+    }
+
+
+    state.pending =
+      keep;
+
+
+    if (
+      finished.length
+    ) {
+      state.history = [
+        ...finished,
+        ...(state.history || [])
+      ].slice(
+        0,
+        SHORT_SHADOW_MAX_HISTORY
+      );
+    }
+
+
+    if (changed) {
+      await this.ctx.storage.put(
+        "shortShadowState",
+        state
+      );
+    }
+
+
+    return {
+      ok: true,
+
+      settlementSource:
+        "massive-s30",
+
+      settled60,
+      settled120,
+      completed
+    };
+  }
+  async evaluateShortShadowV2(symbol) {
+    symbol =
+      normalizeSymbol(symbol);
+
+
+    if (
+      !symbol ||
+      !SHORT_SHADOW_UNIVERSE.includes(symbol)
+    ) {
+      return {
+        ok: false,
+        error:
+          "invalid Cruz V2 short-shadow symbol"
+      };
+    }
+
+
+    // Do not overlap experimental positions
+    // on the same pair.
+    const active =
+      (
+        this.shortShadowState?.pending ||
+        []
+      ).find(
+        x =>
+          x.symbol === symbol
+      );
+
+
+    if (active) {
+      return {
+        ok: false,
+        skipped: true,
+        symbol,
+        reason:
+          "Cruz V2 position already pending on pair"
+      };
+    }
+
+
+    // -------------------------------------------------
+    // TRUE COMPLETED OANDA S30 CONTEXT
+    // -------------------------------------------------
+
+    let bars30;
+
+    try {
+      bars30 =
+        await this.fetchMassive30SecondBars(
+          symbol,
+          80
+        );
+    } catch (e) {
+      return {
+        ok: false,
+        symbol,
+        captured: false,
+
+        reason:
+          `Cruz V2 Massive S30 context unavailable: ${String(
+            e?.message || e
+          )}`
+      };
+    }
+
+
+    if (
+      !Array.isArray(bars30) ||
+      bars30.length < 32
+    ) {
+      return {
+        ok: false,
+        symbol,
+        captured: false,
+
+        reason:
+          `Cruz V2 S30 context insufficient (${bars30?.length || 0}/32)`
+      };
+    }
+
+
+    // -------------------------------------------------
+    // AROON(10) + OsMA(10,20,10)
+    // -------------------------------------------------
+
+    const candidate =
+      scoreCruz30sAroonOsma(
+        bars30,
+
+        // V2 indicator logic is derived entirely
+        // from OANDA S30 candles.
+        // No Tiingo tick-based strategy filter.
+        [],
+
+        symbol
+      );
+
+
+    if (!candidate.ok) {
+      return {
+        ...candidate,
+        symbol,
+        captured: false
+      };
+    }
+
+
+    // -------------------------------------------------
+    // ENTRY REFERENCE
+    //
+    // OANDA candle timestamp = candle OPEN.
+    // Therefore completed S30 close = t + 30s.
+    // -------------------------------------------------
+
+    const signalBar =
+      bars30.at(-1);
+
+
+    const entryPrice =
+      Number(
+        signalBar?.c
+      );
+
+    const signalBarOpenAt =
+      Number(
+        signalBar?.t
+      );
+
+    const entryAt =
+      signalBarOpenAt +
+      30000;
+
+
+    if (
+      !Number.isFinite(entryPrice) ||
+      !Number.isFinite(signalBarOpenAt)
+    ) {
+      return {
+        ok: false,
+        symbol,
+        captured: false,
+        reason:
+          "Cruz V2 completed S30 entry candle is invalid"
+      };
+    }
+
+
+    // -------------------------------------------------
+    // STALE-CANDLE PROTECTION
+    //
+    // Prevent an old completed candle from being
+    // interpreted as a new entry after market/feed gaps.
+    // -------------------------------------------------
+
+    const candleAgeMs =
+      Date.now() -
+      entryAt;
+
+
+    if (
+      candleAgeMs < -5000 ||
+      candleAgeMs > 45000
+    ) {
+      return {
+        ok: false,
+        symbol,
+        captured: false,
+
+        reason:
+          `Cruz V2 latest completed S30 candle is stale (${(
+            candleAgeMs / 1000
+          ).toFixed(1)}s)`
+      };
+    }
+
+
+    // 30-second key rather than the old minute key.
+    const sourceKey =
+      `${SHORT_SHADOW_ID}|` +
+      `${symbol}|` +
+      `${candidate.direction}|` +
+      `${Math.floor(entryAt / 30000)}`;
+
+
+    const capture =
+      await this.captureShortShadow({
+        symbol,
+
+        direction:
+          candidate.direction,
+
+        entryPrice,
+        entryAt,
+        sourceKey,
+
+
+        features: {
+          model:
+            "cruz-30s-aroon10-osma10-20-10",
+
+          dataSource:
+            "massive-s30",
+
+          timeframe:
+            "30s",
+
+          primaryExpirySeconds:
+            120,
+
+          expiryCandidates:
+            candidate.expiryCandidates,
+
+          signalBarOpenAt,
+          signalBarCloseAt:
+            entryAt,
+
+          aroon:
+            candidate.aroon,
+
+          osma:
+            candidate.osma,
+
+          trigger:
+            candidate.trigger,
+
+          reasons:
+            candidate.reasons
+        }
+      });
+
+
+    return {
+      ...candidate,
+
+      symbol,
+
+      captured:
+        Boolean(
+          capture?.ok &&
+          !capture?.duplicate
+        ),
+
+      duplicate:
+        Boolean(
+          capture?.duplicate
+        ),
+
+      shadowId:
+        capture?.id || null,
+
+      entryPrice,
+      entryAt,
+
+      signalBarOpenAt,
+
+      dataSource:
+        "massive-s30"
+    };
+  }
 
   async evaluateShortShadow(symbol) {
     symbol = normalizeSymbol(symbol);
@@ -4834,7 +6653,72 @@ export class TickHub extends DurableObject {
     const u = new URL(req.url), symbol = normalizeSymbol(u.searchParams.get("symbol") || "");
 
     if (u.pathname === "/sleep") return json(await this.closeFeeds("request complete"));
+    if (
+      u.pathname === "/claim-short-cron" &&
+      req.method === "POST"
+    ) {
+      const now =
+        Date.now();
 
+      // One autonomous Cruz V2 scan
+      // for each 30-second time bucket.
+      const slot =
+        Math.floor(
+          now / 30000
+        );
+
+      const last =
+        Number(
+          (
+            await this.ctx.storage.get(
+              "lastShortCronSlot"
+            )
+          ) ?? -1
+        );
+
+
+      if (last === slot) {
+        return json({
+          ok: true,
+          claimed: false,
+          slot
+        });
+      }
+
+
+      const count =
+        Number(
+          (
+            await this.ctx.storage.get(
+              "shortCronScanCount"
+            )
+          ) || 0
+        ) + 1;
+
+
+      await this.ctx.storage.put(
+        "lastShortCronSlot",
+        slot
+      );
+
+      await this.ctx.storage.put(
+        "lastShortCronClaimAt",
+        now
+      );
+
+      await this.ctx.storage.put(
+        "shortCronScanCount",
+        count
+      );
+
+
+      return json({
+        ok: true,
+        claimed: true,
+        slot,
+        count
+      });
+    }
     if (u.pathname === "/claim-cron" && req.method === "POST") {
       const now = Date.now(), minute = Math.floor(now / 60000);
       const last = Number((await this.ctx.storage.get("lastCronMinute")) ?? -1);
@@ -4928,7 +6812,7 @@ export class TickHub extends DurableObject {
 
     if (u.pathname === "/settle-short-shadow") {
       const result =
-        await this.settleShortShadow(
+        await this.settleShortShadowV2(
           Date.now()
         );
 
@@ -4939,7 +6823,9 @@ export class TickHub extends DurableObject {
 
     if (u.pathname === "/short-shadow") {
       return json(
-        await this.evaluateShortShadow(symbol)
+        await this.evaluateShortShadowV2(
+          symbol
+        )
       );
     }
 
@@ -5310,6 +7196,56 @@ async function scanShortShadowUniverse(env) {
   };
 }
 
+async function autoScanShortShadow(env) {
+  try {
+    // Settle any due short-expiry records first.
+    await hub(
+      env,
+      "/settle-short-shadow"
+    );
+
+    // Briefly obtain fresh live quotes for
+    // entry-price and settlement support.
+    await hub(
+      env,
+      "/prime-live?ms=5000"
+    );
+
+    const shortShadow =
+      await scanShortShadowUniverse(
+        env
+      );
+
+    return {
+      ok: true,
+
+      shortShadowChecked:
+        Number(
+          shortShadow?.checked || 0
+        ),
+
+      shortShadowCaptured:
+        Number(
+          shortShadow?.captured || 0
+        ),
+
+      shortShadowSymbols:
+        Array.isArray(
+          shortShadow?.symbols
+        )
+          ? shortShadow.symbols
+          : []
+    };
+  } finally {
+    try {
+      await hub(
+        env,
+        "/sleep"
+      );
+    } catch (_) { }
+  }
+}
+
 async function autoScanAndAlert(env) {
   try {
     // Prime the live WebSocket first so both engines
@@ -5490,11 +7426,86 @@ export default {
       const supplied = String(request.headers.get("X-IQ3M-Cron-Secret") || "");
       if (!expected || supplied !== expected) return new Response("forbidden", { status: 403 });
       try {
-        const claim = await hubPost(env, "/claim-cron", {});
-        if (!claim?.claimed) return json({ ok: true, skipped: true, reason: "minute already claimed" });
-        const result = await autoScanAndAlert(env);
-        try { await hubPost(env, "/cron-result", { result }); } catch (_) { }
-        return json({ ok: true, claimed: true, result });
+        const shortClaim =
+          await hubPost(
+            env,
+            "/claim-short-cron",
+            {}
+          );
+
+        const minuteClaim =
+          await hubPost(
+            env,
+            "/claim-cron",
+            {}
+          );
+
+
+        // -------------------------------------------------
+        // NORMAL MINUTE SCAN
+        //
+        // Existing autoScanAndAlert already performs:
+        // - short-shadow scan
+        // - 5-minute scan
+        //
+        // So when the minute slot is available,
+        // use the existing full workflow.
+        // -------------------------------------------------
+
+        if (minuteClaim?.claimed) {
+          const result =
+            await autoScanAndAlert(env);
+
+          try {
+            await hubPost(
+              env,
+              "/cron-result",
+              { result }
+            );
+          } catch (_) { }
+
+
+          return json({
+            ok: true,
+            claimed: true,
+            minuteClaimed: true,
+            shortClaimed:
+              Boolean(shortClaim?.claimed),
+            result
+          });
+        }
+
+
+        // -------------------------------------------------
+        // SECOND 30-SECOND SLOT
+        //
+        // The 5-minute engine already ran this minute,
+        // but Cruz V2 is allowed another short-only scan.
+        // -------------------------------------------------
+
+        if (shortClaim?.claimed) {
+          const result =
+            await autoScanShortShadow(env);
+
+          return json({
+            ok: true,
+            claimed: true,
+            minuteClaimed: false,
+            shortClaimed: true,
+            result
+          });
+        }
+
+
+        // Neither schedule has anything new to run.
+        return json({
+          ok: true,
+          skipped: true,
+          minuteClaimed: false,
+          shortClaimed: false,
+          reason:
+            "current scheduler slots already claimed"
+        });
       } catch (e) {
         console.error("cron-scan failed", String(e?.stack || e?.message || e));
         return json({ ok: false, error: String(e?.message || e) }, 500);
