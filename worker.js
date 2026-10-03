@@ -6828,171 +6828,169 @@ export class TickHub extends DurableObject {
     }
 
     if (u.pathname === "/settle-short-shadow") {
-
-      if (u.pathname === "/settle-short-shadow") {
-        const result =
-          await this.settleShortShadowV2(
-            Date.now()
-          );
-
-        await this.scheduleAlarm();
-
-        return json(result);
-      }
-
-      if (u.pathname === "/massive-check") {
-        const checkSymbol =
-          normalizeSymbol(
-            u.searchParams.get("symbol") ||
-            "EUR/USD"
-          );
-
-        try {
-          const bars =
-            await this.fetchMassive30SecondBars(
-              checkSymbol,
-              80
-            );
-
-          const last =
-            bars.at(-1) || null;
-
-          return json({
-            ok: true,
-            symbol: checkSymbol,
-            dataSource: "massive-s30",
-            completedBars: bars.length,
-            lastBarOpenAt:
-              last?.t || null,
-            lastBarCloseAt:
-              Number.isFinite(Number(last?.t))
-                ? Number(last.t) + 30000
-                : null
-          });
-        } catch (e) {
-          return json({
-            ok: false,
-            symbol: checkSymbol,
-            dataSource: "massive-s30",
-            error:
-              String(
-                e?.message || e
-              )
-          });
-        }
-      }
-
-      if (u.pathname === "/quote") {
-        if (!symbol) return json({ ok: false, error: "invalid symbol" }, 400);
-        await this.subscribe(symbol);
-        if (isCryptoSymbol(symbol)) await this.ensureCryptoSocket();
-        else await this.ensureSocket();
-        const arr = this.ticks.get(symbol) || [];
-        const q = arr.at(-1);
-        if (!q) return json({ ok: false, symbol, error: "no live quote" });
-        return json({
-          ok: true,
-          symbol,
-          price: Number(q.p),
-          bid: q.bid,
-          ask: q.ask,
-          providerAt: Number(q.t),
-          receivedAt: Number(q.r || q.t),
-          receiveAgeSeconds: this.latestReceivedAge(symbol),
-          marketAgeSeconds: this.latestMarketAge(symbol)
-        });
-      }
-      if (u.pathname === "/tick-sample") {
-        const ms = Math.max(2000, Math.min(8000, Number(u.searchParams.get("ms") || 5000)));
-        return json(await this.sampleTickFlow(ms));
-      }
-      if (u.pathname === "/prime-live") {
-        const ms = Math.max(2000, Math.min(8000, Number(u.searchParams.get("ms") || 5000)));
-        return json(await this.primeLiveFlow(ms));
-      }
-      if (u.pathname === "/top-health") return json(await this.getTopHealth());
-      if (u.pathname === "/risk") return json(this.getRiskGate());
-      if (u.pathname === "/register-chat" && req.method === "POST") return json(await this.registerAlertChat(req));
-      if (u.pathname === "/claim-ready" && req.method === "POST") return json(await this.claimReadyAlert(req));
-      if (u.pathname === "/ready-outcome" && req.method === "POST") return json(await this.finishReadySetup(req));
-      if (u.pathname === "/chats") return json(await this.getAlertChats());
-      if (u.pathname === "/track" && req.method === "POST") return json(await this.trackSignal(req));
-      if (u.pathname === "/stats") return json(await this.getTrackingStats());
-      if (u.pathname === "/forwardstats") return json(await this.getForwardStats());
-      if (u.pathname === "/shortstats") {
-        return json(await this.getShortShadowStats());
-      }
-      if (u.pathname === "/blockerstats") {
-        const stats = await this.getBlockerStats();
-
-        return json({
-          ...stats,
-          message: this.formatBlockerStatsMessage(stats)
-        });
-      }
-
-      if (u.pathname === "/blockerrecent") {
-        const stats = await this.getBlockerStats();
-
-        const limit = Math.max(
-          1,
-          Math.min(
-            30,
-            Number(u.searchParams.get("limit")) || 20
-          )
+      const result =
+        await this.settleShortShadowV2(
+          Date.now()
         );
 
+      await this.scheduleAlarm();
+
+      return json(result);
+    }
+
+    if (u.pathname === "/massive-check") {
+      const checkSymbol =
+        normalizeSymbol(
+          u.searchParams.get("symbol") ||
+          "EUR/USD"
+        );
+
+      try {
+        const bars =
+          await this.fetchMassive30SecondBars(
+            checkSymbol,
+            80
+          );
+
+        const last =
+          bars.at(-1) || null;
+
         return json({
           ok: true,
-          recent: stats.recent.slice(0, limit),
-          message: this.formatRecentBlockersMessage(stats, limit)
+          symbol: checkSymbol,
+          dataSource: "massive-s30",
+          completedBars: bars.length,
+          lastBarOpenAt:
+            last?.t || null,
+          lastBarCloseAt:
+            Number.isFinite(Number(last?.t))
+              ? Number(last.t) + 30000
+              : null
         });
-      }
-
-      if (u.pathname === "/status") {
-        if (symbol) await this.subscribe(symbol);
-        const crypto = isCryptoSymbol(symbol);
-
-        if (symbol && Number.isFinite(this.latestReceivedAge(symbol)) && this.latestReceivedAge(symbol) > 30) {
-          try {
-            if (crypto) await this.forceCryptoReconnect(`status detected stale ${symbol}`);
-            else await this.forceReconnect(`status detected stale ${symbol}`);
-          } catch (_) { }
-        } else {
-          if (crypto) await this.ensureCryptoSocket();
-          else await this.ensureSocket();
-        }
-
-        const arr = symbol ? (this.ticks.get(symbol) || []) : [];
-        const connected = crypto
-          ? Boolean(this.cryptoWs && this.cryptoWs.readyState === 1)
-          : Boolean(this.ws && this.ws.readyState === 1);
-        const status = crypto ? this.lastCryptoStatus : this.lastStatus;
-        const subscribeStatus = crypto ? this.lastCryptoSubscribeStatus : this.lastSubscribeStatus;
-        const lastMessageAt = crypto ? this.lastCryptoWsMessageAt : this.lastWsMessageAt;
-        const lastMessageAge = lastMessageAt ? Math.max(0, (Date.now() - lastMessageAt) / 1000) : null;
-
+      } catch (e) {
         return json({
-          version: VERSION,
-          provider: crypto ? "tiingo-crypto" : "tiingo-fx",
-          status,
-          subscribeStatus,
-          connected,
-          symbols: [...this.symbols],
-          symbol,
-          ticks: arr.length,
-          bars60: buildBars(arr, 60).length,
-          lastTickAgeSeconds: arr.length ? this.latestReceivedAge(symbol) : null,
-          providerTickAgeSeconds: arr.length ? this.latestMarketAge(symbol) : null,
-          lastWsMessageAgeSeconds: lastMessageAge,
-          reconnectCount: this.reconnectCount,
-          expirySeconds: EXPIRY_SECONDS
+          ok: false,
+          symbol: checkSymbol,
+          dataSource: "massive-s30",
+          error:
+            String(
+              e?.message || e
+            )
         });
       }
-
-      return json({ ok: true, version: VERSION, expirySeconds: EXPIRY_SECONDS });
     }
+
+    if (u.pathname === "/quote") {
+      if (!symbol) return json({ ok: false, error: "invalid symbol" }, 400);
+      await this.subscribe(symbol);
+      if (isCryptoSymbol(symbol)) await this.ensureCryptoSocket();
+      else await this.ensureSocket();
+      const arr = this.ticks.get(symbol) || [];
+      const q = arr.at(-1);
+      if (!q) return json({ ok: false, symbol, error: "no live quote" });
+      return json({
+        ok: true,
+        symbol,
+        price: Number(q.p),
+        bid: q.bid,
+        ask: q.ask,
+        providerAt: Number(q.t),
+        receivedAt: Number(q.r || q.t),
+        receiveAgeSeconds: this.latestReceivedAge(symbol),
+        marketAgeSeconds: this.latestMarketAge(symbol)
+      });
+    }
+    if (u.pathname === "/tick-sample") {
+      const ms = Math.max(2000, Math.min(8000, Number(u.searchParams.get("ms") || 5000)));
+      return json(await this.sampleTickFlow(ms));
+    }
+    if (u.pathname === "/prime-live") {
+      const ms = Math.max(2000, Math.min(8000, Number(u.searchParams.get("ms") || 5000)));
+      return json(await this.primeLiveFlow(ms));
+    }
+    if (u.pathname === "/top-health") return json(await this.getTopHealth());
+    if (u.pathname === "/risk") return json(this.getRiskGate());
+    if (u.pathname === "/register-chat" && req.method === "POST") return json(await this.registerAlertChat(req));
+    if (u.pathname === "/claim-ready" && req.method === "POST") return json(await this.claimReadyAlert(req));
+    if (u.pathname === "/ready-outcome" && req.method === "POST") return json(await this.finishReadySetup(req));
+    if (u.pathname === "/chats") return json(await this.getAlertChats());
+    if (u.pathname === "/track" && req.method === "POST") return json(await this.trackSignal(req));
+    if (u.pathname === "/stats") return json(await this.getTrackingStats());
+    if (u.pathname === "/forwardstats") return json(await this.getForwardStats());
+    if (u.pathname === "/shortstats") {
+      return json(await this.getShortShadowStats());
+    }
+    if (u.pathname === "/blockerstats") {
+      const stats = await this.getBlockerStats();
+
+      return json({
+        ...stats,
+        message: this.formatBlockerStatsMessage(stats)
+      });
+    }
+
+    if (u.pathname === "/blockerrecent") {
+      const stats = await this.getBlockerStats();
+
+      const limit = Math.max(
+        1,
+        Math.min(
+          30,
+          Number(u.searchParams.get("limit")) || 20
+        )
+      );
+
+      return json({
+        ok: true,
+        recent: stats.recent.slice(0, limit),
+        message: this.formatRecentBlockersMessage(stats, limit)
+      });
+    }
+
+    if (u.pathname === "/status") {
+      if (symbol) await this.subscribe(symbol);
+      const crypto = isCryptoSymbol(symbol);
+
+      if (symbol && Number.isFinite(this.latestReceivedAge(symbol)) && this.latestReceivedAge(symbol) > 30) {
+        try {
+          if (crypto) await this.forceCryptoReconnect(`status detected stale ${symbol}`);
+          else await this.forceReconnect(`status detected stale ${symbol}`);
+        } catch (_) { }
+      } else {
+        if (crypto) await this.ensureCryptoSocket();
+        else await this.ensureSocket();
+      }
+
+      const arr = symbol ? (this.ticks.get(symbol) || []) : [];
+      const connected = crypto
+        ? Boolean(this.cryptoWs && this.cryptoWs.readyState === 1)
+        : Boolean(this.ws && this.ws.readyState === 1);
+      const status = crypto ? this.lastCryptoStatus : this.lastStatus;
+      const subscribeStatus = crypto ? this.lastCryptoSubscribeStatus : this.lastSubscribeStatus;
+      const lastMessageAt = crypto ? this.lastCryptoWsMessageAt : this.lastWsMessageAt;
+      const lastMessageAge = lastMessageAt ? Math.max(0, (Date.now() - lastMessageAt) / 1000) : null;
+
+      return json({
+        version: VERSION,
+        provider: crypto ? "tiingo-crypto" : "tiingo-fx",
+        status,
+        subscribeStatus,
+        connected,
+        symbols: [...this.symbols],
+        symbol,
+        ticks: arr.length,
+        bars60: buildBars(arr, 60).length,
+        lastTickAgeSeconds: arr.length ? this.latestReceivedAge(symbol) : null,
+        providerTickAgeSeconds: arr.length ? this.latestMarketAge(symbol) : null,
+        lastWsMessageAgeSeconds: lastMessageAge,
+        reconnectCount: this.reconnectCount,
+        expirySeconds: EXPIRY_SECONDS
+      });
+    }
+
+    return json({ ok: true, version: VERSION, expirySeconds: EXPIRY_SECONDS });
   }
+}
 
 async function tgSend(env, chatId, text, replyMarkup = null) {
   const token = String(env.TELEGRAM_BOT_TOKEN || "").trim();
