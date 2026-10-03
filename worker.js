@@ -8309,43 +8309,85 @@ export default {
         }
         if (/^\/shortdiag$/i.test(text)) {
           try {
-            const r =
-              await hub(
-                env,
-                "/s30-check?symbol=EUR%2FUSD"
-              );
+            const rows = [];
+            let websocketConnected = null;
+            let source = "tiango-websocket-ss0";
+            let readyCount = 0;
 
-            const ready =
-              r?.ready === true;
+            for (const pair of SHORT_SHADOW_UNIVERSE) {
+              try {
+                const r =
+                  await hub(
+                    env,
+                    `/s30-check?symbol=${encodeURIComponent(pair)}`
+                  );
 
-            const remaining =
-              Number(r?.remainingBars || 0);
+                websocketConnected =
+                  websocketConnected === null
+                    ? Boolean(r?.websocketConnected)
+                    : (websocketConnected && Boolean(r?.websocketConnected));
 
-            const etaMinutes =
-              Math.ceil(
-                Number(r?.estimatedWarmupSeconds || 0) /
-                60
-              );
+                source =
+                  r?.dataSource ||
+                  source;
+
+                const completed =
+                  Number(r?.completedBars || 0);
+
+                const required =
+                  Number(r?.requiredBars || 32);
+
+                const ticks =
+                  Number(r?.currentBarTicks || 0);
+
+                const ready =
+                  r?.ready === true;
+
+                if (ready) {
+                  readyCount++;
+                }
+
+                const state =
+                  r?.error
+                    ? "ERROR"
+                    : ready
+                      ? "READY"
+                      : "WARMING";
+
+                rows.push(
+                  `${pair} â ${state} â ${completed}/${required} bars â ${ticks} ticks` +
+                  (r?.error
+                    ? ` â ${String(r.error).slice(0, 120)}`
+                    : "")
+                );
+              } catch (e) {
+                rows.push(
+                  `${pair} â ERROR â ${String(e?.message || e).slice(0, 120)}`
+                );
+                websocketConnected = false;
+              }
+            }
+
+            const totalPairs =
+              SHORT_SHADOW_UNIVERSE.length;
+
+            const readyAll =
+              readyCount === totalPairs;
 
             await tgSend(
               env,
               chatId,
-              `CRUZ V2 DATA CHECK\n` +
+              `CRUZ V2 S30 DATA CHECK\n` +
               `Strategy: ${SHORT_SHADOW_ID}\n` +
-              `Symbol: EUR/USD\n` +
-              `Tiingo S30: ${ready ? "READY" : "WARMING"}\n` +
-              `WebSocket: ${r?.websocketConnected ? "CONNECTED" : "RECONNECTING"}\n` +
-              `Completed bars: ${r?.completedBars ?? 0}/${r?.requiredBars ?? 32}\n` +
-              `Current candle ticks: ${r?.currentBarTicks ?? 0}\n` +
-              `Source: ${r?.dataSource || "tiingo-websocket-s30"}\n` +
-              `${ready
-                ? "30-second history is ready for Cruz V2."
-                : `Warm-up remaining: ${remaining} candles (~${etaMinutes} min if quotes remain live).`
-              }` +
-              `${r?.error
-                ? `\nError: ${r.error}`
-                : ""
-              }`
+              `Pairs: ${totalPairs}\n` +
+              `Ready: ${readyCount}/${totalPairs}\n` +
+              `WebSocket: ${websocketConnected ? "CONNECTED" : "RECONNECTING"}\n` +
+              `Source: ${source}\n\n` +
+              rows.join("\n") +
+              `\n\n` +
+              (readyAll
+                ? "All monitored pairs have sufficient 30-second history for Cruz V2."
+                : "Pairs still warming need live quote flow; from an empty cache, 32 completed S30 candles takes about 16 minutes.")
             );
           } catch (e) {
             await tgSend(
