@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.7.0-cruz-aroon-osma-shadow";
+export const VERSION = "13.7.1-cruz-tiingo-s30-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -2912,6 +2912,7 @@ export class TickHub extends DurableObject {
     this.ctx = ctx; this.env = env; this.ws = null; this.cryptoWs = null; this.ticks = new Map(); this.symbols = new Set();
     this.lastStatus = "starting"; this.lastSubscribeStatus = null; this.connecting = false; this.cryptoConnecting = false; this.provider = "tiingo"; this.lastCryptoStatus = "starting"; this.lastCryptoSubscribeStatus = null; this.lastCryptoWsMessageAt = 0;
     this.lastWsMessageAt = 0; this.lastPriceReceivedAt = 0; this.lastConnectAt = 0; this.reconnectCount = 0; this.oneMinuteCache = new Map(); this.oneMinuteCacheDirty = false; this.quotaBlockedUntil = 0; this.pendingSignals = []; this.signalStats = { total: 0, wins: 0, losses: 0, draws: 0, voids: 0 }; this.signalHistory = []; this.forwardStats = null; this.alertChats = []; this.setupStates = {}; this.readyAlertClaims = {}; this.readyAudit = [];
+    this.current30sBars = new Map(); this.completed30sBars = new Map(); this.lastFinalized30sBucket = new Map(); this.s30Dirty = false;
 
     this.shortShadowState = {
       strategyId: SHORT_SHADOW_ID,
@@ -3026,6 +3027,58 @@ export class TickHub extends DurableObject {
       for (const [symbol, value] of Object.entries(persistedContext)) {
         if (value && Array.isArray(value.bars)) this.oneMinuteCache.set(symbol, value);
       }
+
+      // Restore persisted Tiingo-native 30-second OHLC history.
+      const storedS30 = (await this.ctx.storage.get("tiingoS30State")) || {};
+      const storedCompleted = storedS30.completed || {};
+      const storedCurrent = storedS30.current || {};
+      const storedFinalized = storedS30.lastFinalized || {};
+
+      for (const symbol of SHORT_SHADOW_UNIVERSE) {
+        const history = Array.isArray(storedCompleted[symbol])
+          ? storedCompleted[symbol]
+              .filter(b =>
+                Number.isFinite(Number(b?.t)) &&
+                [b?.o, b?.h, b?.l, b?.c].every(v => Number.isFinite(Number(v)))
+              )
+              .map(b => ({
+                t: Number(b.t),
+                o: Number(b.o),
+                h: Number(b.h),
+                l: Number(b.l),
+                c: Number(b.c),
+                n: Number(b.n || 0)
+              }))
+              .sort((a, b) => a.t - b.t)
+              .slice(-160)
+          : [];
+
+        if (history.length) this.completed30sBars.set(symbol, history);
+
+        const current = storedCurrent[symbol];
+        if (
+          current &&
+          Number.isFinite(Number(current.t)) &&
+          [current.o, current.h, current.l, current.c].every(v => Number.isFinite(Number(v)))
+        ) {
+          this.current30sBars.set(symbol, {
+            t: Number(current.t),
+            o: Number(current.o),
+            h: Number(current.h),
+            l: Number(current.l),
+            c: Number(current.c),
+            n: Number(current.n || 0)
+          });
+        }
+
+        const finalized = Number(storedFinalized[symbol]);
+        if (Number.isFinite(finalized)) {
+          this.lastFinalized30sBucket.set(symbol, finalized);
+        } else if (history.length) {
+          this.lastFinalized30sBucket.set(symbol, Number(history.at(-1).t));
+        }
+      }
+
       this.quotaBlockedUntil = Number((await this.ctx.storage.get("tiingoQuotaBlockedUntil")) || 0);
       this.pendingSignals = (await this.ctx.storage.get("pendingSignals")) || [];
       this.signalStats = (await this.ctx.storage.get("signalStats")) || { total: 0, wins: 0, losses: 0, draws: 0, voids: 0 };
@@ -3269,20 +3322,54 @@ export class TickHub extends DurableObject {
     return { ok: !fetchError, source: "tiingo-rest-top", error: fetchError, rows };
   }
 
-  async closeFeeds(reason = "free-tier sleep") {
-    // Persist the live WebSocket sample into the one-minute context before the
-    // Durable Object sleeps. This lets future scans advance indicators without
-    // repeatedly consuming Tiingo's hourly historical REST allocation.
-    try { this.captureSampledMinuteBars(); } catch (e) { this.lastStatus = `sample capture error: ${String(e?.message || e)}`; }
-    if (this.oneMinuteCacheDirty) {
-      try { await this.persistOneMinuteCache(); } catch (e) { this.lastStatus = `context persist error: ${String(e?.message || e)}`; }
+  async closeFeeds(reason = "collector persist") {
+    // Cruz V2 needs a continuous Tiingo FX stream so genuine 30-second OHLC
+    // candles can be built from every quote. Persist state here, but do NOT
+    // close the FX WebSocket after each scheduler/Telegram request.
+    try {
+      this.captureSampledMinuteBars();
+    } catch (e) {
+      this.lastStatus = `sample capture error: ${String(e?.message || e)}`;
     }
-    try { if (this.ws) { try { this.ws.close(1000, reason); } catch (_) { } } } catch (_) { }
-    try { if (this.cryptoWs) { try { this.cryptoWs.close(1000, reason); } catch (_) { } } } catch (_) { }
-    this.ws = null; this.cryptoWs = null; this.connecting = false; this.cryptoConnecting = false;
-    this.lastStatus = "sleeping";
-    this.lastCryptoStatus = "sleeping";
-    return { ok: true, status: "sleeping" };
+
+    this.finalizeTiingo30SecondBars(Date.now());
+
+    if (this.oneMinuteCacheDirty) {
+      try {
+        await this.persistOneMinuteCache();
+      } catch (e) {
+        this.lastStatus = `context persist error: ${String(e?.message || e)}`;
+      }
+    }
+
+    if (this.s30Dirty) {
+      try {
+        await this.persistTiingo30SecondState();
+      } catch (e) {
+        this.lastStatus = `S30 persist error: ${String(e?.message || e)}`;
+      }
+    }
+
+    // Crypto is not part of the current universe, so it can still sleep.
+    try {
+      if (this.cryptoWs) {
+        try { this.cryptoWs.close(1000, reason); } catch (_) { }
+      }
+    } catch (_) { }
+
+    this.cryptoWs = null;
+    this.cryptoConnecting = false;
+
+    const fxOpen = Boolean(this.ws && this.ws.readyState === 1);
+    if (fxOpen && !String(this.lastStatus || "").startsWith("tiingo fx error")) {
+      this.lastStatus = "collector-live";
+    }
+
+    return {
+      ok: true,
+      status: fxOpen ? "collector-live" : this.lastStatus,
+      s30Source: "tiingo-websocket"
+    };
   }
 
   async sendTrackedResult(chatId, text) {
@@ -3572,6 +3659,7 @@ export class TickHub extends DurableObject {
       if (!Number.isFinite(p) || !Number.isFinite(t)) return;
       this.lastStatus = "ok";
       this.pushTick(symbol, t, p, bid, ask);
+      this.updateTiingo30SecondCandle(symbol, t, p);
     } catch (e) {
       this.lastStatus = `tiingo fx parse error: ${String(e?.message || e)}`;
     }
@@ -3652,6 +3740,195 @@ export class TickHub extends DurableObject {
       else await this.ensureSocket();
     }
     return true;
+  }
+
+  commitTiingo30SecondBar(symbol, bar) {
+    const s = normalizeSymbol(symbol);
+    if (!s || !bar) return false;
+
+    const normalized = {
+      t: Number(bar.t),
+      o: Number(bar.o),
+      h: Number(bar.h),
+      l: Number(bar.l),
+      c: Number(bar.c),
+      n: Number(bar.n || 0)
+    };
+
+    if (
+      !Number.isFinite(normalized.t) ||
+      ![normalized.o, normalized.h, normalized.l, normalized.c].every(Number.isFinite)
+    ) {
+      return false;
+    }
+
+    const history = this.completed30sBars.get(s) || [];
+    const last = history.at(-1);
+
+    if (last && Number(last.t) === normalized.t) {
+      history[history.length - 1] = normalized;
+    } else if (!last || Number(normalized.t) > Number(last.t)) {
+      history.push(normalized);
+    } else {
+      return false;
+    }
+
+    if (history.length > 160) {
+      history.splice(0, history.length - 160);
+    }
+
+    this.completed30sBars.set(s, history);
+    this.lastFinalized30sBucket.set(s, normalized.t);
+    this.s30Dirty = true;
+    return true;
+  }
+
+  updateTiingo30SecondCandle(symbol, timestamp, price) {
+    const s = normalizeSymbol(symbol);
+    const t = Number(timestamp);
+    const p = Number(price);
+
+    if (
+      !s ||
+      !SHORT_SHADOW_UNIVERSE.includes(s) ||
+      !Number.isFinite(t) ||
+      !Number.isFinite(p)
+    ) {
+      return false;
+    }
+
+    const bucket = Math.floor(t / 30000) * 30000;
+    const lastFinalized = Number(this.lastFinalized30sBucket.get(s));
+
+    // Ignore late/out-of-order provider messages for an already finalized bucket.
+    if (Number.isFinite(lastFinalized) && bucket <= lastFinalized) {
+      return false;
+    }
+
+    const current = this.current30sBars.get(s);
+
+    if (!current) {
+      this.current30sBars.set(s, {
+        t: bucket,
+        o: p,
+        h: p,
+        l: p,
+        c: p,
+        n: 1
+      });
+      this.s30Dirty = true;
+      return true;
+    }
+
+    if (Number(current.t) === bucket) {
+      current.h = Math.max(Number(current.h), p);
+      current.l = Math.min(Number(current.l), p);
+      current.c = p;
+      current.n = Number(current.n || 0) + 1;
+      this.current30sBars.set(s, current);
+      this.s30Dirty = true;
+      return true;
+    }
+
+    if (bucket > Number(current.t)) {
+      this.commitTiingo30SecondBar(s, current);
+      this.current30sBars.set(s, {
+        t: bucket,
+        o: p,
+        h: p,
+        l: p,
+        c: p,
+        n: 1
+      });
+      this.s30Dirty = true;
+      return true;
+    }
+
+    return false;
+  }
+
+  finalizeTiingo30SecondBars(now = Date.now()) {
+    let changed = false;
+
+    for (const [symbol, current] of this.current30sBars.entries()) {
+      if (
+        current &&
+        Number.isFinite(Number(current.t)) &&
+        Number(current.t) + 30000 <= Number(now)
+      ) {
+        changed = this.commitTiingo30SecondBar(symbol, current) || changed;
+        this.current30sBars.delete(symbol);
+      }
+    }
+
+    if (changed) this.s30Dirty = true;
+    return changed;
+  }
+
+  async persistTiingo30SecondState() {
+    this.finalizeTiingo30SecondBars(Date.now());
+
+    const completed = {};
+    const current = {};
+    const lastFinalized = {};
+
+    for (const symbol of SHORT_SHADOW_UNIVERSE) {
+      completed[symbol] = (this.completed30sBars.get(symbol) || []).slice(-160);
+
+      const active = this.current30sBars.get(symbol);
+      if (active) current[symbol] = { ...active };
+
+      const finalized = Number(this.lastFinalized30sBucket.get(symbol));
+      if (Number.isFinite(finalized)) lastFinalized[symbol] = finalized;
+    }
+
+    await this.ctx.storage.put("tiingoS30State", {
+      version: 1,
+      source: "tiingo-websocket",
+      updatedAt: Date.now(),
+      completed,
+      current,
+      lastFinalized
+    });
+
+    this.s30Dirty = false;
+  }
+
+  getTiingo30SecondBars(symbol, count = 80) {
+    const s = normalizeSymbol(symbol);
+
+    if (!s || !SHORT_SHADOW_UNIVERSE.includes(s)) {
+      throw new Error("invalid Cruz V2 symbol");
+    }
+
+    this.finalizeTiingo30SecondBars(Date.now());
+
+    const safeCount = Math.max(
+      40,
+      Math.min(160, Number(count) || 80)
+    );
+
+    const bars = (this.completed30sBars.get(s) || [])
+      .slice(-safeCount)
+      .map(b => ({ ...b }));
+
+    if (bars.length < 32) {
+      throw new Error(
+        `Tiingo S30 warm-up in progress (${bars.length}/32 completed candles)`
+      );
+    }
+
+    const last = bars.at(-1);
+    const lastCloseAt = Number(last?.t) + 30000;
+    const ageMs = Date.now() - lastCloseAt;
+
+    if (!Number.isFinite(lastCloseAt) || ageMs > 45000) {
+      throw new Error(
+        `Tiingo S30 latest completed candle is stale (${(ageMs / 1000).toFixed(1)}s)`
+      );
+    }
+
+    return bars;
   }
 
   async persistOneMinuteCache() {
@@ -5960,7 +6237,7 @@ export class TickHub extends DurableObject {
 
 
     // -------------------------------------------------
-    // Fetch OANDA S30 context only for pairs
+    // Use persisted Tiingo S30 context only for pairs
     // that actually have an expiry due.
     // -------------------------------------------------
 
@@ -6004,11 +6281,7 @@ export class TickHub extends DurableObject {
     ) {
       try {
         const bars =
-          await this
-            .fetchMassive30SecondBars(
-              symbol,
-              80
-            );
+          await this.getTiingo30SecondBars(symbol, 80);
 
         barsBySymbol.set(
           symbol,
@@ -6016,7 +6289,7 @@ export class TickHub extends DurableObject {
         );
       } catch (_) {
         // Do not fail the entire settlement pass
-        // because one pair's OANDA request failed.
+        // because one pair's Tiingo S30 history is still warming.
       }
     }
 
@@ -6199,7 +6472,7 @@ export class TickHub extends DurableObject {
       ok: true,
 
       settlementSource:
-        "massive-s30",
+        "tiingo-websocket-s30",
 
       settled60,
       settled120,
@@ -6247,17 +6520,14 @@ export class TickHub extends DurableObject {
 
 
     // -------------------------------------------------
-    // TRUE COMPLETED OANDA S30 CONTEXT
+    // TRUE COMPLETED TIINGO WEBSOCKET S30 CONTEXT
     // -------------------------------------------------
 
     let bars30;
 
     try {
       bars30 =
-        await this.fetchMassive30SecondBars(
-          symbol,
-          80
-        );
+        this.getTiingo30SecondBars(symbol, 80);
     } catch (e) {
       return {
         ok: false,
@@ -6265,7 +6535,7 @@ export class TickHub extends DurableObject {
         captured: false,
 
         reason:
-          `Cruz V2 Massive S30 context unavailable: ${String(
+          `Cruz V2 Tiingo S30 context unavailable: ${String(
             e?.message || e
           )}`
       };
@@ -6296,8 +6566,8 @@ export class TickHub extends DurableObject {
         bars30,
 
         // V2 indicator logic is derived entirely
-        // from OANDA S30 candles.
-        // No Tiingo tick-based strategy filter.
+        // from completed Tiingo WebSocket S30 candles.
+        // No separate tick-based strategy filter.
         [],
 
         symbol
@@ -6316,7 +6586,7 @@ export class TickHub extends DurableObject {
     // -------------------------------------------------
     // ENTRY REFERENCE
     //
-    // OANDA candle timestamp = candle OPEN.
+    // S30 candle timestamp = candle OPEN.
     // Therefore completed S30 close = t + 30s.
     // -------------------------------------------------
 
@@ -6407,7 +6677,7 @@ export class TickHub extends DurableObject {
             "cruz-30s-aroon10-osma10-20-10",
 
           dataSource:
-            "massive-s30",
+            "tiingo-websocket-s30",
 
           timeframe:
             "30s",
@@ -6462,7 +6732,7 @@ export class TickHub extends DurableObject {
       signalBarOpenAt,
 
       dataSource:
-        "massive-s30"
+        "tiingo-websocket-s30"
     };
   }
 
@@ -6838,28 +7108,63 @@ export class TickHub extends DurableObject {
       return json(result);
     }
 
-    if (u.pathname === "/massive-check") {
+    if (u.pathname === "/s30-check" || u.pathname === "/massive-check") {
       const checkSymbol =
         normalizeSymbol(
           u.searchParams.get("symbol") ||
           "EUR/USD"
         );
 
+      if (!checkSymbol || !SHORT_SHADOW_UNIVERSE.includes(checkSymbol)) {
+        return json({
+          ok: false,
+          ready: false,
+          symbol: checkSymbol,
+          dataSource: "tiingo-websocket-s30",
+          error: "invalid S30 symbol"
+        }, 400);
+      }
+
       try {
+        this.finalizeTiingo30SecondBars(Date.now());
+
+        if (this.s30Dirty) {
+          await this.persistTiingo30SecondState();
+        }
+
         const bars =
-          await this.fetchMassive30SecondBars(
-            checkSymbol,
-            80
-          );
+          (this.completed30sBars.get(checkSymbol) || [])
+            .slice(-80);
+
+        const current =
+          this.current30sBars.get(checkSymbol) || null;
 
         const last =
           bars.at(-1) || null;
 
+        const ready =
+          bars.length >= 32;
+
+        const remainingBars =
+          Math.max(0, 32 - bars.length);
+
         return json({
           ok: true,
+          ready,
+          warming: !ready,
           symbol: checkSymbol,
-          dataSource: "massive-s30",
+          dataSource: "tiingo-websocket-s30",
+          websocketConnected:
+            Boolean(this.ws && this.ws.readyState === 1),
           completedBars: bars.length,
+          requiredBars: 32,
+          remainingBars,
+          estimatedWarmupSeconds:
+            remainingBars * 30,
+          currentBarOpenAt:
+            current?.t || null,
+          currentBarTicks:
+            Number(current?.n || 0),
           lastBarOpenAt:
             last?.t || null,
           lastBarCloseAt:
@@ -6870,8 +7175,9 @@ export class TickHub extends DurableObject {
       } catch (e) {
         return json({
           ok: false,
+          ready: false,
           symbol: checkSymbol,
-          dataSource: "massive-s30",
+          dataSource: "tiingo-websocket-s30",
           error:
             String(
               e?.message || e
@@ -8006,7 +8312,19 @@ export default {
             const r =
               await hub(
                 env,
-                "/massive-check?symbol=EUR%2FUSD"
+                "/s30-check?symbol=EUR%2FUSD"
+              );
+
+            const ready =
+              r?.ready === true;
+
+            const remaining =
+              Number(r?.remainingBars || 0);
+
+            const etaMinutes =
+              Math.ceil(
+                Number(r?.estimatedWarmupSeconds || 0) /
+                60
               );
 
             await tgSend(
@@ -8015,12 +8333,18 @@ export default {
               `CRUZ V2 DATA CHECK\n` +
               `Strategy: ${SHORT_SHADOW_ID}\n` +
               `Symbol: EUR/USD\n` +
-              `Massive S30: ${r?.ok ? "OK" : "FAILED"}\n` +
-              `Completed bars: ${r?.completedBars ?? 0}\n` +
-              `Source: ${r?.dataSource || "n/a"}\n` +
+              `Tiingo S30: ${ready ? "READY" : "WARMING"}\n` +
+              `WebSocket: ${r?.websocketConnected ? "CONNECTED" : "RECONNECTING"}\n` +
+              `Completed bars: ${r?.completedBars ?? 0}/${r?.requiredBars ?? 32}\n` +
+              `Current candle ticks: ${r?.currentBarTicks ?? 0}\n` +
+              `Source: ${r?.dataSource || "tiingo-websocket-s30"}\n` +
+              `${ready
+                ? "30-second history is ready for Cruz V2."
+                : `Warm-up remaining: ${remaining} candles (~${etaMinutes} min if quotes remain live).`
+              }` +
               `${r?.error
-                ? `Error: ${r.error}`
-                : "30-second data feed is available."
+                ? `\nError: ${r.error}`
+                : ""
               }`
             );
           } catch (e) {
