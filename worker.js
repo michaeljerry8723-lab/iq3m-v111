@@ -8438,6 +8438,11 @@ export default {
             let websocketConnected = null;
             let source = "tiingo-websocket-s30";
             let readyCount = 0;
+            let lastWsMessageAge = null;
+            let lastPriceReceivedAge = null;
+            let reconnectCount = null;
+            let websocketStatus = null;
+            let subscribeStatus = null;
 
             for (const pair of SHORT_SHADOW_UNIVERSE) {
               try {
@@ -8451,6 +8456,39 @@ export default {
                   websocketConnected === null
                     ? Boolean(r?.websocketConnected)
                     : (websocketConnected && Boolean(r?.websocketConnected));
+
+                if (lastWsMessageAge === null) {
+                  lastWsMessageAge =
+                    Number.isFinite(Number(r?.lastWsMessageAgeSeconds))
+                      ? Number(r.lastWsMessageAgeSeconds)
+                      : null;
+                }
+
+                if (lastPriceReceivedAge === null) {
+                  lastPriceReceivedAge =
+                    Number.isFinite(Number(r?.lastPriceReceivedAgeSeconds))
+                      ? Number(r.lastPriceReceivedAgeSeconds)
+                      : null;
+                }
+
+                if (reconnectCount === null) {
+                  reconnectCount =
+                    Number.isFinite(Number(r?.reconnectCount))
+                      ? Number(r.reconnectCount)
+                      : null;
+                }
+
+                if (!websocketStatus) {
+                  websocketStatus =
+                    r?.websocketStatus ||
+                    null;
+                }
+
+                if (!subscribeStatus) {
+                  subscribeStatus =
+                    r?.subscribeStatus ||
+                    null;
+                }
 
                 source =
                   r?.dataSource ||
@@ -8507,6 +8545,11 @@ export default {
               `Pairs: ${totalPairs}\n` +
               `Ready: ${readyCount}/${totalPairs}\n` +
               `WebSocket: ${websocketConnected ? "CONNECTED" : "RECONNECTING"}\n` +
+              `Last WS message: ${lastWsMessageAge == null ? "n/a" : lastWsMessageAge.toFixed(1) + "s ago"}\n` +
+              `Last FX quote: ${lastPriceReceivedAge == null ? "n/a" : lastPriceReceivedAge.toFixed(1) + "s ago"}\n` +
+              `Reconnects: ${reconnectCount == null ? "n/a" : reconnectCount}\n` +
+              `WS status: ${websocketStatus || "n/a"}\n` +
+              `Subscription: ${subscribeStatus || "n/a"}\n` +
               `Source: ${source}\n\n` +
               rows.join("\n") +
               `\n\n` +
