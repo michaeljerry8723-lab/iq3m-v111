@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.7.1-cruz-tiingo-s30-shadow";
+export const VERSION = "13.7.2-cruz-tiingo-s30-watchdog";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -30,6 +30,58 @@ export const PULLBACK_TTL_MS = 5 * 60 * 1000;
 export const GLOBAL_SIGNAL_COOLDOWN_MS = 0;
 export const PAIR_SIGNAL_COOLDOWN_MS = 6 * 60 * 1000;
 export const LOSS_CIRCUIT_BREAKER_MS = 20 * 60 * 1000;
+
+function isTiingoFxSessionOpen(at = Date.now()) {
+  const parts =
+    new Intl.DateTimeFormat(
+      "en-US",
+      {
+        timeZone: "America/New_York",
+        weekday: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false
+      }
+    )
+      .formatToParts(new Date(at))
+      .reduce(
+        (acc, part) => {
+          acc[part.type] = part.value;
+          return acc;
+        },
+        {}
+      );
+
+  const weekday =
+    String(parts.weekday || "");
+
+  const hour =
+    Number(parts.hour);
+
+  const minute =
+    Number(parts.minute);
+
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) {
+    return true;
+  }
+
+  const minutes =
+    hour * 60 + minute;
+
+  if (weekday === "Sat") {
+    return false;
+  }
+
+  if (weekday === "Sun") {
+    return minutes >= 20 * 60;
+  }
+
+  if (weekday === "Fri") {
+    return minutes < 17 * 60;
+  }
+
+  return true;
+}
 
 export function classifyBlocker(reason) {
   const r = String(reason || "").toLowerCase();
@@ -3259,7 +3311,39 @@ export class TickHub extends DurableObject {
     // explicit /checkall health checks and settlement snapshots.
     const before = {};
     for (const symbol of SHORT_SHADOW_UNIVERSE) before[symbol] = (this.ticks.get(symbol) || []).length;
-    await this.ensureSocket();
+
+    // FX WebSocket watchdog:
+    // readyState=OPEN does not guarantee that quote traffic is still flowing.
+    // During an active Tiingo FX session, reconnect when the stream has gone
+    // silent long enough to prevent multi-hour S30 warm-up stalls.
+    const wsOpen =
+      Boolean(this.ws && this.ws.readyState === 1);
+
+    const wsMessageAge =
+      this.lastWsMessageAt
+        ? Math.max(
+          0,
+          (Date.now() - this.lastWsMessageAt) / 1000
+        )
+        : Infinity;
+
+    if (
+      wsOpen &&
+      wsMessageAge > 45 &&
+      isTiingoFxSessionOpen()
+    ) {
+      try {
+        await this.forceReconnect(
+          `FX WebSocket stale ${wsMessageAge.toFixed(1)}s`
+        );
+        await sleep(750);
+      } catch (_) {
+        await this.ensureSocket();
+      }
+    } else {
+      await this.ensureSocket();
+    }
+
     await sleep(ms);
     const rows = SHORT_SHADOW_UNIVERSE.map(symbol => {
       const arr = this.ticks.get(symbol) || [];
@@ -3567,9 +3651,28 @@ export class TickHub extends DurableObject {
 
       ws.addEventListener("message", ev => this.onMessage(ev));
       ws.addEventListener("close", () => {
-        if (this.ws === ws) this.ws = null;
-        this.connecting = false;
-        this.lastStatus = "closed";
+        if (this.ws === ws) {
+          this.ws = null;
+          this.connecting = false;
+          this.lastStatus = "closed";
+
+          // Recover promptly from an actual socket close during an active
+          // market session instead of waiting for the next scheduled scan.
+          try {
+            if (isTiingoFxSessionOpen()) {
+              this.ctx.waitUntil((async () => {
+                try {
+                  await sleep(1500);
+                  if (!this.ws) {
+                    await this.ensureSocket(true);
+                  }
+                } catch (_) { }
+              })());
+            }
+          } catch (_) { }
+        } else {
+          this.connecting = false;
+        }
       });
       ws.addEventListener("error", () => { this.lastStatus = "tiingo fx websocket error"; });
     } catch (e) {
@@ -7170,7 +7273,29 @@ export class TickHub extends DurableObject {
           lastBarCloseAt:
             Number.isFinite(Number(last?.t))
               ? Number(last.t) + 30000
-              : null
+              : null,
+          lastWsMessageAgeSeconds:
+            this.lastWsMessageAt
+              ? Math.max(
+                0,
+                (Date.now() - this.lastWsMessageAt) / 1000
+              )
+              : null,
+          lastPriceReceivedAgeSeconds:
+            this.lastPriceReceivedAt
+              ? Math.max(
+                0,
+                (Date.now() - this.lastPriceReceivedAt) / 1000
+              )
+              : null,
+          reconnectCount:
+            Number(this.reconnectCount || 0),
+          websocketStatus:
+            this.lastStatus || null,
+          subscribeStatus:
+            this.lastSubscribeStatus?.response?.message ||
+            this.lastSubscribeStatus?.status ||
+            null
         });
       } catch (e) {
         return json({
