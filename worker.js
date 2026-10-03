@@ -6821,12 +6821,46 @@ export class TickHub extends DurableObject {
       return json(result);
     }
 
-    if (u.pathname === "/short-shadow") {
-      return json(
-        await this.evaluateShortShadowV2(
-          symbol
-        )
-      );
+    if (u.pathname === "/massive-check") {
+      const checkSymbol =
+        normalizeSymbol(
+          u.searchParams.get("symbol") ||
+          "EUR/USD"
+        );
+
+      try {
+        const bars =
+          await this.fetchMassive30SecondBars(
+            checkSymbol,
+            80
+          );
+
+        const last =
+          bars.at(-1) || null;
+
+        return json({
+          ok: true,
+          symbol: checkSymbol,
+          dataSource: "massive-s30",
+          completedBars: bars.length,
+          lastBarOpenAt:
+            last?.t || null,
+          lastBarCloseAt:
+            Number.isFinite(Number(last?.t))
+              ? Number(last.t) + 30000
+              : null
+        });
+      } catch (e) {
+        return json({
+          ok: false,
+          symbol: checkSymbol,
+          dataSource: "massive-s30",
+          error:
+            String(
+              e?.message || e
+            )
+        });
+      }
     }
 
     if (u.pathname === "/quote") {
@@ -7948,6 +7982,41 @@ export default {
             }
           }
           await tgSend(env, chatId, `V13.5 FIVE-MINUTE SNIPER DIAGNOSIS\n\n${rows.join("\n")}`);
+          return new Response("ok");
+        }
+        if (/^\/shortdiag$/i.test(text)) {
+          try {
+            const r =
+              await hub(
+                env,
+                "/massive-check?symbol=EUR%2FUSD"
+              );
+
+            await tgSend(
+              env,
+              chatId,
+              `CRUZ V2 DATA CHECK\n` +
+              `Strategy: ${SHORT_SHADOW_ID}\n` +
+              `Symbol: EUR/USD\n` +
+              `Massive S30: ${r?.ok ? "OK" : "FAILED"}\n` +
+              `Completed bars: ${r?.completedBars ?? 0}\n` +
+              `Source: ${r?.dataSource || "n/a"}\n` +
+              `${r?.error
+                ? `Error: ${r.error}`
+                : "30-second data feed is available."
+              }`
+            );
+          } catch (e) {
+            await tgSend(
+              env,
+              chatId,
+              `CRUZ V2 DATA CHECK ERROR\n` +
+              String(
+                e?.message || e
+              ).slice(0, 500)
+            );
+          }
+
           return new Response("ok");
         }
         if (/^\/cronstatus$/i.test(text)) {
