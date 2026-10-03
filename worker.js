@@ -8311,7 +8311,7 @@ export default {
           try {
             const rows = [];
             let websocketConnected = null;
-            let source = "tiango-websocket-ss0";
+            let source = "tiingo-websocket-s30";
             let readyCount = 0;
 
             for (const pair of SHORT_SHADOW_UNIVERSE) {
@@ -8355,14 +8355,14 @@ export default {
                       : "WARMING";
 
                 rows.push(
-                  `${pair} â ${state} â ${completed}/${required} bars â ${ticks} ticks` +
+                  `${pair} - ${state} - ${completed}/${required} bars - ${ticks} ticks` +
                   (r?.error
-                    ? ` â ${String(r.error).slice(0, 120)}`
+                    ? ` - ${String(r.error).slice(0, 120)}`
                     : "")
                 );
               } catch (e) {
                 rows.push(
-                  `${pair} â ERROR â ${String(e?.message || e).slice(0, 120)}`
+                  `${pair} - ERROR - ${String(e?.message || e).slice(0, 120)}`
                 );
                 websocketConnected = false;
               }
