@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.7.2-cruz-tiingo-s30-watchdog";
+export const VERSION = "13.7.3-cruz-tiingo-s30-watchdog-fix";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -2963,7 +2963,7 @@ export class TickHub extends DurableObject {
     super(ctx, env);
     this.ctx = ctx; this.env = env; this.ws = null; this.cryptoWs = null; this.ticks = new Map(); this.symbols = new Set();
     this.lastStatus = "starting"; this.lastSubscribeStatus = null; this.connecting = false; this.cryptoConnecting = false; this.provider = "tiingo"; this.lastCryptoStatus = "starting"; this.lastCryptoSubscribeStatus = null; this.lastCryptoWsMessageAt = 0;
-    this.lastWsMessageAt = 0; this.lastPriceReceivedAt = 0; this.lastConnectAt = 0; this.reconnectCount = 0; this.oneMinuteCache = new Map(); this.oneMinuteCacheDirty = false; this.quotaBlockedUntil = 0; this.pendingSignals = []; this.signalStats = { total: 0, wins: 0, losses: 0, draws: 0, voids: 0 }; this.signalHistory = []; this.forwardStats = null; this.alertChats = []; this.setupStates = {}; this.readyAlertClaims = {}; this.readyAudit = [];
+    this.lastWsMessageAt = 0; this.lastWsQuoteAt = 0; this.lastPriceReceivedAt = 0; this.lastConnectAt = 0; this.reconnectCount = 0; this.oneMinuteCache = new Map(); this.oneMinuteCacheDirty = false; this.quotaBlockedUntil = 0; this.pendingSignals = []; this.signalStats = { total: 0, wins: 0, losses: 0, draws: 0, voids: 0 }; this.signalHistory = []; this.forwardStats = null; this.alertChats = []; this.setupStates = {}; this.readyAlertClaims = {}; this.readyAudit = [];
     this.current30sBars = new Map(); this.completed30sBars = new Map(); this.lastFinalized30sBucket = new Map(); this.s30Dirty = false;
 
     this.shortShadowState = {
@@ -3319,22 +3319,22 @@ export class TickHub extends DurableObject {
     const wsOpen =
       Boolean(this.ws && this.ws.readyState === 1);
 
-    const wsMessageAge =
-      this.lastWsMessageAt
+    const wsQuoteAge =
+      this.lastWsQuoteAt
         ? Math.max(
           0,
-          (Date.now() - this.lastWsMessageAt) / 1000
+          (Date.now() - this.lastWsQuoteAt) / 1000
         )
         : Infinity;
 
     if (
       wsOpen &&
-      wsMessageAge > 45 &&
+      wsQuoteAge > 90 &&
       isTiingoFxSessionOpen()
     ) {
       try {
         await this.forceReconnect(
-          `FX WebSocket stale ${wsMessageAge.toFixed(1)}s`
+          `FX WebSocket quote flow stale ${wsQuoteAge.toFixed(1)}s`
         );
         await sleep(750);
       } catch (_) {
@@ -3609,6 +3609,7 @@ export class TickHub extends DurableObject {
     try { if (this.ws) { try { this.ws.close(1000, "reconnect"); } catch (_) { } } } catch (_) { }
     this.ws = null;
     this.connecting = false;
+    this.lastWsQuoteAt = 0;
     await sleep(150);
     await this.ensureSocket(true);
   }
@@ -3760,6 +3761,7 @@ export class TickHub extends DurableObject {
       const bid = Number(d[4]), mid = Number(d[5]), ask = Number(d[7]);
       const p = Number.isFinite(mid) ? mid : (Number.isFinite(bid) && Number.isFinite(ask) ? (bid + ask) / 2 : NaN);
       if (!Number.isFinite(p) || !Number.isFinite(t)) return;
+      this.lastWsQuoteAt = Date.now();
       this.lastStatus = "ok";
       this.pushTick(symbol, t, p, bid, ask);
       this.updateTiingo30SecondCandle(symbol, t, p);
@@ -7281,6 +7283,13 @@ export class TickHub extends DurableObject {
                 (Date.now() - this.lastWsMessageAt) / 1000
               )
               : null,
+          lastWsQuoteAgeSeconds:
+            this.lastWsQuoteAt
+              ? Math.max(
+                0,
+                (Date.now() - this.lastWsQuoteAt) / 1000
+              )
+              : null,
           lastPriceReceivedAgeSeconds:
             this.lastPriceReceivedAt
               ? Math.max(
@@ -8439,6 +8448,7 @@ export default {
             let source = "tiingo-websocket-s30";
             let readyCount = 0;
             let lastWsMessageAge = null;
+            let lastWsQuoteAge = null;
             let lastPriceReceivedAge = null;
             let reconnectCount = null;
             let websocketStatus = null;
@@ -8461,6 +8471,13 @@ export default {
                   lastWsMessageAge =
                     Number.isFinite(Number(r?.lastWsMessageAgeSeconds))
                       ? Number(r.lastWsMessageAgeSeconds)
+                      : null;
+                }
+
+                if (lastWsQuoteAge === null) {
+                  lastWsQuoteAge =
+                    Number.isFinite(Number(r?.lastWsQuoteAgeSeconds))
+                      ? Number(r.lastWsQuoteAgeSeconds)
                       : null;
                 }
 
@@ -8546,7 +8563,8 @@ export default {
               `Ready: ${readyCount}/${totalPairs}\n` +
               `WebSocket: ${websocketConnected ? "CONNECTED" : "RECONNECTING"}\n` +
               `Last WS message: ${lastWsMessageAge == null ? "n/a" : lastWsMessageAge.toFixed(1) + "s ago"}\n` +
-              `Last FX quote: ${lastPriceReceivedAge == null ? "n/a" : lastPriceReceivedAge.toFixed(1) + "s ago"}\n` +
+              `Last WS quote: ${lastWsQuoteAge == null ? "n/a" : lastWsQuoteAge.toFixed(1) + "s ago"}\n` +
+              `Last received price: ${lastPriceReceivedAge == null ? "n/a" : lastPriceReceivedAge.toFixed(1) + "s ago"}\n` +
               `Reconnects: ${reconnectCount == null ? "n/a" : reconnectCount}\n` +
               `WS status: ${websocketStatus || "n/a"}\n` +
               `Subscription: ${subscribeStatus || "n/a"}\n` +
