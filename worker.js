@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.7.3-cruz-tiingo-s30-watchdog-fix";
+export const VERSION = "13.7.4-cruz-tiingo-s30-stable-feed";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -3761,6 +3761,7 @@ export class TickHub extends DurableObject {
       const bid = Number(d[4]), mid = Number(d[5]), ask = Number(d[7]);
       const p = Number.isFinite(mid) ? mid : (Number.isFinite(bid) && Number.isFinite(ask) ? (bid + ask) / 2 : NaN);
       if (!Number.isFinite(p) || !Number.isFinite(t)) return;
+      if (!symbol || !SHORT_SHADOW_UNIVERSE.includes(symbol)) return;
       this.lastWsQuoteAt = Date.now();
       this.lastStatus = "ok";
       this.pushTick(symbol, t, p, bid, ask);
@@ -3808,26 +3809,59 @@ export class TickHub extends DurableObject {
   }
 
   async refreshIfStale(symbol) {
-    const receiveAge = this.latestReceivedAge(symbol);
     const crypto = isCryptoSymbol(symbol);
-    const msgAge = crypto
-      ? (this.lastCryptoWsMessageAt ? Math.max(0, (Date.now() - this.lastCryptoWsMessageAt) / 1000) : Infinity)
-      : (this.lastWsMessageAt ? Math.max(0, (Date.now() - this.lastWsMessageAt) / 1000) : Infinity);
-
-    if (!Number.isFinite(receiveAge)) {
-      if (crypto) await this.ensureCryptoSocket();
-      else await this.ensureSocket();
-      return;
-    }
-
     const open = crypto
       ? Boolean(this.cryptoWs && this.cryptoWs.readyState === 1)
       : Boolean(this.ws && this.ws.readyState === 1);
 
-    if (receiveAge > 15 || msgAge > 45 || !open) {
-      if (crypto) await this.forceCryptoReconnect(`stale ${symbol} feed`);
-      else await this.forceReconnect(`stale ${symbol} feed`);
-      await sleep(1800);
+    if (!open) {
+      if (crypto) {
+        await this.forceCryptoReconnect(`socket closed for ${symbol}`);
+      } else {
+        await this.forceReconnect(`socket closed for ${symbol}`);
+      }
+      await sleep(750);
+      return;
+    }
+
+    // Do not restart the shared multi-symbol FX socket merely because one
+    // pair has not printed a tick recently. Other pairs may still be flowing,
+    // and reconnecting the shared socket repeatedly can create a reconnect storm.
+    if (!crypto) {
+      const wsQuoteAge =
+        this.lastWsQuoteAt
+          ? Math.max(
+            0,
+            (Date.now() - this.lastWsQuoteAt) / 1000
+          )
+          : Infinity;
+
+      if (
+        isTiingoFxSessionOpen() &&
+        wsQuoteAge > 90
+      ) {
+        await this.forceReconnect(
+          `shared FX quote flow stale ${wsQuoteAge.toFixed(1)}s`
+        );
+        await sleep(750);
+      }
+
+      return;
+    }
+
+    const msgAge =
+      this.lastCryptoWsMessageAt
+        ? Math.max(
+          0,
+          (Date.now() - this.lastCryptoWsMessageAt) / 1000
+        )
+        : Infinity;
+
+    if (msgAge > 45) {
+      await this.forceCryptoReconnect(
+        `crypto websocket silent ${msgAge.toFixed(1)}s`
+      );
+      await sleep(750);
     }
   }
 
