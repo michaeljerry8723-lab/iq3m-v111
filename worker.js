@@ -787,14 +787,13 @@ export function scoreCruz30sAroonOsma(
     return {
       ok: false,
       reason:
-        "Cruz V2 30s context is still building",
+        "Cruz pattern 30s context is still building",
       bars30:
         Array.isArray(bars30)
           ? bars30.length
           : 0
     };
   }
-
 
   const aroonNow =
     cruzAroonSnapshot(
@@ -810,14 +809,10 @@ export function scoreCruz30sAroonOsma(
       10
     );
 
-
-  // Previous completed 30s candle.
-  // This lets the two confirmations occur
-  // on adjacent candles rather than forcing
-  // an unrealistically exact simultaneous cross.
+  // Previous completed 30s candle. Cruz-style timing allows the
+  // indicator confirmations to occur on the same or adjacent candle.
   const previousBars =
     bars30.slice(0, -1);
-
 
   const aroonPrevious =
     cruzAroonSnapshot(
@@ -833,21 +828,23 @@ export function scoreCruz30sAroonOsma(
       10
     );
 
-
   if (
     !aroonNow.ready ||
-    !osmaNow.ready
+    !osmaNow.ready ||
+    !aroonPrevious.ready ||
+    !osmaPrevious.ready
   ) {
     return {
       ok: false,
       reason:
-        "Cruz V2 Aroon/OsMA context is not ready"
+        "Cruz pattern Aroon/OsMA context is not ready"
     };
   }
 
-
   // -------------------------------------------------
-  // FRESH AROON CROSS
+  // CRUZ-STYLE AROON TRIGGER
+  //
+  // The Aroon crossover is the primary trigger.
   // -------------------------------------------------
 
   const bullishAroonNow =
@@ -857,45 +854,37 @@ export function scoreCruz30sAroonOsma(
     aroonNow.crossDown === true;
 
   const bullishAroonPrevious =
-    aroonPrevious.ready &&
     aroonPrevious.crossUp === true;
 
   const bearishAroonPrevious =
-    aroonPrevious.ready &&
     aroonPrevious.crossDown === true;
 
-
   // -------------------------------------------------
-  // FRESH OsMA ZERO-LINE TRANSITION
+  // CRUZ-STYLE OsMA MOMENTUM TRANSITION
+  //
+  // Do NOT require an exact zero-line cross.
+  // The screenshots show the useful confirmation as
+  // the OsMA histogram turning/moving in the same
+  // direction around the Aroon crossover.
   // -------------------------------------------------
 
   const bullishOsmaNow =
-    osmaNow.bullishZeroCross === true;
+    osmaNow.osma >
+    osmaNow.previousOsma;
 
   const bearishOsmaNow =
-    osmaNow.bearishZeroCross === true;
+    osmaNow.osma <
+    osmaNow.previousOsma;
 
   const bullishOsmaPrevious =
-    osmaPrevious.ready &&
-    osmaPrevious.bullishZeroCross === true;
+    osmaPrevious.osma >
+    osmaPrevious.previousOsma;
 
   const bearishOsmaPrevious =
-    osmaPrevious.ready &&
-    osmaPrevious.bearishZeroCross === true;
+    osmaPrevious.osma <
+    osmaPrevious.previousOsma;
 
-
-  // -------------------------------------------------
-  // CRUZ V2 CALL
-  //
-  // Aroon-Up crosses above Aroon-Down
-  // AND OsMA crosses bullish through zero.
-  //
-  // Both confirmations must occur either:
-  // - on the same completed 30s candle, or
-  // - within one completed 30s candle of each other.
-  // -------------------------------------------------
-
-  const callSetup =
+  const callIndicatorSetup =
     (
       bullishAroonNow &&
       (
@@ -904,19 +893,11 @@ export function scoreCruz30sAroonOsma(
       )
     ) ||
     (
-      bullishOsmaNow &&
-      bullishAroonPrevious
+      bullishAroonPrevious &&
+      bullishOsmaNow
     );
 
-
-  // -------------------------------------------------
-  // CRUZ V2 PUT
-  //
-  // Aroon-Down crosses above Aroon-Up
-  // AND OsMA crosses bearish through zero.
-  // -------------------------------------------------
-
-  const putSetup =
+  const putIndicatorSetup =
     (
       bearishAroonNow &&
       (
@@ -925,15 +906,14 @@ export function scoreCruz30sAroonOsma(
       )
     ) ||
     (
-      bearishOsmaNow &&
-      bearishAroonPrevious
+      bearishAroonPrevious &&
+      bearishOsmaNow
     );
 
-
-  if (!callSetup && !putSetup) {
-    let reason =
-      "Cruz V2 entry conditions are not aligned";
-
+  if (
+    !callIndicatorSetup &&
+    !putIndicatorSetup
+  ) {
     const freshAroon =
       bullishAroonNow ||
       bearishAroonNow ||
@@ -946,18 +926,19 @@ export function scoreCruz30sAroonOsma(
       bullishOsmaPrevious ||
       bearishOsmaPrevious;
 
+    let reason =
+      "Aroon and OsMA pattern conditions are not aligned";
 
     if (!freshAroon) {
       reason =
         "no fresh Aroon(10) crossover";
     } else if (!freshOsma) {
       reason =
-        "no fresh OsMA(10,20,10) zero-line transition";
+        "no same-direction OsMA momentum transition";
     } else {
       reason =
-        "Aroon and OsMA fresh signals disagree on direction";
+        "Aroon crossover and OsMA transition disagree";
     }
-
 
     return {
       ok: false,
@@ -966,43 +947,103 @@ export function scoreCruz30sAroonOsma(
       aroon: {
         up:
           aroonNow.up,
-
         down:
           aroonNow.down,
-
         crossUp:
           bullishAroonNow,
-
         crossDown:
-          bearishAroonNow
+          bearishAroonNow,
+        previousBarCrossUp:
+          bullishAroonPrevious,
+        previousBarCrossDown:
+          bearishAroonPrevious
       },
 
       osma: {
         value:
           osmaNow.osma,
-
         previous:
           osmaNow.previousOsma,
-
-        bullishZeroCross:
+        bullishTransition:
           bullishOsmaNow,
-
-        bearishZeroCross:
-          bearishOsmaNow
+        bearishTransition:
+          bearishOsmaNow,
+        previousBarBullishTransition:
+          bullishOsmaPrevious,
+        previousBarBearishTransition:
+          bearishOsmaPrevious
       }
     };
   }
 
-
   const direction =
-    callSetup
+    callIndicatorSetup
       ? "CALL"
       : "PUT";
 
+  // -------------------------------------------------
+  // PRICE-CANDLE CONFIRMATION
+  //
+  // The white-box examples show the entry occurring
+  // with the completed price candle pointing in the
+  // same direction as the indicator crossover.
+  // -------------------------------------------------
+
+  const signalBar =
+    bars30.at(-1);
+
+  const open =
+    Number(signalBar?.o);
+
+  const high =
+    Number(signalBar?.h);
+
+  const low =
+    Number(signalBar?.l);
+
+  const close =
+    Number(signalBar?.c);
+
+  const range =
+    high -
+    low;
+
+  const body =
+    Math.abs(
+      close - open
+    );
+
+  const bodyRatio =
+    Number.isFinite(range) &&
+    range > 0
+      ? body / range
+      : 0;
+
+  const candleAligned =
+    direction === "CALL"
+      ? close > open
+      : close < open;
+
+  if (!candleAligned) {
+    return {
+      ok: false,
+      reason:
+        "Aroon/OsMA pattern aligned but entry candle direction is not confirmed",
+      direction,
+
+      candle: {
+        open,
+        high,
+        low,
+        close,
+        bodyRatio
+      }
+    };
+  }
 
   // -------------------------------------------------
   // EXECUTION SAFEGUARD ONLY
-  // Not part of Cruz's indicator strategy.
+  // This does not define the Cruz pattern.
   // -------------------------------------------------
 
   const lastLive =
@@ -1033,25 +1074,24 @@ export function scoreCruz30sAroonOsma(
       if (spread.abnormal) {
         return {
           ok: false,
-
           reason:
-            "Cruz V2 qualified but live spread is abnormal",
-
+            "Cruz pattern qualified but live spread is abnormal",
           strategyQualified:
             true,
-
           direction
         };
       }
     }
   }
 
-
   return {
     ok: true,
 
     strategyId:
-      "cruz-30s-aroon-osma-v2",
+      "cruz-30s-aroon10-osma10-20-10-pattern-v1",
+
+    patternRevision:
+      "Aroon crossover + same-direction OsMA transition + confirming candle",
 
     direction,
 
@@ -1063,7 +1103,6 @@ export function scoreCruz30sAroonOsma(
 
     expiryCandidates:
       [60, 120],
-
 
     aroon: {
       period: 10,
@@ -1093,7 +1132,6 @@ export function scoreCruz30sAroonOsma(
         bearishAroonPrevious
     },
 
-
     osma: {
       fastPeriod: 10,
       slowPeriod: 20,
@@ -1111,19 +1149,34 @@ export function scoreCruz30sAroonOsma(
       signal:
         osmaNow.signal,
 
-      bullishZeroCross:
+      bullishTransition:
         bullishOsmaNow,
 
-      bearishZeroCross:
+      bearishTransition:
         bearishOsmaNow,
 
-      previousBarBullishZeroCross:
+      previousBarBullishTransition:
         bullishOsmaPrevious,
 
-      previousBarBearishZeroCross:
-        bearishOsmaPrevious
+      previousBarBearishTransition:
+        bearishOsmaPrevious,
+
+      bullishZeroCross:
+        osmaNow.bullishZeroCross,
+
+      bearishZeroCross:
+        osmaNow.bearishZeroCross
     },
 
+    candle: {
+      aligned:
+        candleAligned,
+      open,
+      high,
+      low,
+      close,
+      bodyRatio
+    },
 
     trigger: {
       sameOrAdjacent30s:
@@ -1137,27 +1190,31 @@ export function scoreCruz30sAroonOsma(
         bearishAroonNow ||
         bearishAroonPrevious,
 
-      bullishOsma:
+      bullishOsmaTransition:
         bullishOsmaNow ||
         bullishOsmaPrevious,
 
-      bearishOsma:
+      bearishOsmaTransition:
         bearishOsmaNow ||
-        bearishOsmaPrevious
-    },
+        bearishOsmaPrevious,
 
+      zeroCrossRequired:
+        false
+    },
 
     reasons:
       direction === "CALL"
         ? [
           "Aroon-Up crossed above Aroon-Down",
-          "OsMA crossed bullish through zero",
-          "Aroon and OsMA confirmations occurred within one 30s candle"
+          "OsMA momentum turned bullish around the crossover",
+          "Confirmation occurred within the same or adjacent 30s candle",
+          "Completed entry candle is bullish"
         ]
         : [
           "Aroon-Down crossed above Aroon-Up",
-          "OsMA crossed bearish through zero",
-          "Aroon and OsMA confirmations occurred within one 30s candle"
+          "OsMA momentum turned bearish around the crossover",
+          "Confirmation occurred within the same or adjacent 30s candle",
+          "Completed entry candle is bearish"
         ]
   };
 }
