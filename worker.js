@@ -6753,9 +6753,8 @@ export class TickHub extends DurableObject {
     // -------------------------------------------------
     // SOURCE-VERIFIED ENTRY REQUIRED
     // -------------------------------------------------
-    // Do not invent an execution point from the detected pattern. The old
-    // implementation used the completed S30 close as the entry reference;
-    // that fallback is now explicitly prohibited.
+    // The previous implementation treated the completed S30 close as the
+    // entry reference. Do not invent that execution point.
     const entryMethod = determineCruzResearchEntry({
       symbol,
       candidate,
@@ -6776,8 +6775,9 @@ export class TickHub extends DurableObject {
       };
     }
 
-      throw new Error("Unreachable: source-verified Cruz entry method required");
-    }
+    throw new Error("Unreachable: source-verified Cruz entry method required");
+
+  }
   async evaluateShortShadow(symbol) {
     symbol = normalizeSymbol(symbol);
 
