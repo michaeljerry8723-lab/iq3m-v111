@@ -2072,8 +2072,10 @@ console.log(
 
   assert(
     callScore.osma?.value > 0 &&
-    putScore.osma?.value < 0,
-    "Cruz CALL/PUT confirmation uses OsMA polarity above/below zero"
+    callScore.osma?.value > callScore.osma?.previous &&
+    putScore.osma?.value < 0 &&
+    putScore.osma?.value < putScore.osma?.previous,
+    "Cruz CALL/PUT requires matching OsMA polarity and directional histogram growth"
   );
 
   assert(
@@ -3604,8 +3606,8 @@ console.log(
   // -------------------------------------------------
 
   assert(
-    SHORT_SHADOW_ID === "cruz-30s-aroon10-osma10-20-10-screenshot-derived-polarity-shadow-v4",
-    "Screenshot-derived OsMA-polarity revision uses a distinct fresh dataset ID"
+    SHORT_SHADOW_ID === "cruz-30s-aroon10-osma10-20-10-screenshot-derived-momentum-shadow-v5",
+    "Screenshot-derived OsMA-momentum revision uses a distinct fresh dataset ID"
   );
 
   assert(

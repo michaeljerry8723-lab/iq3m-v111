@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.7.9-cruz-osma-polarity-shadow";
+export const VERSION = "13.8.0-cruz-osma-momentum-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -15,7 +15,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "CAD/JPY"
 ]);
 export const SHORT_SHADOW_ID =
-  "cruz-30s-aroon10-osma10-20-10-screenshot-derived-polarity-shadow-v4";
+  "cruz-30s-aroon10-osma10-20-10-screenshot-derived-momentum-shadow-v5";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const SHORT_SHADOW_MAX_PENDING = 250;
 export const SHORT_SHADOW_MAX_HISTORY = 1000;
@@ -860,25 +860,28 @@ export function scoreCruz30sAroonOsma(
     aroonPrevious.crossDown === true;
 
   // -------------------------------------------------
-  // CRUZ-STYLE OsMA POLARITY CONFIRMATION
+  // CRUZ-STYLE OsMA POLARITY + MOMENTUM CONFIRMATION
   //
   // Do NOT require an exact zero-line cross.
-  // The screenshot shows bearish OsMA histogram blocks
-  // below zero with a bearish Aroon crossover; use the
-  // histogram side of zero as confirmation.
+  // The screenshots show histogram bars on the matching side
+  // of zero and strengthening in the crossover direction.
   // -------------------------------------------------
 
   const bullishOsmaNow =
-    osmaNow.osma > 0;
+    osmaNow.osma > 0 &&
+    osmaNow.osma > osmaNow.previousOsma;
 
   const bearishOsmaNow =
-    osmaNow.osma < 0;
+    osmaNow.osma < 0 &&
+    osmaNow.osma < osmaNow.previousOsma;
 
   const bullishOsmaPrevious =
-    osmaPrevious.osma > 0;
+    osmaPrevious.osma > 0 &&
+    osmaPrevious.osma > osmaPrevious.previousOsma;
 
   const bearishOsmaPrevious =
-    osmaPrevious.osma < 0;
+    osmaPrevious.osma < 0 &&
+    osmaPrevious.osma < osmaPrevious.previousOsma;
 
   const callIndicatorSetup =
     (
@@ -930,10 +933,10 @@ export function scoreCruz30sAroonOsma(
         "no fresh Aroon(10) crossover";
     } else if (!freshOsma) {
       reason =
-        "no same-side OsMA zero-line polarity";
+        "no same-side, strengthening OsMA histogram";
     } else {
       reason =
-        "Aroon crossover and OsMA polarity disagree";
+        "Aroon crossover and OsMA polarity/momentum disagree";
     }
 
     return {
@@ -960,13 +963,13 @@ export function scoreCruz30sAroonOsma(
           osmaNow.osma,
         previous:
           osmaNow.previousOsma,
-        bullishPolarity:
+        bullishMomentumConfirmation:
           bullishOsmaNow,
-        bearishPolarity:
+        bearishMomentumConfirmation:
           bearishOsmaNow,
-        previousBarBullishPolarity:
+        previousBarBullishMomentumConfirmation:
           bullishOsmaPrevious,
-        previousBarBearishPolarity:
+        previousBarBearishMomentumConfirmation:
           bearishOsmaPrevious
       }
     };
@@ -1066,7 +1069,7 @@ export function scoreCruz30sAroonOsma(
       SHORT_SHADOW_ID,
 
     patternRevision:
-      "Screenshot-derived reconstruction: fresh Aroon(10) crossover + same-side OsMA zero-line polarity on the same/adjacent completed S30 candle (OsMA > 0 for CALL, < 0 for PUT); no candle-color gate. Exact Cruz proprietary rules are unverified.",
+      "Screenshot-derived reconstruction: fresh Aroon(10) crossover + same-side, strengthening OsMA histogram on the same/adjacent completed S30 candle (OsMA > 0 and rising for CALL; < 0 and falling for PUT); no candle-color gate. Exact Cruz proprietary rules are unverified.",
 
     direction,
 
@@ -1163,11 +1166,11 @@ export function scoreCruz30sAroonOsma(
         bearishAroonNow ||
         bearishAroonPrevious,
 
-      bullishOsmaPolarity:
+      bullishOsmaMomentum:
         bullishOsmaNow ||
         bullishOsmaPrevious,
 
-      bearishOsmaPolarity:
+      bearishOsmaMomentum:
         bearishOsmaNow ||
         bearishOsmaPrevious,
 
