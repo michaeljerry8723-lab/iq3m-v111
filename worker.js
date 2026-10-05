@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.8.0-cruz-osma-momentum-shadow";
+export const VERSION = "13.8.1-cruz-5m-ema-context-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -15,8 +15,11 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "CAD/JPY"
 ]);
 export const SHORT_SHADOW_ID =
-  "cruz-30s-aroon10-osma10-20-10-screenshot-derived-momentum-shadow-v5";
+  "cruz-30s-aroon10-osma10-20-10-ema20-50-context-shadow-v6";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
+export const CRUZ_5M_CONTEXT_MIN_BARS = 100;
+export const CRUZ_5M_EMA_FAST = 20;
+export const CRUZ_5M_EMA_SLOW = 50;
 export const SHORT_SHADOW_MAX_PENDING = 250;
 export const SHORT_SHADOW_MAX_HISTORY = 1000;
 export const CRYPTO_SYMBOLS = new Set();
@@ -775,6 +778,114 @@ export function cruzOsmaSnapshot(
       osma < 0
   };
 }
+export function aggregateCruzFiveMinuteBars(bars30) {
+  if (!Array.isArray(bars30) || !bars30.length) return [];
+
+  const buckets = new Map();
+
+  for (const raw of bars30) {
+    const t = Number(raw?.t);
+    const o = Number(raw?.o);
+    const h = Number(raw?.h);
+    const l = Number(raw?.l);
+    const c = Number(raw?.c);
+
+    if (
+      !Number.isFinite(t) ||
+      ![o, h, l, c].every(Number.isFinite) ||
+      t % 30000 !== 0
+    ) continue;
+
+    const bucketAt = Math.floor(t / 300000) * 300000;
+    if (!buckets.has(bucketAt)) buckets.set(bucketAt, []);
+    buckets.get(bucketAt).push({ t, o, h, l, c, n: Number(raw?.n || 0) });
+  }
+
+  const out = [];
+
+  for (const [bucketAt, items] of [...buckets.entries()].sort((a, b) => a[0] - b[0])) {
+    items.sort((a, b) => a.t - b.t);
+
+    if (
+      items.length !== 10 ||
+      items.some((bar, index) => bar.t !== bucketAt + index * 30000)
+    ) continue;
+
+    out.push({
+      t: bucketAt,
+      o: items[0].o,
+      h: Math.max(...items.map(bar => bar.h)),
+      l: Math.min(...items.map(bar => bar.l)),
+      c: items.at(-1).c,
+      n: items.reduce((sum, bar) => sum + bar.n, 0)
+    });
+  }
+
+  return out;
+}
+
+export function cruzFiveMinuteEmaSnapshot(
+  bars5m,
+  fastPeriod = CRUZ_5M_EMA_FAST,
+  slowPeriod = CRUZ_5M_EMA_SLOW,
+  minimumBars = CRUZ_5M_CONTEXT_MIN_BARS
+) {
+  const fast = Math.max(2, Math.floor(fastPeriod));
+  const slow = Math.max(fast + 1, Math.floor(slowPeriod));
+  const required = Math.max(slow + 1, Math.floor(minimumBars));
+
+  if (!Array.isArray(bars5m) || bars5m.length < required) {
+    return {
+      ready: false,
+      reason: "5-minute EMA(20/50) context is still warming up",
+      bars: Array.isArray(bars5m) ? bars5m.length : 0,
+      requiredBars: required,
+      fastPeriod: fast,
+      slowPeriod: slow
+    };
+  }
+
+  const closes = bars5m.map(bar => Number(bar?.c));
+  if (!closes.every(Number.isFinite)) {
+    return {
+      ready: false,
+      reason: "5-minute EMA context contains invalid closes",
+      bars: bars5m.length,
+      requiredBars: required,
+      fastPeriod: fast,
+      slowPeriod: slow
+    };
+  }
+
+  const fastSeries = emaSeries(closes, fast);
+  const slowSeries = emaSeries(closes, slow);
+  const emaFast = fastSeries.at(-1);
+  const emaSlow = slowSeries.at(-1);
+
+  if (!Number.isFinite(emaFast) || !Number.isFinite(emaSlow)) {
+    return {
+      ready: false,
+      reason: "5-minute EMA(20/50) values are not ready",
+      bars: bars5m.length,
+      requiredBars: required,
+      fastPeriod: fast,
+      slowPeriod: slow
+    };
+  }
+
+  return {
+    ready: true,
+    timeframe: "5m",
+    bars: bars5m.length,
+    requiredBars: required,
+    fastPeriod: fast,
+    slowPeriod: slow,
+    emaFast,
+    emaSlow,
+    direction: emaFast > emaSlow ? "CALL" : emaFast < emaSlow ? "PUT" : "NEUTRAL"
+  };
+}
+
 export function scoreCruz30sAroonOsma(
   bars30,
   ticks,
@@ -1069,7 +1180,7 @@ export function scoreCruz30sAroonOsma(
       SHORT_SHADOW_ID,
 
     patternRevision:
-      "Screenshot-derived reconstruction: fresh Aroon(10) crossover + same-side, strengthening OsMA histogram on the same/adjacent completed S30 candle (OsMA > 0 and rising for CALL; < 0 and falling for PUT); no candle-color gate. Exact Cruz proprietary rules are unverified.",
+      "Screenshot-derived reconstruction with 5-minute EMA(20/50) trend context: fresh Aroon(10) crossover + same-side, strengthening OsMA histogram on the same/adjacent completed S30 candle (OsMA > 0 and rising for CALL; < 0 and falling for PUT); no candle-color gate. Exact Cruz proprietary rules are unverified.",
 
     direction,
 
@@ -2997,7 +3108,7 @@ export class TickHub extends DurableObject {
     this.ctx = ctx; this.env = env; this.ws = null; this.cryptoWs = null; this.ticks = new Map(); this.symbols = new Set();
     this.lastStatus = "starting"; this.lastSubscribeStatus = null; this.connecting = false; this.cryptoConnecting = false; this.provider = "tiingo"; this.lastCryptoStatus = "starting"; this.lastCryptoSubscribeStatus = null; this.lastCryptoWsMessageAt = 0;
     this.lastWsMessageAt = 0; this.lastWsQuoteAt = 0; this.lastPriceReceivedAt = 0; this.lastConnectAt = 0; this.reconnectCount = 0; this.oneMinuteCache = new Map(); this.oneMinuteCacheDirty = false; this.quotaBlockedUntil = 0; this.pendingSignals = []; this.signalStats = { total: 0, wins: 0, losses: 0, draws: 0, voids: 0 }; this.signalHistory = []; this.forwardStats = null; this.alertChats = []; this.setupStates = {}; this.readyAlertClaims = {}; this.readyAudit = [];
-    this.current30sBars = new Map(); this.completed30sBars = new Map(); this.lastFinalized30sBucket = new Map(); this.s30Dirty = false;
+    this.current30sBars = new Map(); this.completed30sBars = new Map(); this.completedFiveMinuteBars = new Map(); this.lastFinalized30sBucket = new Map(); this.s30Dirty = false;
 
     this.shortShadowState = {
       strategyId: SHORT_SHADOW_ID,
@@ -3118,6 +3229,7 @@ export class TickHub extends DurableObject {
       const storedCompleted = storedS30.completed || {};
       const storedCurrent = storedS30.current || {};
       const storedFinalized = storedS30.lastFinalized || {};
+      const storedFiveMinute = storedS30.completedFiveMinute || {};
 
       for (const symbol of SHORT_SHADOW_UNIVERSE) {
         const history = Array.isArray(storedCompleted[symbol])
@@ -3139,6 +3251,24 @@ export class TickHub extends DurableObject {
           : [];
 
         if (history.length) this.completed30sBars.set(symbol, history);
+
+        const restoredFiveMinute = Array.isArray(storedFiveMinute[symbol])
+          ? storedFiveMinute[symbol]
+              .filter(b =>
+                Number.isFinite(Number(b?.t)) &&
+                [b?.o, b?.h, b?.l, b?.c].every(v => Number.isFinite(Number(v)))
+              )
+              .map(b => ({
+                t: Number(b.t), o: Number(b.o), h: Number(b.h),
+                l: Number(b.l), c: Number(b.c), n: Number(b.n || 0)
+              }))
+              .sort((a, b) => a.t - b.t)
+              .slice(-150)
+          : aggregateCruzFiveMinuteBars(history).slice(-150);
+
+        if (restoredFiveMinute.length) {
+          this.completedFiveMinuteBars.set(symbol, restoredFiveMinute);
+        }
 
         const current = storedCurrent[symbol];
         if (
@@ -3950,6 +4080,29 @@ export class TickHub extends DurableObject {
     }
 
     this.completed30sBars.set(s, history);
+
+    const aggregatedFiveMinute =
+      aggregateCruzFiveMinuteBars(history.slice(-10)).at(-1);
+
+    if (aggregatedFiveMinute) {
+      const fiveMinuteHistory =
+        this.completedFiveMinuteBars.get(s) || [];
+      const lastFiveMinute =
+        fiveMinuteHistory.at(-1);
+
+      if (lastFiveMinute && Number(lastFiveMinute.t) === aggregatedFiveMinute.t) {
+        fiveMinuteHistory[fiveMinuteHistory.length - 1] = aggregatedFiveMinute;
+      } else if (!lastFiveMinute || aggregatedFiveMinute.t > Number(lastFiveMinute.t)) {
+        fiveMinuteHistory.push(aggregatedFiveMinute);
+      }
+
+      if (fiveMinuteHistory.length > 150) {
+        fiveMinuteHistory.splice(0, fiveMinuteHistory.length - 150);
+      }
+
+      this.completedFiveMinuteBars.set(s, fiveMinuteHistory);
+    }
+
     this.lastFinalized30sBucket.set(s, normalized.t);
     this.s30Dirty = true;
     return true;
@@ -4041,11 +4194,13 @@ export class TickHub extends DurableObject {
     this.finalizeTiingo30SecondBars(Date.now());
 
     const completed = {};
+    const completedFiveMinute = {};
     const current = {};
     const lastFinalized = {};
 
     for (const symbol of SHORT_SHADOW_UNIVERSE) {
       completed[symbol] = (this.completed30sBars.get(symbol) || []).slice(-160);
+      completedFiveMinute[symbol] = (this.completedFiveMinuteBars.get(symbol) || []).slice(-150);
 
       const active = this.current30sBars.get(symbol);
       if (active) current[symbol] = { ...active };
@@ -4059,6 +4214,7 @@ export class TickHub extends DurableObject {
       source: "tiingo-websocket",
       updatedAt: Date.now(),
       completed,
+      completedFiveMinute,
       current,
       lastFinalized
     });
@@ -4101,6 +4257,12 @@ export class TickHub extends DurableObject {
     }
 
     return bars;
+  }
+
+  getCruzFiveMinuteTrend(symbol) {
+    return cruzFiveMinuteEmaSnapshot(
+      this.completedFiveMinuteBars.get(normalizeSymbol(symbol)) || []
+    );
   }
 
   async persistOneMinuteCache() {
@@ -6736,6 +6898,34 @@ export class TickHub extends DurableObject {
       };
     }
 
+    const fiveMinuteTrend =
+      this.getCruzFiveMinuteTrend(symbol);
+
+    if (!fiveMinuteTrend.ready) {
+      return {
+        ok: false,
+        symbol,
+        captured: false,
+        reason: fiveMinuteTrend.reason,
+        fiveMinuteTrend
+      };
+    }
+
+    if (fiveMinuteTrend.direction !== candidate.direction) {
+      return {
+        ok: false,
+        symbol,
+        captured: false,
+        reason: "5-minute EMA(20/50) trend disagrees with the 30-second Aroon/OsMA setup",
+        strategyQualified: true,
+        direction: candidate.direction,
+        fiveMinuteTrend
+      };
+    }
+
+    candidate.fiveMinuteTrend =
+      fiveMinuteTrend;
+
 
     // -------------------------------------------------
     // ENTRY REFERENCE
@@ -6851,6 +7041,9 @@ export class TickHub extends DurableObject {
 
           osma:
             candidate.osma,
+
+          fiveMinuteTrend:
+            candidate.fiveMinuteTrend,
 
           trigger:
             candidate.trigger,

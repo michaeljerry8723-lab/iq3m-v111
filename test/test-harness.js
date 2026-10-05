@@ -31,6 +31,8 @@ import {
   cruzAroonSnapshot,
   cruzOsmaSnapshot,
   scoreCruz30sAroonOsma,
+  aggregateCruzFiveMinuteBars,
+  cruzFiveMinuteEmaSnapshot,
   cruzS30SettlementPrice,
   TickHub
 } from "../worker.js";
@@ -2899,6 +2901,12 @@ console.log(
 
     await ctx.waitForInit();
 
+    let contextDirection = "PUT";
+    hub.getCruzFiveMinuteTrend = () => ({
+      ready: true, timeframe: "5m", bars: 100, requiredBars: 100,
+      fastPeriod: 20, slowPeriod: 50, emaFast: 1.099, emaSlow: 1.100,
+      direction: contextDirection
+    });
 
     // Use deterministic completed Tiingo S30 bars without a provider call.
     hub.getTiingo30SecondBars = (
@@ -2915,11 +2923,20 @@ console.log(
     };
 
 
-    const result =
-      await hub.evaluateShortShadowV2(
-        "EUR/USD"
-      );
+    const filtered =
+      await hub.evaluateShortShadowV2("EUR/USD");
 
+    assert(
+      filtered.ok === false &&
+      filtered.captured === false &&
+      /trend disagrees/i.test(filtered.reason) &&
+      hub.shortShadowState.pending.length === 0,
+      "5-minute EMA(20/50) blocks a CALL against a bearish trend"
+    );
+
+    contextDirection = "CALL";
+    const result =
+      await hub.evaluateShortShadowV2("EUR/USD");
 
     assert(
       result.ok === true &&
@@ -3103,6 +3120,11 @@ console.log(
 
     await ctx.waitForInit();
 
+    hub.getCruzFiveMinuteTrend = () => ({
+      ready: true, timeframe: "5m", bars: 100, requiredBars: 100,
+      fastPeriod: 20, slowPeriod: 50, emaFast: 1.100, emaSlow: 1.101,
+      direction: "PUT"
+    });
 
     hub.getTiingo30SecondBars = (
       symbol,
@@ -3600,14 +3622,19 @@ console.log(
 
   await ctx.waitForInit();
 
+  hub.getCruzFiveMinuteTrend = () => ({
+    ready: true, timeframe: "5m", bars: 100, requiredBars: 100,
+    fastPeriod: 20, slowPeriod: 50, emaFast: 1.102, emaSlow: 1.101,
+    direction: "CALL"
+  });
 
   // -------------------------------------------------
   // V1 state must disappear because strategy ID changed.
   // -------------------------------------------------
 
   assert(
-    SHORT_SHADOW_ID === "cruz-30s-aroon10-osma10-20-10-screenshot-derived-momentum-shadow-v5",
-    "Screenshot-derived OsMA-momentum revision uses a distinct fresh dataset ID"
+    SHORT_SHADOW_ID === "cruz-30s-aroon10-osma10-20-10-ema20-50-context-shadow-v6",
+    "Screenshot-derived 5-minute EMA-context revision uses a distinct fresh dataset ID"
   );
 
   assert(
@@ -4001,6 +4028,62 @@ console.log(
     Date.now =
       realDateNow;
   }
+}
+
+console.log();
+
+// -----------------------------------------------------------------------------
+// Test 32: 5-minute aggregation and EMA(20/50) context
+// -----------------------------------------------------------------------------
+console.log("Test 32: Cruz 5-minute EMA(20/50) context");
+
+{
+  const start = Date.UTC(2026, 9, 3, 0, 0, 0);
+  const tenS30Bars = Array.from({ length: 10 }, (_, i) => ({
+    t: start + i * 30000,
+    o: 1.1000 + i * 0.0001,
+    h: 1.1005 + i * 0.0001,
+    l: 1.0995 + i * 0.0001,
+    c: 1.1002 + i * 0.0001,
+    n: 2
+  }));
+
+  assert(
+    aggregateCruzFiveMinuteBars(tenS30Bars.slice(0, 9)).length === 0,
+    "Incomplete 5-minute bucket is excluded"
+  );
+
+  const aggregated = aggregateCruzFiveMinuteBars(tenS30Bars);
+  assert(
+    aggregated.length === 1 &&
+    aggregated[0].t === start &&
+    aggregated[0].o === tenS30Bars[0].o &&
+    aggregated[0].h === tenS30Bars.at(-1).h &&
+    aggregated[0].l === tenS30Bars[0].l &&
+    aggregated[0].c === tenS30Bars.at(-1).c,
+    "Ten completed S30 candles aggregate into one correctly aligned 5-minute candle"
+  );
+
+  const rising = Array.from({ length: 100 }, (_, i) => ({ c: 1 + i * 0.001 }));
+  const falling = Array.from({ length: 100 }, (_, i) => ({ c: 2 - i * 0.001 }));
+  const callTrend = cruzFiveMinuteEmaSnapshot(rising);
+  const putTrend = cruzFiveMinuteEmaSnapshot(falling);
+
+  assert(
+    callTrend.ready && callTrend.fastPeriod === 20 &&
+    callTrend.slowPeriod === 50 && callTrend.direction === "CALL",
+    "EMA(20) above EMA(50) identifies CALL context after warm-up"
+  );
+
+  assert(
+    putTrend.ready && putTrend.direction === "PUT",
+    "EMA(20) below EMA(50) identifies PUT context after warm-up"
+  );
+
+  assert(
+    cruzFiveMinuteEmaSnapshot(rising.slice(0, 99)).ready === false,
+    "EMA context blocks entries until 100 complete 5-minute candles are available"
+  );
 }
 
 console.log();
