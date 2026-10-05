@@ -17,6 +17,15 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
 export const SHORT_SHADOW_ID =
   "cruz-30s-aroon10-osma10-20-10-every-entry-shadow-v2";
 
+export const CRUZ_RESEARCH_DATASET_ID =
+  "cruz-v2-fresh-observations-2026-10-05";
+
+const CRUZ_RESEARCH_STATE_KEY =
+  "cruzResearchState";
+
+const CRUZ_RESEARCH_MAX_HISTORY =
+  5000;
+
 // Research-integrity guard: the original Cruz entry procedure has not been
 // independently source-verified from the author's material. Never use the
 // completed S30 close as an invented fallback entry.
@@ -3019,6 +3028,12 @@ export class TickHub extends DurableObject {
       history: []
     };
 
+    this.cruzResearchState = {
+      datasetId: CRUZ_RESEARCH_DATASET_ID,
+      startedAt: Date.now(),
+      observations: []
+    };
+
     this.blockerStats = {
       strategyId: STRATEGY_ID,
       classifierVersion: BLOCKER_CLASSIFIER_VERSION,
@@ -3032,6 +3047,48 @@ export class TickHub extends DurableObject {
     this.ctx.blockConcurrencyWhile(async () => {
 
       const storedBlockers = await this.ctx.storage.get("blockerStats");
+
+      const storedCruzResearch =
+        await this.ctx.storage.get(
+          CRUZ_RESEARCH_STATE_KEY
+        );
+
+      if (
+        storedCruzResearch?.datasetId ===
+        CRUZ_RESEARCH_DATASET_ID
+      ) {
+        this.cruzResearchState = {
+          datasetId:
+            CRUZ_RESEARCH_DATASET_ID,
+
+          startedAt:
+            Number(
+              storedCruzResearch.startedAt
+            ) || Date.now(),
+
+          observations:
+            Array.isArray(
+              storedCruzResearch.observations
+            )
+              ? storedCruzResearch.observations
+              : []
+        };
+      } else {
+        this.cruzResearchState = {
+          datasetId:
+            CRUZ_RESEARCH_DATASET_ID,
+
+          startedAt:
+            Date.now(),
+
+          observations: []
+        };
+
+        await this.ctx.storage.put(
+          CRUZ_RESEARCH_STATE_KEY,
+          this.cruzResearchState
+        );
+      }
 
       if (
         storedBlockers?.strategyId === STRATEGY_ID &&
@@ -6131,6 +6188,261 @@ export class TickHub extends DurableObject {
     };
   }
 
+  async recordCruzResearchObservation(body = {}) {
+    const symbol =
+      normalizeSymbol(body?.symbol);
+
+    const direction =
+      String(
+        body?.direction || ""
+      ).toUpperCase();
+
+    const sourceBarOpenAt =
+      Number(
+        body?.sourceBarOpenAt
+      );
+
+    const sourceBarCloseAt =
+      Number(
+        body?.sourceBarCloseAt
+      );
+
+    const observedPrice =
+      Number(
+        body?.observedPrice
+      );
+
+    if (
+      !symbol ||
+      !SHORT_SHADOW_UNIVERSE.includes(symbol)
+    ) {
+      return {
+        ok: false,
+        error: "invalid Cruz research symbol"
+      };
+    }
+
+    if (
+      !["CALL", "PUT"].includes(direction)
+    ) {
+      return {
+        ok: false,
+        error: "invalid Cruz research direction"
+      };
+    }
+
+    if (
+      !Number.isFinite(sourceBarOpenAt) ||
+      !Number.isFinite(sourceBarCloseAt) ||
+      !Number.isFinite(observedPrice)
+    ) {
+      return {
+        ok: false,
+        error: "invalid Cruz research source timestamp or price"
+      };
+    }
+
+    if (
+      !this.cruzResearchState ||
+      this.cruzResearchState.datasetId !==
+        CRUZ_RESEARCH_DATASET_ID
+    ) {
+      this.cruzResearchState = {
+        datasetId:
+          CRUZ_RESEARCH_DATASET_ID,
+
+        startedAt:
+          Date.now(),
+
+        observations: []
+      };
+    }
+
+    const sourceKey =
+      String(
+        body?.sourceKey ||
+        (
+          CRUZ_RESEARCH_DATASET_ID +
+          "|" +
+          symbol +
+          "|" +
+          direction +
+          "|" +
+          sourceBarOpenAt
+        )
+      );
+
+    const observations =
+      Array.isArray(
+        this.cruzResearchState.observations
+      )
+        ? this.cruzResearchState.observations
+        : [];
+
+    const duplicate =
+      observations.find(
+        x =>
+          String(
+            x?.sourceKey || ""
+          ) === sourceKey
+      );
+
+    if (duplicate) {
+      return {
+        ok: true,
+        duplicate: true,
+        id: duplicate.id,
+        datasetId:
+          CRUZ_RESEARCH_DATASET_ID
+      };
+    }
+
+    const observation = {
+      id:
+        crypto.randomUUID(),
+
+      datasetId:
+        CRUZ_RESEARCH_DATASET_ID,
+
+      sourceKey,
+
+      strategyId:
+        SHORT_SHADOW_ID,
+
+      symbol,
+      direction,
+
+      sourceBarOpenAt,
+      sourceBarCloseAt,
+
+      observedAt:
+        Number(
+          body?.observedAt
+        ) || Date.now(),
+
+      observedPrice,
+
+      patternRevision:
+        body?.patternRevision || null,
+
+      aroon:
+        body?.aroon || null,
+
+      osma:
+        body?.osma || null,
+
+      candle:
+        body?.candle || null,
+
+      trigger:
+        body?.trigger || null,
+
+      capturedAt:
+        Date.now()
+    };
+
+    this.cruzResearchState.observations =
+      [
+        observation,
+        ...observations
+      ].slice(
+        0,
+        CRUZ_RESEARCH_MAX_HISTORY
+      );
+
+    await this.ctx.storage.put(
+      CRUZ_RESEARCH_STATE_KEY,
+      this.cruzResearchState
+    );
+
+    return {
+      ok: true,
+      duplicate: false,
+      id: observation.id,
+      datasetId:
+        CRUZ_RESEARCH_DATASET_ID,
+      sourceKey
+    };
+  }
+
+  async getCruzResearchStats() {
+    const state =
+      this.cruzResearchState || {
+        datasetId:
+          CRUZ_RESEARCH_DATASET_ID,
+        startedAt: null,
+        observations: []
+      };
+
+    const observations =
+      Array.isArray(
+        state.observations
+      )
+        ? state.observations
+        : [];
+
+    const bySymbol = {};
+    const byDirection = {
+      CALL: 0,
+      PUT: 0
+    };
+
+    for (
+      const symbol of SHORT_SHADOW_UNIVERSE
+    ) {
+      bySymbol[symbol] = 0;
+    }
+
+    for (const row of observations) {
+      if (
+        Object.prototype.hasOwnProperty.call(
+          bySymbol,
+          row?.symbol
+        )
+      ) {
+        bySymbol[row.symbol]++;
+      }
+
+      const direction =
+        String(
+          row?.direction || ""
+        ).toUpperCase();
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          byDirection,
+          direction
+        )
+      ) {
+        byDirection[direction]++;
+      }
+    }
+
+    return {
+      ok: true,
+      datasetId:
+        CRUZ_RESEARCH_DATASET_ID,
+
+      strategyId:
+        SHORT_SHADOW_ID,
+
+      startedAt:
+        state.startedAt || null,
+
+      totalObservations:
+        observations.length,
+
+      bySymbol,
+      byDirection,
+
+      latest:
+        observations.slice(
+          0,
+          25
+        )
+    };
+  }
+
   async captureShortShadow(body = {}) {
     const symbol = normalizeSymbol(body?.symbol);
     const direction = String(body?.direction || "").toUpperCase();
@@ -6763,19 +7075,94 @@ export class TickHub extends DurableObject {
     });
 
     if (!entryMethod?.qualified || !entryMethod?.sourceVerified) {
+      const sourceBar =
+        bars30.at(-1);
+
+      const observation =
+        await this.recordCruzResearchObservation({
+          symbol,
+          direction:
+            candidate.direction,
+
+          sourceBarOpenAt:
+            Number(
+              sourceBar?.t
+            ),
+
+          sourceBarCloseAt:
+            Number(
+              sourceBar?.t
+            ) + 30000,
+
+          observedPrice:
+            Number(
+              sourceBar?.c
+            ),
+
+          observedAt:
+            Date.now(),
+
+          patternRevision:
+            candidate.patternRevision,
+
+          aroon:
+            candidate.aroon,
+
+          osma:
+            candidate.osma,
+
+          candle:
+            candidate.candle,
+
+          trigger:
+            candidate.trigger,
+
+          sourceKey:
+            CRUZ_RESEARCH_DATASET_ID +
+            "|" +
+            symbol +
+            "|" +
+            candidate.direction +
+            "|" +
+            Number(sourceBar?.t)
+        });
+
       return {
         ...candidate,
         symbol,
         captured: false,
         patternDetected: true,
-        strategyQualified: true,
+
+        observationRecorded:
+          Boolean(
+            observation?.ok
+          ),
+
+        observationDuplicate:
+          Boolean(
+            observation?.duplicate
+          ),
+
+        observationId:
+          observation?.id || null,
+
         entryMethodVerified: false,
-        entryMethodRevision: CRUZ_ENTRY_METHOD_REVISION,
-        reason: entryMethod?.reason || "Cruz entry method is not source-verified"
+
+        entryMethodRevision:
+          CRUZ_ENTRY_METHOD_REVISION,
+
+        datasetId:
+          CRUZ_RESEARCH_DATASET_ID,
+
+        reason:
+          entryMethod?.reason ||
+          "Cruz entry method is not source-verified"
       };
     }
 
-    throw new Error("Unreachable: source-verified Cruz entry method required");
+    throw new Error(
+      "Unreachable: source-verified Cruz entry method required"
+    );
 
   }
   async evaluateShortShadow(symbol) {
@@ -7296,6 +7683,12 @@ export class TickHub extends DurableObject {
     if (u.pathname === "/forwardstats") return json(await this.getForwardStats());
     if (u.pathname === "/shortstats") {
       return json(await this.getShortShadowStats());
+    }
+
+    if (u.pathname === "/cruz-research-stats") {
+      return json(
+        await this.getCruzResearchStats()
+      );
     }
     if (u.pathname === "/blockerstats") {
       const stats = await this.getBlockerStats();
