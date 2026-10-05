@@ -32,7 +32,9 @@ import {
   cruzOsmaSnapshot,
   scoreCruz30sAroonOsma,
   cruzS30SettlementPrice,
-  TickHub
+  TickHub,
+  CRUZ_ENTRY_METHOD_REVISION,
+  determineCruzResearchEntry
 } from "../worker.js";
 
 // Mock Durable Object storage for Node testing
@@ -89,6 +91,24 @@ function assert(condition, message) {
     failed++;
   }
 }
+
+
+// -----------------------------------------------------------------------------
+// Test 32: Cruz entry-method integrity guard
+// -----------------------------------------------------------------------------
+console.log("Test 32: Cruz entry-method integrity guard");
+{
+  const entry = determineCruzResearchEntry({});
+  assert(
+    entry.qualified === false && entry.sourceVerified === false,
+    "Cruz research entry remains blocked until the source-verified entry rule exists"
+  );
+  assert(
+    CRUZ_ENTRY_METHOD_REVISION === "source-verified-rule-required-v1",
+    "Cruz research entry revision explicitly requires source verification"
+  );
+}
+console.log();
 
 console.log(`=======================================================`);
 console.log(`Running V13.6 Pocket Option FX Sniper Audit Test Suite`);
@@ -2749,10 +2769,10 @@ console.log(
 console.log();
 
 // -----------------------------------------------------------------------------
-// Test 27: Cruz V2 evaluator captures deterministic OANDA S30 CALL
+// Test 27: Cruz V2 evaluator refuses unverified entry fallback
 // -----------------------------------------------------------------------------
 console.log(
-  "Test 27: Cruz V2 evaluator captures OANDA S30 CALL"
+  "Test 27: Cruz V2 evaluator refuses unverified entry fallback"
 );
 
 {
@@ -2898,55 +2918,21 @@ console.log(
 
     assert(
       result.ok === true &&
-      result.captured === true &&
-      result.direction === "CALL",
-      "Cruz V2 evaluator captures aligned Aroon/OsMA CALL"
+      result.patternDetected === true &&
+      result.captured === false &&
+      result.direction === "CALL" &&
+      result.entryMethodVerified === false,
+      "Cruz V2 detects the aligned CALL pattern but refuses an unverified entry"
     );
 
 
     assert(
-      hub.shortShadowState.pending.length === 1,
-      "Cruz V2 captured setup enters the pending settlement queue"
+      hub.shortShadowState.pending.length === 0,
+      "Unverified Cruz entry is not inserted into the pending settlement queue"
     );
 
 
-    const record =
-      hub.shortShadowState.pending[0];
 
-
-    assert(
-      record.entryPrice ===
-      Number(
-        bars30.at(-1).c
-      ) &&
-      record.entryAt ===
-      expectedEntryAt &&
-      record.expiry120At ===
-      expectedEntryAt +
-      120000,
-      "Cruz V2 uses completed OANDA S30 close and exact 120-second expiry"
-    );
-
-
-    assert(
-      record.features?.model ===
-      "cruz-30s-aroon10-osma10-20-10" &&
-      record.features?.dataSource ===
-      "massive-s30" &&
-      record.features?.timeframe ===
-      "30s" &&
-      record.features?.primaryExpirySeconds ===
-      120 &&
-      record.features?.aroon?.period ===
-      10 &&
-      record.features?.osma?.fastPeriod ===
-      10 &&
-      record.features?.osma?.slowPeriod ===
-      20 &&
-      record.features?.osma?.signalPeriod ===
-      10,
-      "Captured V2 record preserves exact 30s Aroon(10) and OsMA(10,20,10) configuration"
-    );
   } finally {
     Date.now =
       realDateNow;
@@ -2956,10 +2942,10 @@ console.log(
 console.log();
 
 // -----------------------------------------------------------------------------
-// Test 28: Cruz V2 evaluator captures deterministic OANDA S30 PUT
+// Test 28: Cruz V2 evaluator refuses unverified PUT entry fallback
 // -----------------------------------------------------------------------------
 console.log(
-  "Test 28: Cruz V2 evaluator captures Massive S30 PUT"
+  "Test 28: Cruz V2 evaluator refuses unverified PUT entry fallback"
 );
 
 {
@@ -3102,55 +3088,21 @@ console.log(
 
     assert(
       result.ok === true &&
-      result.captured === true &&
-      result.direction === "PUT",
-      "Cruz V2 evaluator captures aligned Aroon/OsMA PUT"
+      result.patternDetected === true &&
+      result.captured === false &&
+      result.direction === "PUT" &&
+      result.entryMethodVerified === false,
+      "Cruz V2 detects the aligned PUT pattern but refuses an unverified entry"
     );
 
 
     assert(
-      hub.shortShadowState.pending.length === 1,
-      "Cruz V2 PUT setup enters the pending settlement queue"
+      hub.shortShadowState.pending.length === 0,
+      "Unverified Cruz PUT entry is not inserted into the pending settlement queue"
     );
 
 
-    const record =
-      hub.shortShadowState.pending[0];
 
-
-    assert(
-      record.entryPrice ===
-      Number(
-        bars30.at(-1).c
-      ) &&
-      record.entryAt ===
-      expectedEntryAt &&
-      record.expiry120At ===
-      expectedEntryAt +
-      120000,
-      "Cruz V2 PUT uses completed OANDA S30 close and exact 120-second expiry"
-    );
-
-
-    assert(
-      record.features?.model ===
-      "cruz-30s-aroon10-osma10-20-10" &&
-      record.features?.dataSource ===
-      "massive-s30" &&
-      record.features?.timeframe ===
-      "30s" &&
-      record.features?.primaryExpirySeconds ===
-      120 &&
-      record.features?.aroon?.period ===
-      10 &&
-      record.features?.osma?.fastPeriod ===
-      10 &&
-      record.features?.osma?.slowPeriod ===
-      20 &&
-      record.features?.osma?.signalPeriod ===
-      10,
-      "Captured PUT record preserves exact V2 indicator configuration"
-    );
   } finally {
     Date.now =
       realDateNow;

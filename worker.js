@@ -16,6 +16,18 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
 ]);
 export const SHORT_SHADOW_ID =
   "cruz-30s-aroon10-osma10-20-10-every-entry-shadow-v2";
+
+// Research-integrity guard: the original Cruz entry procedure has not been
+// independently source-verified from the author's material. Never use the
+// completed S30 close as an invented fallback entry.
+export const CRUZ_ENTRY_METHOD_REVISION = "source-verified-rule-required-v1";
+export function determineCruzResearchEntry() {
+  return {
+    qualified: false,
+    sourceVerified: false,
+    reason: "Cruz entry rule is not source-verified; no completed-S30-close fallback is permitted"
+  };
+}
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const SHORT_SHADOW_MAX_PENDING = 250;
 export const SHORT_SHADOW_MAX_HISTORY = 1000;
@@ -6739,158 +6751,33 @@ export class TickHub extends DurableObject {
 
 
     // -------------------------------------------------
-    // ENTRY REFERENCE
-    //
-    // S30 candle timestamp = candle OPEN.
-    // Therefore completed S30 close = t + 30s.
+    // SOURCE-VERIFIED ENTRY REQUIRED
     // -------------------------------------------------
-
-    const signalBar =
-      bars30.at(-1);
-
-
-    const entryPrice =
-      Number(
-        signalBar?.c
-      );
-
-    const signalBarOpenAt =
-      Number(
-        signalBar?.t
-      );
-
-    const entryAt =
-      signalBarOpenAt +
-      30000;
-
-
-    if (
-      !Number.isFinite(entryPrice) ||
-      !Number.isFinite(signalBarOpenAt)
-    ) {
-      return {
-        ok: false,
-        symbol,
-        captured: false,
-        reason:
-          "Cruz V2 completed S30 entry candle is invalid"
-      };
-    }
-
-
-    // -------------------------------------------------
-    // STALE-CANDLE PROTECTION
-    //
-    // Prevent an old completed candle from being
-    // interpreted as a new entry after market/feed gaps.
-    // -------------------------------------------------
-
-    const candleAgeMs =
-      Date.now() -
-      entryAt;
-
-
-    if (
-      candleAgeMs < -5000 ||
-      candleAgeMs > 45000
-    ) {
-      return {
-        ok: false,
-        symbol,
-        captured: false,
-
-        reason:
-          `Cruz V2 latest completed S30 candle is stale (${(
-            candleAgeMs / 1000
-          ).toFixed(1)}s)`
-      };
-    }
-
-
-    // 30-second key rather than the old minute key.
-    const sourceKey =
-      `${SHORT_SHADOW_ID}|` +
-      `${symbol}|` +
-      `${candidate.direction}|` +
-      `${Math.floor(entryAt / 30000)}`;
-
-
-    const capture =
-      await this.captureShortShadow({
-        symbol,
-
-        direction:
-          candidate.direction,
-
-        entryPrice,
-        entryAt,
-        sourceKey,
-
-
-        features: {
-          model:
-            "cruz-30s-aroon10-osma10-20-10",
-
-          dataSource:
-            "tiingo-websocket-s30",
-
-          timeframe:
-            "30s",
-
-          primaryExpirySeconds:
-            120,
-
-          expiryCandidates:
-            candidate.expiryCandidates,
-
-          signalBarOpenAt,
-          signalBarCloseAt:
-            entryAt,
-
-          aroon:
-            candidate.aroon,
-
-          osma:
-            candidate.osma,
-
-          trigger:
-            candidate.trigger,
-
-          reasons:
-            candidate.reasons
-        }
-      });
-
-
-    return {
-      ...candidate,
-
+    // The previous implementation treated the completed S30 close as the
+    // entry reference. Do not invent that execution point.
+    const entryMethod = determineCruzResearchEntry({
       symbol,
+      candidate,
+      bars30,
+      now: Date.now()
+    });
 
-      captured:
-        Boolean(
-          capture?.ok &&
-          !capture?.duplicate
-        ),
+    if (!entryMethod?.qualified || !entryMethod?.sourceVerified) {
+      return {
+        ...candidate,
+        symbol,
+        captured: false,
+        patternDetected: true,
+        strategyQualified: true,
+        entryMethodVerified: false,
+        entryMethodRevision: CRUZ_ENTRY_METHOD_REVISION,
+        reason: entryMethod?.reason || "Cruz entry method is not source-verified"
+      };
+    }
 
-      duplicate:
-        Boolean(
-          capture?.duplicate
-        ),
+    throw new Error("Unreachable: source-verified Cruz entry method required");
 
-      shadowId:
-        capture?.id || null,
-
-      entryPrice,
-      entryAt,
-
-      signalBarOpenAt,
-
-      dataSource:
-        "tiingo-websocket-s30"
-    };
   }
-
   async evaluateShortShadow(symbol) {
     symbol = normalizeSymbol(symbol);
 
