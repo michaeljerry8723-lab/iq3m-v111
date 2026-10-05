@@ -34,7 +34,8 @@ import {
   cruzS30SettlementPrice,
   TickHub,
   CRUZ_ENTRY_METHOD_REVISION,
-  determineCruzResearchEntry
+  determineCruzResearchEntry,
+  CRUZ_RESEARCH_DATASET_ID
 } from "../worker.js";
 
 // Mock Durable Object storage for Node testing
@@ -108,6 +109,113 @@ console.log("Test 32: Cruz entry-method integrity guard");
     "Cruz research entry revision explicitly requires source verification"
   );
 }
+console.log();
+
+// -----------------------------------------------------------------------------
+// Test 33: Fresh Cruz research dataset is isolated from legacy shadow data
+// -----------------------------------------------------------------------------
+console.log("Test 33: Fresh Cruz research dataset isolation");
+{
+  const oldRecord = {
+    id: "legacy-1",
+    strategyId: SHORT_SHADOW_ID,
+    symbol: "EUR/USD",
+    direction: "CALL",
+    entryPrice: 1.1,
+    entryAt: Date.now() - 120000,
+    result60: "WIN",
+    result120: "LOSS"
+  };
+
+  const storage = new MockStorage({
+    shortShadowState: {
+      strategyId: SHORT_SHADOW_ID,
+      startedAt: Date.now() - 86400000,
+      pending: [],
+      history: [oldRecord]
+    }
+  });
+
+  const ctx = new MockCtx(storage);
+  const hub = new TickHub(ctx, {
+    WS_SYMBOLS: "EUR/USD"
+  });
+
+  await ctx.waitForInit();
+
+  const before =
+    await hub.getCruzResearchStats();
+
+  assert(
+    before.datasetId === CRUZ_RESEARCH_DATASET_ID &&
+    before.totalObservations === 0,
+    "Fresh Cruz dataset starts at zero and does not inherit legacy shadow history"
+  );
+
+  const sourceBarOpenAt =
+    Date.now() - 30000;
+
+  const first =
+    await hub.recordCruzResearchObservation({
+      symbol: "EUR/USD",
+      direction: "CALL",
+      sourceBarOpenAt,
+      sourceBarCloseAt:
+        sourceBarOpenAt + 30000,
+      observedPrice: 1.12345,
+      observedAt:
+        sourceBarOpenAt + 30000,
+      patternRevision:
+        "Every fresh Aroon crossover + same-direction OsMA transition; no candle-color gate",
+      aroon: {
+        crossUp: true
+      },
+      osma: {
+        bullishTransition: true
+      }
+    });
+
+  assert(
+    first.ok &&
+    !first.duplicate &&
+    first.datasetId === CRUZ_RESEARCH_DATASET_ID,
+    "First qualifying observation is recorded in the fresh dataset"
+  );
+
+  const duplicate =
+    await hub.recordCruzResearchObservation({
+      symbol: "EUR/USD",
+      direction: "CALL",
+      sourceBarOpenAt,
+      sourceBarCloseAt:
+        sourceBarOpenAt + 30000,
+      observedPrice: 1.12345,
+      observedAt:
+        sourceBarOpenAt + 30000,
+      sourceKey:
+        CRUZ_RESEARCH_DATASET_ID +
+        "|EUR/USD|CALL|" +
+        sourceBarOpenAt
+    });
+
+  assert(
+    duplicate.ok &&
+    duplicate.duplicate === true,
+    "The same source candle cannot be recorded twice"
+  );
+
+  const after =
+    await hub.getCruzResearchStats();
+
+  assert(
+    after.totalObservations === 1 &&
+    after.bySymbol["EUR/USD"] === 1 &&
+    after.byDirection.CALL === 1,
+    "Fresh Cruz statistics count exactly one unique observation"
+  );
+}
+console.log();
+
 console.log();
 
 console.log(`=======================================================`);
