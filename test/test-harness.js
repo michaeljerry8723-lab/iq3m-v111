@@ -3598,6 +3598,11 @@ console.log(
   // -------------------------------------------------
 
   assert(
+    SHORT_SHADOW_ID === "cruz-30s-aroon10-osma10-20-10-screenshot-derived-shadow-v3",
+    "Screenshot-derived Cruz revision uses a distinct fresh dataset ID"
+  );
+
+  assert(
     hub.shortShadowState.strategyId ===
     SHORT_SHADOW_ID &&
     hub.shortShadowState.pending.length ===

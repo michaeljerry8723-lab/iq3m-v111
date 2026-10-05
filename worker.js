@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.7.7-cruz-screenshot-reconstruction-shadow";
+export const VERSION = "13.7.8-cruz-screenshot-fresh-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -15,7 +15,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "CAD/JPY"
 ]);
 export const SHORT_SHADOW_ID =
-  "cruz-30s-aroon10-osma10-20-10-every-entry-shadow-v2";
+  "cruz-30s-aroon10-osma10-20-10-screenshot-derived-shadow-v3";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const SHORT_SHADOW_MAX_PENDING = 250;
 export const SHORT_SHADOW_MAX_HISTORY = 1000;
