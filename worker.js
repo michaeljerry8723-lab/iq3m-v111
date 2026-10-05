@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.7.8-cruz-screenshot-fresh-shadow";
+export const VERSION = "13.7.9-cruz-osma-polarity-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -15,7 +15,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "CAD/JPY"
 ]);
 export const SHORT_SHADOW_ID =
-  "cruz-30s-aroon10-osma10-20-10-screenshot-derived-shadow-v3";
+  "cruz-30s-aroon10-osma10-20-10-screenshot-derived-polarity-shadow-v4";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const SHORT_SHADOW_MAX_PENDING = 250;
 export const SHORT_SHADOW_MAX_HISTORY = 1000;
@@ -860,29 +860,25 @@ export function scoreCruz30sAroonOsma(
     aroonPrevious.crossDown === true;
 
   // -------------------------------------------------
-  // CRUZ-STYLE OsMA MOMENTUM TRANSITION
+  // CRUZ-STYLE OsMA POLARITY CONFIRMATION
   //
   // Do NOT require an exact zero-line cross.
-  // The screenshots show the useful confirmation as
-  // the OsMA histogram turning/moving in the same
-  // direction around the Aroon crossover.
+  // The screenshot shows bearish OsMA histogram blocks
+  // below zero with a bearish Aroon crossover; use the
+  // histogram side of zero as confirmation.
   // -------------------------------------------------
 
   const bullishOsmaNow =
-    osmaNow.osma >
-    osmaNow.previousOsma;
+    osmaNow.osma > 0;
 
   const bearishOsmaNow =
-    osmaNow.osma <
-    osmaNow.previousOsma;
+    osmaNow.osma < 0;
 
   const bullishOsmaPrevious =
-    osmaPrevious.osma >
-    osmaPrevious.previousOsma;
+    osmaPrevious.osma > 0;
 
   const bearishOsmaPrevious =
-    osmaPrevious.osma <
-    osmaPrevious.previousOsma;
+    osmaPrevious.osma < 0;
 
   const callIndicatorSetup =
     (
@@ -934,10 +930,10 @@ export function scoreCruz30sAroonOsma(
         "no fresh Aroon(10) crossover";
     } else if (!freshOsma) {
       reason =
-        "no same-direction OsMA momentum transition";
+        "no same-side OsMA zero-line polarity";
     } else {
       reason =
-        "Aroon crossover and OsMA transition disagree";
+        "Aroon crossover and OsMA polarity disagree";
     }
 
     return {
@@ -964,13 +960,13 @@ export function scoreCruz30sAroonOsma(
           osmaNow.osma,
         previous:
           osmaNow.previousOsma,
-        bullishTransition:
+        bullishPolarity:
           bullishOsmaNow,
-        bearishTransition:
+        bearishPolarity:
           bearishOsmaNow,
-        previousBarBullishTransition:
+        previousBarBullishPolarity:
           bullishOsmaPrevious,
-        previousBarBearishTransition:
+        previousBarBearishPolarity:
           bearishOsmaPrevious
       }
     };
@@ -1070,7 +1066,7 @@ export function scoreCruz30sAroonOsma(
       SHORT_SHADOW_ID,
 
     patternRevision:
-      "Screenshot-derived reconstruction: fresh Aroon(10) crossover + same-direction OsMA slope on the same/adjacent completed S30 candle; no candle-color gate. Exact Cruz proprietary rules are unverified.",
+      "Screenshot-derived reconstruction: fresh Aroon(10) crossover + same-side OsMA zero-line polarity on the same/adjacent completed S30 candle (OsMA > 0 for CALL, < 0 for PUT); no candle-color gate. Exact Cruz proprietary rules are unverified.",
 
     direction,
 
@@ -1167,11 +1163,11 @@ export function scoreCruz30sAroonOsma(
         bearishAroonNow ||
         bearishAroonPrevious,
 
-      bullishOsmaTransition:
+      bullishOsmaPolarity:
         bullishOsmaNow ||
         bullishOsmaPrevious,
 
-      bearishOsmaTransition:
+      bearishOsmaPolarity:
         bearishOsmaNow ||
         bearishOsmaPrevious,
 

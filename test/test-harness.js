@@ -2071,6 +2071,12 @@ console.log(
   );
 
   assert(
+    callScore.osma?.value > 0 &&
+    putScore.osma?.value < 0,
+    "Cruz CALL/PUT confirmation uses OsMA polarity above/below zero"
+  );
+
+  assert(
     putScore.candle?.close > putScore.candle?.open &&
     putScore.ok && putScore.direction === "PUT",
     "PUT remains eligible with a bullish price candle when indicators align"
@@ -3598,8 +3604,8 @@ console.log(
   // -------------------------------------------------
 
   assert(
-    SHORT_SHADOW_ID === "cruz-30s-aroon10-osma10-20-10-screenshot-derived-shadow-v3",
-    "Screenshot-derived Cruz revision uses a distinct fresh dataset ID"
+    SHORT_SHADOW_ID === "cruz-30s-aroon10-osma10-20-10-screenshot-derived-polarity-shadow-v4",
+    "Screenshot-derived OsMA-polarity revision uses a distinct fresh dataset ID"
   );
 
   assert(
