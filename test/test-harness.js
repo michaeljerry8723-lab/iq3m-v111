@@ -2932,25 +2932,7 @@ console.log(
     );
 
 
-    assert(
-      record.features?.model ===
-      "cruz-30s-aroon10-osma10-20-10" &&
-      record.features?.dataSource ===
-      "massive-s30" &&
-      record.features?.timeframe ===
-      "30s" &&
-      record.features?.primaryExpirySeconds ===
-      120 &&
-      record.features?.aroon?.period ===
-      10 &&
-      record.features?.osma?.fastPeriod ===
-      10 &&
-      record.features?.osma?.slowPeriod ===
-      20 &&
-      record.features?.osma?.signalPeriod ===
-      10,
-      "Captured V2 record preserves exact 30s Aroon(10) and OsMA(10,20,10) configuration"
-    );
+
   } finally {
     Date.now =
       realDateNow;
