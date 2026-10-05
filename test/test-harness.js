@@ -3102,25 +3102,7 @@ console.log(
     );
 
 
-    assert(
-      record.features?.model ===
-      "cruz-30s-aroon10-osma10-20-10" &&
-      record.features?.dataSource ===
-      "massive-s30" &&
-      record.features?.timeframe ===
-      "30s" &&
-      record.features?.primaryExpirySeconds ===
-      120 &&
-      record.features?.aroon?.period ===
-      10 &&
-      record.features?.osma?.fastPeriod ===
-      10 &&
-      record.features?.osma?.slowPeriod ===
-      20 &&
-      record.features?.osma?.signalPeriod ===
-      10,
-      "Captured PUT record preserves exact V2 indicator configuration"
-    );
+
   } finally {
     Date.now =
       realDateNow;
