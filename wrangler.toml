@@ -6,6 +6,9 @@ compatibility_date = "2026-09-24"
 BOT_COMPACT_MODE = "1"
 WS_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF"
 
+[previews.vars]
+BOT_COMPACT_MODE = "1"
+WS_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF"
 
 [[durable_objects.bindings]]
 name = "TICK_HUB"
