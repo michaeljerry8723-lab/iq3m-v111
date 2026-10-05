@@ -6776,81 +6776,8 @@ export class TickHub extends DurableObject {
       };
     }
 
-      await this.captureShortShadow({
-        symbol,
-
-        direction:
-          candidate.direction,
-
-        entryPrice,
-        entryAt,
-        sourceKey,
-
-
-        features: {
-          model:
-            "cruz-30s-aroon10-osma10-20-10",
-
-          dataSource:
-            "tiingo-websocket-s30",
-
-          timeframe:
-            "30s",
-
-          primaryExpirySeconds:
-            120,
-
-          expiryCandidates:
-            candidate.expiryCandidates,
-
-          signalBarOpenAt,
-          signalBarCloseAt:
-            entryAt,
-
-          aroon:
-            candidate.aroon,
-
-          osma:
-            candidate.osma,
-
-          trigger:
-            candidate.trigger,
-
-          reasons:
-            candidate.reasons
-        }
-      });
-
-
-    return {
-      ...candidate,
-
-      symbol,
-
-      captured:
-        Boolean(
-          capture?.ok &&
-          !capture?.duplicate
-        ),
-
-      duplicate:
-        Boolean(
-          capture?.duplicate
-        ),
-
-      shadowId:
-        capture?.id || null,
-
-      entryPrice,
-      entryAt,
-
-      signalBarOpenAt,
-
-      dataSource:
-        "tiingo-websocket-s30"
-    };
-  }
-
+      throw new Error("Unreachable: source-verified Cruz entry method required");
+    }
   async evaluateShortShadow(symbol) {
     symbol = normalizeSymbol(symbol);
 
