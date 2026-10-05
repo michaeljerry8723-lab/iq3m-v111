@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.7.6-cruz-every-entry-shadow";
+export const VERSION = "13.7.7-cruz-screenshot-reconstruction-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -1067,10 +1067,10 @@ export function scoreCruz30sAroonOsma(
     ok: true,
 
     strategyId:
-      "cruz-30s-aroon10-osma10-20-10-pattern-v2",
+      SHORT_SHADOW_ID,
 
     patternRevision:
-      "Every fresh Aroon crossover + same-direction OsMA transition; no candle-color gate",
+      "Screenshot-derived reconstruction: fresh Aroon(10) crossover + same-direction OsMA slope on the same/adjacent completed S30 candle; no candle-color gate. Exact Cruz proprietary rules are unverified.",
 
     direction,
 

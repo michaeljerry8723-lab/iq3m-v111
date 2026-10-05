@@ -1964,7 +1964,7 @@ console.log(
     makeBar(
       31,
       {
-        open: 1.1000,
+        open: 1.1020,
         high: 1.1120,
         low: 1.1005,
         close: 1.1015
@@ -1984,6 +1984,18 @@ console.log(
     callScore.ok === true &&
     callScore.direction === "CALL",
     `Cruz V2 produces CALL from aligned Aroon/OsMA confirmation`
+  );
+
+  assert(
+    callScore.strategyId === SHORT_SHADOW_ID &&
+    /screenshot-derived reconstruction/i.test(callScore.patternRevision),
+    "Cruz scorer identifies its output as a screenshot-derived reconstruction"
+  );
+
+  assert(
+    callScore.candle?.close < callScore.candle?.open &&
+    callScore.ok && callScore.direction === "CALL",
+    "CALL remains eligible with a bearish price candle when indicators align"
   );
 
   assert(
@@ -2036,7 +2048,7 @@ console.log(
     makeBar(
       31,
       {
-        open: 1.1000,
+        open: 1.0970,
         high: 1.0995,
         low: 1.0880,
         close: 1.0985
@@ -2056,6 +2068,12 @@ console.log(
     putScore.ok === true &&
     putScore.direction === "PUT",
     "Cruz V2 produces PUT from aligned Aroon/OsMA confirmation"
+  );
+
+  assert(
+    putScore.candle?.close > putScore.candle?.open &&
+    putScore.ok && putScore.direction === "PUT",
+    "PUT remains eligible with a bullish price candle when indicators align"
   );
 
   assert(
@@ -2749,10 +2767,10 @@ console.log(
 console.log();
 
 // -----------------------------------------------------------------------------
-// Test 27: Cruz V2 evaluator captures deterministic OANDA S30 CALL
+// Test 27: Cruz V2 evaluator captures deterministic Tiingo S30 CALL
 // -----------------------------------------------------------------------------
 console.log(
-  "Test 27: Cruz V2 evaluator captures OANDA S30 CALL"
+  "Test 27: Cruz V2 evaluator captures Tiingo S30 CALL"
 );
 
 {
@@ -2874,20 +2892,19 @@ console.log(
     await ctx.waitForInit();
 
 
-    // No external OANDA call during test.
-    hub.fetchMassive30SecondBars =
-      async (
-        symbol,
-        count
-      ) => {
-        assert(
-          symbol === "EUR/USD" &&
-          count === 80,
-          "Cruz V2 evaluator requests 80 S30 bars for the selected pair"
-        );
+    // Use deterministic completed Tiingo S30 bars without a provider call.
+    hub.getTiingo30SecondBars = (
+      symbol,
+      count
+    ) => {
+      assert(
+        symbol === "EUR/USD" &&
+        count === 80,
+        "Cruz V2 evaluator reads 80 persisted Tiingo S30 bars"
+      );
 
-        return bars30;
-      };
+      return bars30;
+    };
 
 
     const result =
@@ -2924,7 +2941,7 @@ console.log(
       record.expiry120At ===
       expectedEntryAt +
       120000,
-      "Cruz V2 uses completed OANDA S30 close and exact 120-second expiry"
+      "Cruz V2 uses completed Tiingo S30 close and exact 120-second expiry"
     );
 
 
@@ -2932,7 +2949,7 @@ console.log(
       record.features?.model ===
       "cruz-30s-aroon10-osma10-20-10" &&
       record.features?.dataSource ===
-      "massive-s30" &&
+      "tiingo-websocket-s30" &&
       record.features?.timeframe ===
       "30s" &&
       record.features?.primaryExpirySeconds ===
@@ -2956,10 +2973,10 @@ console.log(
 console.log();
 
 // -----------------------------------------------------------------------------
-// Test 28: Cruz V2 evaluator captures deterministic OANDA S30 PUT
+// Test 28: Cruz V2 evaluator captures deterministic Tiingo S30 PUT
 // -----------------------------------------------------------------------------
 console.log(
-  "Test 28: Cruz V2 evaluator captures Massive S30 PUT"
+  "Test 28: Cruz V2 evaluator captures Tiingo S30 PUT"
 );
 
 {
@@ -3079,19 +3096,18 @@ console.log(
     await ctx.waitForInit();
 
 
-    hub.fetchMassive30SecondBars =
-      async (
-        symbol,
-        count
-      ) => {
-        assert(
-          symbol === "GBP/USD" &&
-          count === 80,
-          "Cruz V2 PUT evaluator requests 80 Massive S30 bars for the selected pair"
-        );
+    hub.getTiingo30SecondBars = (
+      symbol,
+      count
+    ) => {
+      assert(
+        symbol === "GBP/USD" &&
+        count === 80,
+        "Cruz V2 PUT evaluator reads 80 persisted Tiingo S30 bars"
+      );
 
-        return bars30;
-      };
+      return bars30;
+    };
 
 
     const result =
@@ -3128,7 +3144,7 @@ console.log(
       record.expiry120At ===
       expectedEntryAt +
       120000,
-      "Cruz V2 PUT uses completed OANDA S30 close and exact 120-second expiry"
+      "Cruz V2 PUT uses completed Tiingo S30 close and exact 120-second expiry"
     );
 
 
@@ -3136,7 +3152,7 @@ console.log(
       record.features?.model ===
       "cruz-30s-aroon10-osma10-20-10" &&
       record.features?.dataSource ===
-      "massive-s30" &&
+      "tiingo-websocket-s30" &&
       record.features?.timeframe ===
       "30s" &&
       record.features?.primaryExpirySeconds ===
@@ -3322,7 +3338,7 @@ console.log(
               "cruz-30s-aroon10-osma10-20-10",
 
             dataSource:
-              "oanda-s30-mid",
+              "tiingo-websocket-s30",
 
             primaryExpirySeconds:
               120
@@ -3343,7 +3359,7 @@ console.log(
     let fetchCount = 0;
 
 
-    hub.fetchMassive30SecondBars =
+    hub.getTiingo30SecondBars =
       async (
         symbol,
         count
@@ -3369,7 +3385,7 @@ console.log(
     assert(
       fetchCount === 1 &&
       settled.settlementSource ===
-      "massive-s30",
+      "tiingo-websocket-s30",
       "Cruz V2 settlement uses OANDA S30 as the single settlement source"
     );
 
@@ -3600,8 +3616,8 @@ console.log(
 
 
   try {
-    hub.fetchMassive30SecondBars =
-      async () =>
+    hub.getTiingo30SecondBars =
+      () =>
         signalBars;
 
 
@@ -3640,13 +3656,13 @@ console.log(
       "cruz-30s-aroon10-osma10-20-10" &&
       hub.shortShadowState.pending[0]
         ?.features?.dataSource ===
-      "massive-s30",
-      "Production capture is tagged with the fresh V2 strategy and Massive S30 model"
+      "tiingo-websocket-s30",
+      "Production capture is tagged with the fresh V2 strategy and Tiingo S30 model"
     );
 
 
     // -------------------------------------------------
-    // Add exact future OANDA S30 settlement candles.
+    // Add exact future Tiingo S30 settlement candles.
     // -------------------------------------------------
 
     const settlementBars = [
@@ -3696,7 +3712,7 @@ console.log(
     ];
 
 
-    hub.fetchMassive30SecondBars =
+    hub.getTiingo30SecondBars =
       async () =>
         settlementBars;
 
@@ -3726,9 +3742,9 @@ console.log(
     assert(
       settled.ok === true &&
       settled.settlementSource ===
-      "massive-s30" &&
+      "tiingo-websocket-s30" &&
       settled.completed === 1,
-      "/settle-short-shadow production route now uses V2 Massive S30 settlement"
+      "/settle-short-shadow production route now uses V2 Tiingo S30 settlement"
     );
 
 
