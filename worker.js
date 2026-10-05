@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.7.5-cruz-pattern-shadow";
+export const VERSION = "13.7.6-cruz-every-entry-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -15,7 +15,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "CAD/JPY"
 ]);
 export const SHORT_SHADOW_ID =
-  "cruz-30s-aroon10-osma10-20-10-pattern-v1-shadow";
+  "cruz-30s-aroon10-osma10-20-10-every-entry-shadow-v2";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const SHORT_SHADOW_MAX_PENDING = 250;
 export const SHORT_SHADOW_MAX_HISTORY = 1000;
@@ -982,11 +982,11 @@ export function scoreCruz30sAroonOsma(
       : "PUT";
 
   // -------------------------------------------------
-  // PRICE-CANDLE CONFIRMATION
+  // PRICE-CANDLE CONTEXT
   //
-  // The white-box examples show the entry occurring
-  // with the completed price candle pointing in the
-  // same direction as the indicator crossover.
+  // Candle direction is recorded for diagnostics only.
+  // It is NOT an extra entry filter. The marked Cruz zone
+  // is the Aroon crossover with same-direction OsMA momentum.
   // -------------------------------------------------
 
   const signalBar =
@@ -1010,7 +1010,8 @@ export function scoreCruz30sAroonOsma(
 
   const body =
     Math.abs(
-      close - open
+      close -
+      open
     );
 
   const bodyRatio =
@@ -1018,28 +1019,6 @@ export function scoreCruz30sAroonOsma(
     range > 0
       ? body / range
       : 0;
-
-  const candleAligned =
-    direction === "CALL"
-      ? close > open
-      : close < open;
-
-  if (!candleAligned) {
-    return {
-      ok: false,
-      reason:
-        "Aroon/OsMA pattern aligned but entry candle direction is not confirmed",
-      direction,
-
-      candle: {
-        open,
-        high,
-        low,
-        close,
-        bodyRatio
-      }
-    };
-  }
 
   // -------------------------------------------------
   // EXECUTION SAFEGUARD ONLY
@@ -1088,10 +1067,10 @@ export function scoreCruz30sAroonOsma(
     ok: true,
 
     strategyId:
-      "cruz-30s-aroon10-osma10-20-10-pattern-v1",
+      "cruz-30s-aroon10-osma10-20-10-pattern-v2",
 
     patternRevision:
-      "Aroon crossover + same-direction OsMA transition + confirming candle",
+      "Every fresh Aroon crossover + same-direction OsMA transition; no candle-color gate",
 
     direction,
 
@@ -1169,8 +1148,6 @@ export function scoreCruz30sAroonOsma(
     },
 
     candle: {
-      aligned:
-        candleAligned,
       open,
       high,
       low,
@@ -1208,13 +1185,13 @@ export function scoreCruz30sAroonOsma(
           "Aroon-Up crossed above Aroon-Down",
           "OsMA momentum turned bullish around the crossover",
           "Confirmation occurred within the same or adjacent 30s candle",
-          "Completed entry candle is bullish"
+          "Every qualifying crossover is eligible for shadow capture"
         ]
         : [
           "Aroon-Down crossed above Aroon-Up",
           "OsMA momentum turned bearish around the crossover",
           "Confirmation occurred within the same or adjacent 30s candle",
-          "Completed entry candle is bearish"
+          "Every qualifying crossover is eligible for shadow capture"
         ]
   };
 }
@@ -6692,28 +6669,10 @@ export class TickHub extends DurableObject {
     }
 
 
-    // Do not overlap experimental positions
-    // on the same pair.
-    const active =
-      (
-        this.shortShadowState?.pending ||
-        []
-      ).find(
-        x =>
-          x.symbol === symbol
-      );
-
-
-    if (active) {
-      return {
-        ok: false,
-        skipped: true,
-        symbol,
-        reason:
-          "Cruz V2 position already pending on pair"
-      };
-    }
-
+    // Every qualifying Cruz crossover is independently eligible.
+    // Do not suppress a new setup because an earlier same-pair
+    // shadow record is still waiting for its 60s/120s outcome.
+    // Duplicate protection is handled by the 30-second source key.
 
     // -------------------------------------------------
     // TRUE COMPLETED TIINGO WEBSOCKET S30 CONTEXT
