@@ -1,4 +1,4 @@
-// V13.9.3 — intrabar video-derived SuperTrend/MACD with quote-time settlement
+// V13.9.4 — enter on first live SuperTrend/MACD confluence
 import { DurableObject } from "cloudflare:workers";
 
 export const VERSION = "13.9.4-pocket-option-confluence-transition";
