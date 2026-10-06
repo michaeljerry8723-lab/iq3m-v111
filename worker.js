@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.8.2-cruz-5m-expiry-shadow";
+export const VERSION = "13.8.3-cruz-5m-osma-accelerated-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -15,11 +15,14 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "CAD/JPY"
 ]);
 export const SHORT_SHADOW_ID =
-  "cruz-30s-aroon10-osma10-20-10-ema20-50-context-300s-shadow-v7";
+  "cruz-30s-aroon10-osma5-13-4-ema20-50-context-300s-shadow-v8";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120, 300]);
 export const CRUZ_5M_CONTEXT_MIN_BARS = 100;
 export const CRUZ_5M_EMA_FAST = 20;
 export const CRUZ_5M_EMA_SLOW = 50;
+export const CRUZ_5M_EXPIRY_OSMA_FAST = 5;
+export const CRUZ_5M_EXPIRY_OSMA_SLOW = 13;
+export const CRUZ_5M_EXPIRY_OSMA_SIGNAL = 4;
 export const SHORT_SHADOW_MAX_PENDING = 250;
 export const SHORT_SHADOW_MAX_HISTORY = 1000;
 export const CRYPTO_SYMBOLS = new Set();
@@ -915,9 +918,9 @@ export function scoreCruz30sAroonOsma(
   const osmaNow =
     cruzOsmaSnapshot(
       bars30,
-      10,
-      20,
-      10
+      CRUZ_5M_EXPIRY_OSMA_FAST,
+      CRUZ_5M_EXPIRY_OSMA_SLOW,
+      CRUZ_5M_EXPIRY_OSMA_SIGNAL
     );
 
   // Previous completed 30s candle. Cruz-style timing allows the
@@ -934,9 +937,9 @@ export function scoreCruz30sAroonOsma(
   const osmaPrevious =
     cruzOsmaSnapshot(
       previousBars,
-      10,
-      20,
-      10
+      CRUZ_5M_EXPIRY_OSMA_FAST,
+      CRUZ_5M_EXPIRY_OSMA_SLOW,
+      CRUZ_5M_EXPIRY_OSMA_SIGNAL
     );
 
   if (
@@ -1180,7 +1183,7 @@ export function scoreCruz30sAroonOsma(
       SHORT_SHADOW_ID,
 
     patternRevision:
-      "Screenshot-derived reconstruction with 5-minute EMA(20/50) trend context: fresh Aroon(10) crossover + same-side, strengthening OsMA histogram on the same/adjacent completed S30 candle (OsMA > 0 and rising for CALL; < 0 and falling for PUT); no candle-color gate. Exact Cruz proprietary rules are unverified.",
+      "Screenshot-derived reconstruction of the entry concept with a custom 5-minute-expiry setting candidate: Aroon(10) crossover + same-side, strengthening OsMA(5,13,4) histogram on completed S30 candles, with 5-minute EMA(20/50) context; no candle-color gate. This is an unvalidated custom variant, not a claim of Cruz proprietary settings.",
 
     direction,
 
@@ -1222,9 +1225,9 @@ export function scoreCruz30sAroonOsma(
     },
 
     osma: {
-      fastPeriod: 10,
-      slowPeriod: 20,
-      signalPeriod: 10,
+      fastPeriod: CRUZ_5M_EXPIRY_OSMA_FAST,
+      slowPeriod: CRUZ_5M_EXPIRY_OSMA_SLOW,
+      signalPeriod: CRUZ_5M_EXPIRY_OSMA_SIGNAL,
 
       value:
         osmaNow.osma,
@@ -6873,7 +6876,7 @@ export class TickHub extends DurableObject {
 
         features: {
           model:
-            "cruz-30s-aroon10-osma10-20-10",
+            "cruz-30s-aroon10-osma5-13-4",
 
           dataSource:
             "tiingo-websocket-s30",
