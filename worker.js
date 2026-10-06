@@ -1,4 +1,4 @@
-// V13.9.2 — intrabar video-derived SuperTrend/MACD shadow collection
+// V13.9.3 — intrabar video-derived SuperTrend/MACD with quote-time settlement
 import { DurableObject } from "cloudflare:workers";
 
 export const VERSION = "13.9.3-pocket-option-intrabar-settlement-fix";
