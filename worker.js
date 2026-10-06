@@ -1,7 +1,7 @@
 // V13.9.3 — intrabar video-derived SuperTrend/MACD with quote-time settlement
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.9.3-pocket-option-intrabar-settlement-fix";
+export const VERSION = "13.9.4-pocket-option-confluence-transition";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -15,7 +15,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "CAD/JPY"
 ]);
 export const SHORT_SHADOW_ID =
-  "pocketoption-30s-supertrend-atr10-mult2-macd10-20-5-60-120-intrabar-shadow-v4";
+  "pocketoption-30s-supertrend-atr10-mult2-macd10-20-5-60-120-intrabar-shadow-v5";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
 export const VIDEO_SUPERTREND_MULTIPLIER = 2;
@@ -1071,18 +1071,33 @@ export function scorePocketOption30sSuperTrendMacd(bars30) {
     close > open ? "CALL" :
     close < open ? "PUT" : "NEUTRAL";
 
-  const call =
+  // Video entry is indicator confluence: SuperTrend defines direction,
+  // then enter as soon as the MACD main/signal lines agree. The two
+  // conditions need not cross during the same candle. Evaluate the live
+  // candle so the setup is captured at the first intrabar alignment.
+  const callAligned =
     supertrend.direction === "CALL" &&
-    macd.crossUp;
-  const put =
+    macd.bullish;
+  const putAligned =
     supertrend.direction === "PUT" &&
-    macd.crossDown;
+    macd.bearish;
+  const wasCallAligned =
+    supertrend.previousDirection === "CALL" &&
+    macd.previousMacd > macd.previousSignal;
+  const wasPutAligned =
+    supertrend.previousDirection === "PUT" &&
+    macd.previousMacd < macd.previousSignal;
+
+  const call =
+    callAligned &&
+    !wasCallAligned;
+  const put =
+    putAligned &&
+    !wasPutAligned;
 
   if (!call && !put) {
-    let reason = "SuperTrend direction and MACD crossover are not aligned";
-    if (!macd.crossUp && !macd.crossDown) reason = "no fresh MACD(10,20,5) line crossover";
-    else if (macd.crossUp && supertrend.direction !== "CALL") reason = "bullish MACD crossover lacks bullish SuperTrend confirmation";
-    else if (macd.crossDown && supertrend.direction !== "PUT") reason = "bearish MACD crossover lacks bearish SuperTrend confirmation";
+    let reason = "SuperTrend and MACD direction are not aligned";
+    if (callAligned || putAligned) reason = "SuperTrend/MACD confluence was already aligned on the previous completed candle";
     return {
       ok: false,
       reason,
@@ -1112,12 +1127,12 @@ export function scorePocketOption30sSuperTrendMacd(bars30) {
     ok: true,
     strategyId: SHORT_SHADOW_ID,
     patternRevision:
-      "Video-derived reconstruction: on a 30-second chart, SuperTrend ATR(10) multiplier 2 establishes direction and a fresh MACD(10,20,5) line/signal crossover in that direction triggers entry intrabar on the live quote. No completed-candle wait or candle-colour confirmation is imposed. Intrabar indicator alignment may reverse before candle close; entries remain shadow-only. The video uses one-minute expiry; bot shadows 60s and 120s.",
+      "Video-derived reconstruction: on a 30-second chart, SuperTrend direction and MACD(10,20,5) main/signal line ordering must agree. Enter at the first live quote where their directional states become aligned; the MACD cross need not occur in that exact candle and no candle close or candle-colour confirmation is required. Intrabar indicator alignment can reverse before candle close; entries remain shadow-only. The video uses one-minute expiry; bot shadows 60s and 120s.",
     direction,
     trigger:
       direction === "CALL"
-        ? "SuperTrend bullish; MACD line crossed above signal line intrabar"
-        : "SuperTrend bearish; MACD line crossed below signal line intrabar",
+        ? "SuperTrend bullish; MACD main line is above signal and confluence just aligned intrabar"
+        : "SuperTrend bearish; MACD main line is below signal and confluence just aligned intrabar",
     timeframe: "30s",
     expiryCandidates: [60, 120],
     supertrend: {
@@ -1141,8 +1156,8 @@ export function scorePocketOption30sSuperTrendMacd(bars30) {
     candleDirection,
     reasons: [
       direction === "CALL"
-        ? "SuperTrend direction and bullish MACD crossover confirm upward bias"
-        : "SuperTrend direction and bearish MACD crossover confirm downward bias"
+        ? "SuperTrend bullish direction and bullish MACD line ordering have just aligned"
+        : "SuperTrend bearish direction and bearish MACD line ordering have just aligned"
     ]
   };
 }
