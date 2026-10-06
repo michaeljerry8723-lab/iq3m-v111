@@ -1,7 +1,7 @@
-// V13.9.1 — video-derived SuperTrend/MACD shadow collection
+// V13.9.2 — intrabar video-derived SuperTrend/MACD shadow collection
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.9.1-pocket-option-supertrend-macd-shadow";
+export const VERSION = "13.9.2-pocket-option-supertrend-macd-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -15,7 +15,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "CAD/JPY"
 ]);
 export const SHORT_SHADOW_ID =
-  "pocketoption-30s-supertrend-atr10-mult2-macd10-20-5-60-120-shadow-v2";
+  "pocketoption-30s-supertrend-atr10-mult2-macd10-20-5-60-120-intrabar-shadow-v3";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
 export const VIDEO_SUPERTREND_MULTIPLIER = 2;
@@ -1112,12 +1112,12 @@ export function scorePocketOption30sSuperTrendMacd(bars30) {
     ok: true,
     strategyId: SHORT_SHADOW_ID,
     patternRevision:
-      "Video-derived reconstruction: on 30-second candles, SuperTrend ATR(10) multiplier 2 establishes the direction; a fresh MACD(10,20,5) line/signal crossover in that direction triggers the entry. No separate candle-colour confirmation is imposed. The video uses one-minute expiry; bot shadows 60s and 120s.",
+      "Video-derived reconstruction: on a 30-second chart, SuperTrend ATR(10) multiplier 2 establishes direction and a fresh MACD(10,20,5) line/signal crossover in that direction triggers entry intrabar on the live quote. No completed-candle wait or candle-colour confirmation is imposed. Intrabar indicator alignment may reverse before candle close; entries remain shadow-only. The video uses one-minute expiry; bot shadows 60s and 120s.",
     direction,
     trigger:
       direction === "CALL"
-        ? "SuperTrend bullish; MACD line crossed above signal line"
-        : "SuperTrend bearish; MACD line crossed below signal line",
+        ? "SuperTrend bullish; MACD line crossed above signal line intrabar"
+        : "SuperTrend bearish; MACD line crossed below signal line intrabar",
     timeframe: "30s",
     expiryCandidates: [60, 120],
     supertrend: {
@@ -3416,6 +3416,17 @@ export class TickHub extends DurableObject {
               : []
           };
         } else {
+          if (
+            storedShortShadow?.strategyId &&
+            Array.isArray(storedShortShadow.pending) &&
+            Array.isArray(storedShortShadow.history)
+          ) {
+            await this.ctx.storage.put(
+              `shortShadowArchive:${storedShortShadow.strategyId}`,
+              storedShortShadow
+            );
+          }
+
           this.shortShadowState = {
             strategyId: SHORT_SHADOW_ID,
             startedAt: Date.now(),
@@ -4178,7 +4189,25 @@ export class TickHub extends DurableObject {
       this.lastWsQuoteAt = Date.now();
       this.lastStatus = "ok";
       this.pushTick(symbol, t, p, bid, ask);
-      this.updateTiingo30SecondCandle(symbol, t, p);
+      const candleUpdated =
+        this.updateTiingo30SecondCandle(symbol, t, p);
+
+      // Run the video-derived entry check directly from live quote events;
+      // do not wait for the 30-second candle to finalize.
+      if (
+        candleUpdated &&
+        (this.completed30sBars.get(symbol) || []).length >= 32
+      ) {
+        this.ctx.waitUntil(
+          this.evaluateShortShadowV2(symbol).catch(e => {
+            console.error(
+              "intrabar short-shadow evaluation failed",
+              symbol,
+              String(e?.stack || e?.message || e)
+            );
+          })
+        );
+      }
     } catch (e) {
       this.lastStatus = `tiingo fx parse error: ${String(e?.message || e)}`;
     }
@@ -4472,11 +4501,11 @@ export class TickHub extends DurableObject {
     this.s30Dirty = false;
   }
 
-  getTiingo30SecondBars(symbol, count = 80) {
+  getTiingo30SecondBars(symbol, count = 80, includeCurrent = false) {
     const s = normalizeSymbol(symbol);
 
     if (!s || !SHORT_SHADOW_UNIVERSE.includes(s)) {
-      throw new Error("invalid Cruz V2 symbol");
+      throw new Error("invalid video-strategy S30 symbol");
     }
 
     this.finalizeTiingo30SecondBars(Date.now());
@@ -4490,6 +4519,8 @@ export class TickHub extends DurableObject {
       .slice(-safeCount)
       .map(b => ({ ...b }));
 
+    // Keep the full completed-bar warm-up, then append the live candle so
+    // MACD and SuperTrend can be evaluated as each quote changes its OHLC.
     if (bars.length < 32) {
       throw new Error(
         `Tiingo S30 warm-up in progress (${bars.length}/32 completed candles)`
@@ -4504,6 +4535,13 @@ export class TickHub extends DurableObject {
       throw new Error(
         `Tiingo S30 latest completed candle is stale (${(ageMs / 1000).toFixed(1)}s)`
       );
+    }
+
+    if (includeCurrent) {
+      const active = this.current30sBars.get(s);
+      if (active && Number(active.t) > Number(last?.t)) {
+        bars.push({ ...active });
+      }
     }
 
     return bars;
@@ -6493,16 +6531,7 @@ export class TickHub extends DurableObject {
               )
             );
 
-          const wl300 =
-            setups.some(x =>
-              ["WIN", "LOSS"].includes(
-                String(
-                  x?.result300 || ""
-                ).toUpperCase()
-              )
-            );
-
-          return wl60 && wl120 && wl300;
+          return wl60 && wl120;
         })
         .length;
 
@@ -6925,28 +6954,36 @@ export class TickHub extends DurableObject {
     };
   }
   async evaluateShortShadowV2(symbol) {
-    symbol =
-      normalizeSymbol(symbol);
+    symbol = normalizeSymbol(symbol);
 
-
-    if (
-      !symbol ||
-      !SHORT_SHADOW_UNIVERSE.includes(symbol)
-    ) {
+    if (!symbol || !SHORT_SHADOW_UNIVERSE.includes(symbol)) {
       return {
         ok: false,
-        error:
-          "invalid video-strategy short-shadow symbol"
+        error: "invalid video-strategy short-shadow symbol"
       };
     }
 
+    const ticks = this.ticks.get(symbol) || [];
+    const quote = ticks.at(-1);
+    const quoteReceivedAt = Number(quote?.r || 0);
+    const now = Date.now();
 
-    // Each qualifying video-derived setup is independently eligible.
-    // Duplicate protection uses the completed S30 candle source key.
+    if (
+      !quote ||
+      !Number.isFinite(quoteReceivedAt) ||
+      now - quoteReceivedAt > 10000
+    ) {
+      return {
+        ok: false,
+        symbol,
+        captured: false,
+        reason: "waiting for a fresh live quote for intrabar entry"
+      };
+    }
 
     let bars30;
     try {
-      bars30 = this.getTiingo30SecondBars(symbol, 80);
+      bars30 = this.getTiingo30SecondBars(symbol, 80, true);
     } catch (e) {
       return {
         ok: false,
@@ -6956,165 +6993,85 @@ export class TickHub extends DurableObject {
       };
     }
 
+    const signalBar = bars30.at(-1);
+    const activeBar = this.current30sBars.get(symbol);
+    const quoteBucket = Math.floor(Number(quote.t) / 30000) * 30000;
+
+    if (
+      !signalBar ||
+      !activeBar ||
+      Number(activeBar.t) !== Number(signalBar.t) ||
+      Number(activeBar.t) !== quoteBucket
+    ) {
+      return {
+        ok: false,
+        symbol,
+        captured: false,
+        reason: "waiting for the active 30-second candle"
+      };
+    }
+
     const candidate = scorePocketOption30sSuperTrendMacd(bars30);
     if (!candidate.ok) {
       return { ...candidate, symbol, captured: false };
     }
 
-
-    // -------------------------------------------------
-    // ENTRY REFERENCE
-    //
-    // S30 candle timestamp = candle OPEN.
-    // Therefore completed S30 close = t + 30s.
-    // -------------------------------------------------
-
-    const signalBar =
-      bars30.at(-1);
-
-
-    const entryPrice =
-      Number(
-        signalBar?.c
-      );
-
-    const signalBarOpenAt =
-      Number(
-        signalBar?.t
-      );
-
-    const entryAt =
-      signalBarOpenAt +
-      30000;
-
+    // The current candle is still forming. Use the live quote that caused
+    // the indicator alignment as the entry price and receive time.
+    const entryPrice = Number(quote.p);
+    const entryAt = quoteReceivedAt;
+    const signalBarOpenAt = Number(signalBar.t);
 
     if (
       !Number.isFinite(entryPrice) ||
+      !Number.isFinite(entryAt) ||
       !Number.isFinite(signalBarOpenAt)
     ) {
       return {
         ok: false,
         symbol,
         captured: false,
-        reason:
-          "Video strategy completed S30 entry candle is invalid"
+        reason: "video strategy intrabar entry quote is invalid"
       };
     }
 
-
-    // -------------------------------------------------
-    // STALE-CANDLE PROTECTION
-    //
-    // Prevent an old completed candle from being
-    // interpreted as a new entry after market/feed gaps.
-    // -------------------------------------------------
-
-    const candleAgeMs =
-      Date.now() -
-      entryAt;
-
-
-    if (
-      candleAgeMs < -5000 ||
-      candleAgeMs > 45000
-    ) {
-      return {
-        ok: false,
-        symbol,
-        captured: false,
-
-        reason:
-          `Video strategy latest completed S30 candle is stale (${(
-            candleAgeMs / 1000
-          ).toFixed(1)}s)`
-      };
-    }
-
-
-    // 30-second key rather than the old minute key.
     const sourceKey =
-      `${SHORT_SHADOW_ID}|` +
-      `${symbol}|` +
-      `${candidate.direction}|` +
-      `${Math.floor(entryAt / 30000)}`;
+      `${SHORT_SHADOW_ID}|${symbol}|${candidate.direction}|${signalBarOpenAt}`;
 
-
-    const capture =
-      await this.captureShortShadow({
-        symbol,
-
-        direction:
-          candidate.direction,
-
-        entryPrice,
-        entryAt,
-        sourceKey,
-
-
-        features: {
-          model:
-            "video-30s-supertrend10x2-macd10-20-5",
-
-          dataSource:
-            "tiingo-websocket-s30",
-
-          timeframe:
-            "30s",
-
-          primaryExpirySeconds:
-            60,
-
-          expiryCandidates:
-            candidate.expiryCandidates,
-
-          signalBarOpenAt,
-          signalBarCloseAt:
-            entryAt,
-
-          supertrend:
-            candidate.supertrend,
-
-          macd:
-            candidate.macd,
-
-          candleDirection:
-            candidate.candleDirection,
-
-          trigger:
-            candidate.trigger,
-
-          reasons:
-            candidate.reasons
-        }
-      });
-
+    const capture = await this.captureShortShadow({
+      symbol,
+      direction: candidate.direction,
+      entryPrice,
+      entryAt,
+      sourceKey,
+      features: {
+        model: "video-30s-supertrend10x2-macd10-20-5-intrabar",
+        dataSource: "tiingo-websocket-s30",
+        timeframe: "30s",
+        entryMode: "intrabar-indicator-confirmation",
+        signalBarOpenAt,
+        signalBarExpectedCloseAt: signalBarOpenAt + 30000,
+        primaryExpirySeconds: 60,
+        expiryCandidates: candidate.expiryCandidates,
+        supertrend: candidate.supertrend,
+        macd: candidate.macd,
+        candleDirection: candidate.candleDirection,
+        trigger: candidate.trigger,
+        reasons: candidate.reasons
+      }
+    });
 
     return {
       ...candidate,
-
       symbol,
-
-      captured:
-        Boolean(
-          capture?.ok &&
-          !capture?.duplicate
-        ),
-
-      duplicate:
-        Boolean(
-          capture?.duplicate
-        ),
-
-      shadowId:
-        capture?.id || null,
-
+      captured: Boolean(capture?.ok && !capture?.duplicate),
+      duplicate: Boolean(capture?.duplicate),
+      shadowId: capture?.id || null,
       entryPrice,
       entryAt,
-
       signalBarOpenAt,
-
-      dataSource:
-        "tiingo-websocket-s30"
+      entryMode: "intrabar-indicator-confirmation",
+      dataSource: "tiingo-websocket-s30"
     };
   }
 
