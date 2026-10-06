@@ -430,12 +430,14 @@ console.log(`Test 9: Short-expiry shadow statistics`);
         symbol: "EUR/USD",
         result60: "WIN",
         result120: "WIN",
+        result300: "WIN",
         entryAt: clusterBase
       },
       {
         symbol: "GBP/USD",
         result60: "LOSS",
         result120: "WIN",
+        result300: "LOSS",
         entryAt: clusterBase
       },
       {
@@ -493,6 +495,13 @@ console.log(`Test 9: Short-expiry shadow statistics`);
   assert(
     Math.abs(stats.expiry120.winRate - (2 / 3) * 100) < 0.001,
     `120s W/L win rate: ${stats.expiry120.winRate}`
+  );
+
+  assert(
+    stats.expiry300.settled === 2 &&
+    stats.expiry300.wins === 1 &&
+    stats.expiry300.losses === 1,
+    "300s statistics count matched results"
   );
 
   assert(
@@ -663,8 +672,10 @@ console.log(`Test 11: Short-expiry alarm scheduling`);
         entryAt: now,
         expiry60At: now + 60000,
         expiry120At: now + 120000,
+        expiry300At: now + 300000,
         result60: null,
-        result120: null
+        result120: null,
+        result300: null
       }
     ]
   };
@@ -697,6 +708,15 @@ console.log(`Test 11: Short-expiry alarm scheduling`);
     secondAlarm >= now + 119000 &&
     secondAlarm <= now + 121000,
     "After 60s settlement, alarm advances to 120s expiry"
+  );
+
+  hub.shortShadowState.pending[0].result120 = "WIN";
+  await hub.scheduleAlarm();
+
+  const thirdAlarm = await storage.getAlarm();
+  assert(
+    thirdAlarm >= now + 299000 && thirdAlarm <= now + 301000,
+    "After 120s settlement, alarm advances to 300s expiry"
   );
 
   hub.shortShadowState.pending = [];
@@ -1405,7 +1425,7 @@ console.log(
 
   hub.shortShadowState = {
     strategyId: SHORT_SHADOW_ID,
-    startedAt: now - 300000,
+    startedAt: now - 600000,
 
     pending: [
       {
@@ -1417,19 +1437,23 @@ console.log(
         direction: "CALL",
 
         entryPrice: 1.1000,
-        entryAt: now - 180000,
+        entryAt: now - 600000,
 
-        expiry60At: now - 120000,
-        expiry120At: now - 60000,
+        expiry60At: now - 540000,
+        expiry120At: now - 480000,
+        expiry300At: now - 300000,
 
         result60: null,
         result120: null,
+        result300: null,
 
         exit60Price: null,
         exit120Price: null,
+        exit300Price: null,
 
         exit60TickAt: null,
-        exit120TickAt: null
+        exit120TickAt: null,
+        exit300TickAt: null
       }
     ],
 
@@ -1474,8 +1498,9 @@ console.log(
 
   assert(
     hub.shortShadowState.history[0].result60 === "VOID" &&
-    hub.shortShadowState.history[0].result120 === "VOID",
-    "Both overdue expiries settle VOID when no expiry tick is available"
+    hub.shortShadowState.history[0].result120 === "VOID" &&
+    hub.shortShadowState.history[0].result300 === "VOID",
+    "All overdue expiries settle VOID when no S30 settlement candle is available"
   );
 }
 
@@ -1502,7 +1527,7 @@ console.log(
 
   hub.shortShadowState = {
     strategyId: SHORT_SHADOW_ID,
-    startedAt: now - 300000,
+    startedAt: now - 600000,
 
     pending: [
       {
@@ -1514,19 +1539,23 @@ console.log(
         direction: "CALL",
 
         entryPrice: 1.1000,
-        entryAt: now - 180000,
+        entryAt: now - 600000,
 
-        expiry60At: now - 120000,
-        expiry120At: now - 60000,
+        expiry60At: now - 540000,
+        expiry120At: now - 480000,
+        expiry300At: now - 300000,
 
         result60: null,
         result120: null,
+        result300: null,
 
         exit60Price: null,
         exit120Price: null,
+        exit300Price: null,
 
         exit60TickAt: null,
-        exit120TickAt: null
+        exit120TickAt: null,
+        exit300TickAt: null
       }
     ],
 
@@ -1566,7 +1595,8 @@ console.log(
   assert(
     hub.shortShadowState.history.length === 1 &&
     hub.shortShadowState.history[0].result60 === "VOID" &&
-    hub.shortShadowState.history[0].result120 === "VOID",
+    hub.shortShadowState.history[0].result120 === "VOID" &&
+    hub.shortShadowState.history[0].result300 === "VOID",
     "Scheduler settlement endpoint moves overdue record to history as VOID"
   );
 }
@@ -2089,9 +2119,9 @@ console.log(
   assert(
     callScore.timeframe === "30s" &&
     putScore.timeframe === "30s" &&
-    callScore.primaryExpirySeconds === 120 &&
-    putScore.primaryExpirySeconds === 120,
-    "Cruz V2 uses 30-second chart with 120-second primary expiry"
+    callScore.primaryExpirySeconds === 300 &&
+    putScore.primaryExpirySeconds === 300,
+    "Cruz V2 uses 30-second chart with 300-second primary expiry"
   );
 }
 
@@ -2965,8 +2995,11 @@ console.log(
       expectedEntryAt &&
       record.expiry120At ===
       expectedEntryAt +
-      120000,
-      "Cruz V2 uses completed Tiingo S30 close and exact 120-second expiry"
+      120000 &&
+      record.expiry300At ===
+      expectedEntryAt +
+      300000,
+      "Cruz V2 captures 120-second diagnostic and 300-second primary expiries"
     );
 
 
@@ -2978,7 +3011,7 @@ console.log(
       record.features?.timeframe ===
       "30s" &&
       record.features?.primaryExpirySeconds ===
-      120 &&
+      300 &&
       record.features?.aroon?.period ===
       10 &&
       record.features?.osma?.fastPeriod ===
@@ -3173,8 +3206,11 @@ console.log(
       expectedEntryAt &&
       record.expiry120At ===
       expectedEntryAt +
-      120000,
-      "Cruz V2 PUT uses completed Tiingo S30 close and exact 120-second expiry"
+      120000 &&
+      record.expiry300At ===
+      expectedEntryAt +
+      300000,
+      "Cruz V2 PUT captures 120-second diagnostic and 300-second primary expiries"
     );
 
 
@@ -3186,7 +3222,7 @@ console.log(
       record.features?.timeframe ===
       "30s" &&
       record.features?.primaryExpirySeconds ===
-      120 &&
+      300 &&
       record.features?.aroon?.period ===
       10 &&
       record.features?.osma?.fastPeriod ===
@@ -3237,6 +3273,9 @@ console.log(
   const expiry120At =
     entryAt + 120000;
 
+  const expiry300At =
+    entryAt + 300000;
+
 
   const bars30 = [
     {
@@ -3284,13 +3323,21 @@ console.log(
       l: 1.0988,
       c: 1.0990,
       n: 20
-    }
+    },
+    ...Array.from({ length: 6 }, (_, i) => ({
+      t: start + (i + 5) * 30000,
+      o: 1.0990,
+      h: 1.0992,
+      l: 1.0978,
+      c: i === 5 ? 1.0980 : 1.0985,
+      n: 20
+    }))
   ];
 
 
   Date.now =
     () =>
-      expiry120At +
+      expiry300At +
       1000;
 
 
@@ -3344,11 +3391,15 @@ console.log(
 
           expiry60At,
           expiry120At,
+          expiry300At,
 
           result60:
             null,
 
           result120:
+            null,
+
+          result300:
             null,
 
           exit60Price:
@@ -3357,10 +3408,16 @@ console.log(
           exit120Price:
             null,
 
+          exit300Price:
+            null,
+
           exit60TickAt:
             null,
 
           exit120TickAt:
+            null,
+
+          exit300TickAt:
             null,
 
           features: {
@@ -3371,7 +3428,7 @@ console.log(
               "tiingo-websocket-s30",
 
             primaryExpirySeconds:
-              120
+              300
           }
         }
       ],
@@ -3423,6 +3480,7 @@ console.log(
     assert(
       settled.settled60 === 1 &&
       settled.settled120 === 1 &&
+      settled.settled300 === 1 &&
       settled.completed === 1,
       "Both 60s diagnostic and 120s primary expiries settle in one pass"
     );
@@ -3447,8 +3505,11 @@ console.log(
       record.result120 === "LOSS" &&
       record.exit120Price === 1.0990 &&
       record.exit120TickAt ===
-      expiry120At,
-      "Cruz V2 scores the exact 60s and 120s OANDA candle closes"
+      expiry120At &&
+      record.result300 === "LOSS" &&
+      record.exit300Price === 1.0980 &&
+      record.exit300TickAt === expiry300At,
+      "Cruz V2 scores the exact 60s, 120s, and 300s S30 closes"
     );
   } finally {
     Date.now =
@@ -3562,6 +3623,10 @@ console.log(
     entryAt +
     120000;
 
+  const expiry300At =
+    entryAt +
+    300000;
+
 
   // Simulate Durable Object storage containing
   // the OLD V1 experiment.
@@ -3633,8 +3698,8 @@ console.log(
   // -------------------------------------------------
 
   assert(
-    SHORT_SHADOW_ID === "cruz-30s-aroon10-osma10-20-10-ema20-50-context-shadow-v6",
-    "Screenshot-derived 5-minute EMA-context revision uses a distinct fresh dataset ID"
+    SHORT_SHADOW_ID === "cruz-30s-aroon10-osma10-20-10-ema20-50-context-300s-shadow-v7",
+    "300-second shadow revision uses a distinct fresh dataset ID"
   );
 
   assert(
@@ -3748,7 +3813,14 @@ console.log(
           low: 1.1000,
           close: 1.1005
         }
-      )
+      ),
+
+      ...Array.from({ length: 6 }, (_, i) => makeBar(36 + i, {
+        open: 1.1005,
+        high: 1.1008,
+        low: 1.0990,
+        close: i === 5 ? 1.0995 : 1.1000
+      }))
     ];
 
 
@@ -3759,7 +3831,7 @@ console.log(
 
     Date.now =
       () =>
-        expiry120At +
+        expiry300At +
         1000;
 
 
@@ -3807,8 +3879,11 @@ console.log(
       1.1020 &&
       record.result120 === "LOSS" &&
       record.exit120Price ===
-      1.1005,
-      "Production V2 route independently scores exact 60s and 120s S30 outcomes"
+      1.1005 &&
+      record.result300 === "LOSS" &&
+      record.exit300Price === 1.0995 &&
+      record.expiry300At === expiry300At,
+      "Production V2 route scores exact 60s, 120s, and 300s S30 outcomes"
     );
 
   } finally {
