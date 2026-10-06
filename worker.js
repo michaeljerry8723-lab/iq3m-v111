@@ -1,7 +1,7 @@
-// V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
+// V13.9.0 — video-derived SuperTrend/MACD shadow collection
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.8.4-cruz-5m-osma-accelerated-shadow-fresh-v9";
+export const VERSION = "13.9.0-pocket-option-supertrend-macd-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -15,8 +15,13 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "CAD/JPY"
 ]);
 export const SHORT_SHADOW_ID =
-  "cruz-30s-aroon10-osma5-13-4-ema20-50-context-300s-shadow-v9";
-export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120, 300]);
+  "pocketoption-30s-supertrend-atr10-mult2-macd10-20-5-60-120-shadow-v1";
+export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
+export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
+export const VIDEO_SUPERTREND_MULTIPLIER = 2;
+export const VIDEO_MACD_FAST_PERIOD = 10;
+export const VIDEO_MACD_SLOW_PERIOD = 20;
+export const VIDEO_MACD_SIGNAL_PERIOD = 5;
 export const CRUZ_5M_CONTEXT_MIN_BARS = 100;
 export const CRUZ_5M_EMA_FAST = 20;
 export const CRUZ_5M_EMA_SLOW = 50;
@@ -886,6 +891,264 @@ export function cruzFiveMinuteEmaSnapshot(
     emaFast,
     emaSlow,
     direction: emaFast > emaSlow ? "CALL" : emaFast < emaSlow ? "PUT" : "NEUTRAL"
+  };
+}
+
+function supertrendSnapshot(bars, period = VIDEO_SUPERTREND_ATR_PERIOD, multiplier = VIDEO_SUPERTREND_MULTIPLIER) {
+  const p = Math.max(2, Math.floor(Number(period) || 10));
+  const factor = Number(multiplier);
+  if (!Array.isArray(bars) || bars.length < p + 2 || !Number.isFinite(factor) || factor <= 0) {
+    return { ready: false, period: p, multiplier: factor };
+  }
+
+  const ranges = bars.map((bar, i) => {
+    const high = Number(bar?.h);
+    const low = Number(bar?.l);
+    const previousClose = i > 0 ? Number(bars[i - 1]?.c) : NaN;
+    if (![high, low].every(Number.isFinite) || high < low) return NaN;
+    return i === 0 || !Number.isFinite(previousClose)
+      ? high - low
+      : Math.max(high - low, Math.abs(high - previousClose), Math.abs(low - previousClose));
+  });
+  if (!ranges.every(Number.isFinite)) return { ready: false, period: p, multiplier: factor };
+
+  const atr = new Array(bars.length).fill(NaN);
+  let seed = 0;
+  for (let i = 0; i < p; i++) seed += ranges[i];
+  atr[p - 1] = seed / p;
+  for (let i = p; i < bars.length; i++) {
+    atr[i] = (atr[i - 1] * (p - 1) + ranges[i]) / p;
+  }
+
+  let finalUpper = NaN;
+  let finalLower = NaN;
+  let direction = "PUT";
+  let previousDirection = null;
+  let line = NaN;
+  let previousLine = NaN;
+
+  for (let i = p - 1; i < bars.length; i++) {
+    const high = Number(bars[i].h);
+    const low = Number(bars[i].l);
+    const close = Number(bars[i].c);
+    const midpoint = (high + low) / 2;
+    const basicUpper = midpoint + factor * atr[i];
+    const basicLower = midpoint - factor * atr[i];
+
+    if (i === p - 1) {
+      finalUpper = basicUpper;
+      finalLower = basicLower;
+      previousDirection = direction;
+      line = finalUpper;
+      continue;
+    }
+
+    const previousClose = Number(bars[i - 1].c);
+    const priorUpper = finalUpper;
+    const priorLower = finalLower;
+    finalUpper = basicUpper < priorUpper || previousClose > priorUpper ? basicUpper : priorUpper;
+    finalLower = basicLower > priorLower || previousClose < priorLower ? basicLower : priorLower;
+    previousDirection = direction;
+
+    if (direction === "PUT") {
+      direction = close > finalUpper ? "CALL" : "PUT";
+    } else {
+      direction = close < finalLower ? "PUT" : "CALL";
+    }
+
+    previousLine = line;
+    line = direction === "CALL" ? finalLower : finalUpper;
+  }
+
+  const current = bars.at(-1);
+  const prior = bars.at(-2);
+  const currentClose = Number(current?.c);
+  const priorClose = Number(prior?.c);
+  if (![atr.at(-1), currentClose, priorClose, line].every(Number.isFinite)) {
+    return { ready: false, period: p, multiplier: factor };
+  }
+
+  return {
+    ready: true,
+    period: p,
+    multiplier: factor,
+    atr: atr.at(-1),
+    direction,
+    previousDirection,
+    flippedUp: previousDirection === "PUT" && direction === "CALL",
+    flippedDown: previousDirection === "CALL" && direction === "PUT",
+    line,
+    previousLine,
+    close: currentClose,
+    previousClose: priorClose
+  };
+}
+
+function videoMacdSnapshot(
+  bars,
+  fastPeriod = VIDEO_MACD_FAST_PERIOD,
+  slowPeriod = VIDEO_MACD_SLOW_PERIOD,
+  signalPeriod = VIDEO_MACD_SIGNAL_PERIOD
+) {
+  const fast = Math.max(2, Math.floor(Number(fastPeriod) || 10));
+  const slow = Math.max(fast + 1, Math.floor(Number(slowPeriod) || 20));
+  const signal = Math.max(2, Math.floor(Number(signalPeriod) || 5));
+  if (!Array.isArray(bars) || bars.length < slow + signal + 2) {
+    return { ready: false, fastPeriod: fast, slowPeriod: slow, signalPeriod: signal };
+  }
+
+  const closes = bars.map(bar => Number(bar?.c));
+  if (!closes.every(Number.isFinite)) {
+    return { ready: false, fastPeriod: fast, slowPeriod: slow, signalPeriod: signal };
+  }
+  const fastEma = emaSeries(closes, fast);
+  const slowEma = emaSeries(closes, slow);
+  const macd = [];
+  for (let i = 0; i < closes.length; i++) {
+    if (Number.isFinite(fastEma[i]) && Number.isFinite(slowEma[i])) {
+      macd.push(fastEma[i] - slowEma[i]);
+    }
+  }
+  if (macd.length < signal + 2) {
+    return { ready: false, fastPeriod: fast, slowPeriod: slow, signalPeriod: signal };
+  }
+
+  const signalLine = emaSeries(macd, signal);
+  const i = macd.length - 1;
+  const prior = i - 1;
+  if (![macd[i], signalLine[i], macd[prior], signalLine[prior]].every(Number.isFinite)) {
+    return { ready: false, fastPeriod: fast, slowPeriod: slow, signalPeriod: signal };
+  }
+
+  return {
+    ready: true,
+    fastPeriod: fast,
+    slowPeriod: slow,
+    signalPeriod: signal,
+    macd: macd[i],
+    signal: signalLine[i],
+    previousMacd: macd[prior],
+    previousSignal: signalLine[prior],
+    crossUp: macd[prior] <= signalLine[prior] && macd[i] > signalLine[i],
+    crossDown: macd[prior] >= signalLine[prior] && macd[i] < signalLine[i],
+    bullish: macd[i] > signalLine[i],
+    bearish: macd[i] < signalLine[i]
+  };
+}
+
+export function scorePocketOption30sSuperTrendMacd(bars30) {
+  if (!Array.isArray(bars30) || bars30.length < 32) {
+    return {
+      ok: false,
+      reason: "Pocket Option S30 context is still building",
+      bars30: Array.isArray(bars30) ? bars30.length : 0
+    };
+  }
+
+  const supertrend = supertrendSnapshot(
+    bars30,
+    VIDEO_SUPERTREND_ATR_PERIOD,
+    VIDEO_SUPERTREND_MULTIPLIER
+  );
+  const macd = videoMacdSnapshot(
+    bars30,
+    VIDEO_MACD_FAST_PERIOD,
+    VIDEO_MACD_SLOW_PERIOD,
+    VIDEO_MACD_SIGNAL_PERIOD
+  );
+  if (!supertrend.ready || !macd.ready) {
+    return { ok: false, reason: "SuperTrend/MACD indicator context is not ready" };
+  }
+
+  const bar = bars30.at(-1);
+  const open = Number(bar?.o);
+  const close = Number(bar?.c);
+  if (![open, close].every(Number.isFinite)) {
+    return { ok: false, reason: "latest completed S30 candle is invalid" };
+  }
+
+  const candleDirection =
+    close > open ? "CALL" :
+    close < open ? "PUT" : "NEUTRAL";
+
+  const call =
+    supertrend.direction === "CALL" &&
+    macd.crossUp &&
+    candleDirection === "CALL";
+  const put =
+    supertrend.direction === "PUT" &&
+    macd.crossDown &&
+    candleDirection === "PUT";
+
+  if (!call && !put) {
+    let reason = "SuperTrend, MACD crossover, and candle direction are not aligned";
+    if (!macd.crossUp && !macd.crossDown) reason = "no fresh MACD(10,20,5) line crossover";
+    else if (macd.crossUp && supertrend.direction !== "CALL") reason = "bullish MACD crossover lacks bullish SuperTrend confirmation";
+    else if (macd.crossDown && supertrend.direction !== "PUT") reason = "bearish MACD crossover lacks bearish SuperTrend confirmation";
+    else if ((macd.crossUp && candleDirection !== "CALL") || (macd.crossDown && candleDirection !== "PUT")) {
+      reason = "signal candle does not confirm the MACD direction";
+    }
+    return {
+      ok: false,
+      reason,
+      supertrend: {
+        period: supertrend.period,
+        multiplier: supertrend.multiplier,
+        direction: supertrend.direction,
+        flippedUp: supertrend.flippedUp,
+        flippedDown: supertrend.flippedDown,
+        line: supertrend.line
+      },
+      macd: {
+        fastPeriod: macd.fastPeriod,
+        slowPeriod: macd.slowPeriod,
+        signalPeriod: macd.signalPeriod,
+        value: macd.macd,
+        signal: macd.signal,
+        crossUp: macd.crossUp,
+        crossDown: macd.crossDown
+      },
+      candleDirection
+    };
+  }
+
+  const direction = call ? "CALL" : "PUT";
+  return {
+    ok: true,
+    strategyId: SHORT_SHADOW_ID,
+    patternRevision:
+      "Video-derived reconstruction: 30-second candles; SuperTrend ATR(10) multiplier 2 agrees with a fresh MACD(10,20,5) line crossover and a same-direction completed candle. One-minute expiry in the video; bot shadows 60s and 120s. Exact discretion about trend strength and candle timing is not fully specified.",
+    direction,
+    trigger:
+      direction === "CALL"
+        ? "SuperTrend bullish; MACD line crossed above signal line; completed candle closed bullish"
+        : "SuperTrend bearish; MACD line crossed below signal line; completed candle closed bearish",
+    timeframe: "30s",
+    expiryCandidates: [60, 120],
+    supertrend: {
+      period: supertrend.period,
+      multiplier: supertrend.multiplier,
+      direction: supertrend.direction,
+      flippedUp: supertrend.flippedUp,
+      flippedDown: supertrend.flippedDown,
+      line: supertrend.line,
+      atr: supertrend.atr
+    },
+    macd: {
+      fastPeriod: macd.fastPeriod,
+      slowPeriod: macd.slowPeriod,
+      signalPeriod: macd.signalPeriod,
+      value: macd.macd,
+      signal: macd.signal,
+      crossUp: macd.crossUp,
+      crossDown: macd.crossDown
+    },
+    candleDirection,
+    reasons: [
+      direction === "CALL"
+        ? "SuperTrend direction and MACD crossover confirm upward price action"
+        : "SuperTrend direction and MACD crossover confirm downward price action"
+    ]
   };
 }
 
@@ -6393,16 +6656,12 @@ export class TickHub extends DurableObject {
       entryAt,
       expiry60At: entryAt + 60 * 1000,
       expiry120At: entryAt + 120 * 1000,
-      expiry300At: entryAt + 300 * 1000,
       result60: null,
       result120: null,
-      result300: null,
       exit60Price: null,
       exit120Price: null,
-      exit300Price: null,
       exit60TickAt: null,
       exit120TickAt: null,
-      exit300TickAt: null,
       features: body?.features || null,
       capturedAt: Date.now()
     };
@@ -6428,8 +6687,7 @@ export class TickHub extends DurableObject {
       entryPrice,
       entryAt,
       expiry60At: record.expiry60At,
-      expiry120At: record.expiry120At,
-      expiry300At: record.expiry300At
+      expiry120At: record.expiry120At
     };
   }
 
@@ -6683,106 +6941,30 @@ export class TickHub extends DurableObject {
       return {
         ok: false,
         error:
-          "invalid Cruz V2 short-shadow symbol"
+          "invalid video-strategy short-shadow symbol"
       };
     }
 
 
-    // Every qualifying Cruz crossover is independently eligible.
-    // Do not suppress a new setup because an earlier same-pair
-    // shadow record is still waiting for its 60s/120s outcome.
-    // Duplicate protection is handled by the 30-second source key.
-
-    // -------------------------------------------------
-    // TRUE COMPLETED TIINGO WEBSOCKET S30 CONTEXT
-    // -------------------------------------------------
+    // Each qualifying video-derived setup is independently eligible.
+    // Duplicate protection uses the completed S30 candle source key.
 
     let bars30;
-
     try {
-      bars30 =
-        this.getTiingo30SecondBars(symbol, 80);
+      bars30 = this.getTiingo30SecondBars(symbol, 80);
     } catch (e) {
       return {
         ok: false,
         symbol,
         captured: false,
-
-        reason:
-          `Cruz V2 Tiingo S30 context unavailable: ${String(
-            e?.message || e
-          )}`
+        reason: `Video strategy Tiingo S30 context unavailable: ${String(e?.message || e)}`
       };
     }
 
-
-    if (
-      !Array.isArray(bars30) ||
-      bars30.length < 32
-    ) {
-      return {
-        ok: false,
-        symbol,
-        captured: false,
-
-        reason:
-          `Cruz V2 S30 context insufficient (${bars30?.length || 0}/32)`
-      };
-    }
-
-
-    // -------------------------------------------------
-    // AROON(10) + OsMA(10,20,10)
-    // -------------------------------------------------
-
-    const candidate =
-      scoreCruz30sAroonOsma(
-        bars30,
-
-        // V2 indicator logic is derived entirely
-        // from completed Tiingo WebSocket S30 candles.
-        // No separate tick-based strategy filter.
-        [],
-
-        symbol
-      );
-
-
+    const candidate = scorePocketOption30sSuperTrendMacd(bars30);
     if (!candidate.ok) {
-      return {
-        ...candidate,
-        symbol,
-        captured: false
-      };
+      return { ...candidate, symbol, captured: false };
     }
-
-    const fiveMinuteTrend =
-      this.getCruzFiveMinuteTrend(symbol);
-
-    if (!fiveMinuteTrend.ready) {
-      return {
-        ok: false,
-        symbol,
-        captured: false,
-        reason: fiveMinuteTrend.reason,
-        fiveMinuteTrend
-      };
-    }
-
-    if (fiveMinuteTrend.direction !== candidate.direction) {
-      return {
-        ok: false,
-        symbol,
-        captured: false,
-        reason: "5-minute EMA(20/50) trend disagrees with the 30-second Aroon/OsMA setup",
-        strategyQualified: true,
-        direction: candidate.direction,
-        fiveMinuteTrend
-      };
-    }
-
-    candidate.fiveMinuteTrend =
-      fiveMinuteTrend;
 
 
     // -------------------------------------------------
@@ -6820,7 +7002,7 @@ export class TickHub extends DurableObject {
         symbol,
         captured: false,
         reason:
-          "Cruz V2 completed S30 entry candle is invalid"
+          "Video strategy completed S30 entry candle is invalid"
       };
     }
 
@@ -6847,7 +7029,7 @@ export class TickHub extends DurableObject {
         captured: false,
 
         reason:
-          `Cruz V2 latest completed S30 candle is stale (${(
+          `Video strategy latest completed S30 candle is stale (${(
             candleAgeMs / 1000
           ).toFixed(1)}s)`
       };
@@ -6876,7 +7058,7 @@ export class TickHub extends DurableObject {
 
         features: {
           model:
-            "cruz-30s-aroon10-osma5-13-4",
+            "video-30s-supertrend10x2-macd10-20-5",
 
           dataSource:
             "tiingo-websocket-s30",
@@ -6885,7 +7067,7 @@ export class TickHub extends DurableObject {
             "30s",
 
           primaryExpirySeconds:
-            300,
+            60,
 
           expiryCandidates:
             candidate.expiryCandidates,
@@ -6894,14 +7076,14 @@ export class TickHub extends DurableObject {
           signalBarCloseAt:
             entryAt,
 
-          aroon:
-            candidate.aroon,
+          supertrend:
+            candidate.supertrend,
 
-          osma:
-            candidate.osma,
+          macd:
+            candidate.macd,
 
-          fiveMinuteTrend:
-            candidate.fiveMinuteTrend,
+          candleDirection:
+            candidate.candleDirection,
 
           trigger:
             candidate.trigger,
@@ -8222,18 +8404,12 @@ export default {
             const pairLines =
               SHORT_SHADOW_UNIVERSE
                 .map(symbol => {
-                  const row =
-                    st.byPair?.[symbol] || {};
-
+                  const row = st.byPair?.[symbol] || {};
                   return (
                     `${symbol} — ` +
                     `60s ${formatBucket(row.expiry60)} | ` +
-                    `120s ${formatBucket(row.expiry120)} | ` +
-                    `300s ${formatBucket(row.expiry300)}` +
-                    `${Number(row.pending || 0) > 0
-                      ? ` | P:${row.pending}`
-                      : ""
-                    }`
+                    `120s ${formatBucket(row.expiry120)}` +
+                    `${Number(row.pending || 0) > 0 ? ` | P:${row.pending}` : ""}`
                   );
                 })
                 .join("\n");
@@ -8266,18 +8442,12 @@ export default {
             const sessionLines =
               Object.entries(sessionLabels)
                 .map(([key, label]) => {
-                  const row =
-                    st.bySession?.[key] || {};
-
+                  const row = st.bySession?.[key] || {};
                   return (
                     `${label}\n` +
                     `60s ${formatBucket(row.expiry60)} | ` +
-                    `120s ${formatBucket(row.expiry120)} | ` +
-                    `300s ${formatBucket(row.expiry300)}` +
-                    `${Number(row.pending || 0) > 0
-                      ? ` | Pending: ${row.pending}`
-                      : ""
-                    }`
+                    `120s ${formatBucket(row.expiry120)}` +
+                    `${Number(row.pending || 0) > 0 ? ` | Pending: ${row.pending}` : ""}`
                   );
                 })
                 .join("\n");
@@ -8291,8 +8461,7 @@ export default {
                   return (
                     `${label}\n` +
                     `60s ${formatClusterBucket(row.expiry60)}\n` +
-                    `120s ${formatClusterBucket(row.expiry120)}\n` +
-                    `300s ${formatClusterBucket(row.expiry300)}`
+                    `120s ${formatClusterBucket(row.expiry120)}`
                   );
                 })
                 .join("\n");
@@ -8305,9 +8474,6 @@ export default {
 
             const adjusted120 =
               st.clusterAdjusted?.expiry120 || {};
-
-            const adjusted300 =
-              st.clusterAdjusted?.expiry300 || {};
 
 
             const adjustedWr60 =
@@ -8322,13 +8488,6 @@ export default {
                 ? "n/a"
                 : Number(
                   adjusted120.equalClusterWinRate
-                ).toFixed(1) + "%";
-
-            const adjustedWr300 =
-              adjusted300.equalClusterWinRate == null
-                ? "n/a"
-                : Number(
-                  adjusted300.equalClusterWinRate
                 ).toFixed(1) + "%";
 
             const pendingHealth =
@@ -8378,8 +8537,7 @@ export default {
               `Total: ${pendingHealth.total || 0}\n` +
               `Due 60s: ${pendingHealth.due60 || 0}\n` +
               `Due 120s: ${pendingHealth.due120 || 0}\n` +
-              `Due 300s: ${pendingHealth.due300 || 0}\n` +
-              `Overdue >15s: ${pendingHealth.overdue300 || 0}\n` +
+              `Overdue >15s: ${pendingHealth.overdue120 || 0}\n` +
               `Oldest age: ${oldestPendingAge}s\n\n` +
 
               `60 SECOND\n` +
@@ -8398,23 +8556,13 @@ export default {
               `Voids: ${st.expiry120?.voids || 0}\n` +
               `W/L win rate: ${wr120}\n\n` +
 
-              `300 SECOND (5 MINUTES)\n` +
-              `Settled: ${st.expiry300?.settled || 0}\n` +
-              `Wins: ${st.expiry300?.wins || 0}\n` +
-              `Losses: ${st.expiry300?.losses || 0}\n` +
-              `Draws: ${st.expiry300?.draws || 0}\n` +
-              `Voids: ${st.expiry300?.voids || 0}\n` +
-              `W/L win rate: ${wr300}\n\n` +
-
               `BY DIRECTION\n` +
               `CALL — 60s ${formatBucket(callStats.expiry60)} | ` +
               `120s ${formatBucket(callStats.expiry120)} | ` +
-              `300s ${formatBucket(callStats.expiry300)} | ` +
               `Pending: ${callStats.pending || 0}\n` +
 
               `PUT — 60s ${formatBucket(putStats.expiry60)} | ` +
               `120s ${formatBucket(putStats.expiry120)} | ` +
-              `300s ${formatBucket(putStats.expiry300)} | ` +
               `Pending: ${putStats.pending || 0}\n\n` +
 
               `BY UTC MARKET WINDOW\n` +
@@ -8445,11 +8593,6 @@ export default {
               `Losing: ${adjusted120.losingClusters || 0} | ` +
               `Tied: ${adjusted120.tiedClusters || 0}\n\n` +
 
-              `300s — ${adjustedWr300}\n` +
-              `Settled clusters: ${adjusted300.settledClusters || 0}\n` +
-              `Winning: ${adjusted300.winningClusters || 0} | ` +
-              `Losing: ${adjusted300.losingClusters || 0} | ` +
-              `Tied: ${adjusted300.tiedClusters || 0}\n\n` +
               `EVIDENCE PROGRESS\n` +
               `Scored independent clusters: ${evidence.settledClusters || 0}\n` +
               `Minimum target: ${evidence.minimumTarget || 50}\n` +
