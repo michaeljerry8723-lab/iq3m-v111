@@ -1,7 +1,7 @@
-// V13.9.0 — video-derived SuperTrend/MACD shadow collection
+// V13.9.1 — video-derived SuperTrend/MACD shadow collection
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.9.0-pocket-option-supertrend-macd-shadow";
+export const VERSION = "13.9.1-pocket-option-supertrend-macd-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -15,7 +15,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "CAD/JPY"
 ]);
 export const SHORT_SHADOW_ID =
-  "pocketoption-30s-supertrend-atr10-mult2-macd10-20-5-60-120-shadow-v1";
+  "pocketoption-30s-supertrend-atr10-mult2-macd10-20-5-60-120-shadow-v2";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
 export const VIDEO_SUPERTREND_MULTIPLIER = 2;
@@ -1073,21 +1073,16 @@ export function scorePocketOption30sSuperTrendMacd(bars30) {
 
   const call =
     supertrend.direction === "CALL" &&
-    macd.crossUp &&
-    candleDirection === "CALL";
+    macd.crossUp;
   const put =
     supertrend.direction === "PUT" &&
-    macd.crossDown &&
-    candleDirection === "PUT";
+    macd.crossDown;
 
   if (!call && !put) {
-    let reason = "SuperTrend, MACD crossover, and candle direction are not aligned";
+    let reason = "SuperTrend direction and MACD crossover are not aligned";
     if (!macd.crossUp && !macd.crossDown) reason = "no fresh MACD(10,20,5) line crossover";
     else if (macd.crossUp && supertrend.direction !== "CALL") reason = "bullish MACD crossover lacks bullish SuperTrend confirmation";
     else if (macd.crossDown && supertrend.direction !== "PUT") reason = "bearish MACD crossover lacks bearish SuperTrend confirmation";
-    else if ((macd.crossUp && candleDirection !== "CALL") || (macd.crossDown && candleDirection !== "PUT")) {
-      reason = "signal candle does not confirm the MACD direction";
-    }
     return {
       ok: false,
       reason,
@@ -1117,12 +1112,12 @@ export function scorePocketOption30sSuperTrendMacd(bars30) {
     ok: true,
     strategyId: SHORT_SHADOW_ID,
     patternRevision:
-      "Video-derived reconstruction: 30-second candles; SuperTrend ATR(10) multiplier 2 agrees with a fresh MACD(10,20,5) line crossover and a same-direction completed candle. One-minute expiry in the video; bot shadows 60s and 120s. Exact discretion about trend strength and candle timing is not fully specified.",
+      "Video-derived reconstruction: on 30-second candles, SuperTrend ATR(10) multiplier 2 establishes the direction; a fresh MACD(10,20,5) line/signal crossover in that direction triggers the entry. No separate candle-colour confirmation is imposed. The video uses one-minute expiry; bot shadows 60s and 120s.",
     direction,
     trigger:
       direction === "CALL"
-        ? "SuperTrend bullish; MACD line crossed above signal line; completed candle closed bullish"
-        : "SuperTrend bearish; MACD line crossed below signal line; completed candle closed bearish",
+        ? "SuperTrend bullish; MACD line crossed above signal line"
+        : "SuperTrend bearish; MACD line crossed below signal line",
     timeframe: "30s",
     expiryCandidates: [60, 120],
     supertrend: {
@@ -1146,8 +1141,8 @@ export function scorePocketOption30sSuperTrendMacd(bars30) {
     candleDirection,
     reasons: [
       direction === "CALL"
-        ? "SuperTrend direction and MACD crossover confirm upward price action"
-        : "SuperTrend direction and MACD crossover confirm downward price action"
+        ? "SuperTrend direction and bullish MACD crossover confirm upward bias"
+        : "SuperTrend direction and bearish MACD crossover confirm downward bias"
     ]
   };
 }
