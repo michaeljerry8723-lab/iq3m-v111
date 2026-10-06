@@ -1,7 +1,7 @@
 // V13.6.1 — five-minute automatic sniper audit with blocker stats instrumentation
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.8.1-cruz-5m-ema-context-shadow";
+export const VERSION = "13.8.2-cruz-5m-expiry-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -15,8 +15,8 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "CAD/JPY"
 ]);
 export const SHORT_SHADOW_ID =
-  "cruz-30s-aroon10-osma10-20-10-ema20-50-context-shadow-v6";
-export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
+  "cruz-30s-aroon10-osma10-20-10-ema20-50-context-300s-shadow-v7";
+export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120, 300]);
 export const CRUZ_5M_CONTEXT_MIN_BARS = 100;
 export const CRUZ_5M_EMA_FAST = 20;
 export const CRUZ_5M_EMA_SLOW = 50;
@@ -1188,10 +1188,10 @@ export function scoreCruz30sAroonOsma(
       "30s",
 
     primaryExpirySeconds:
-      120,
+      300,
 
     expiryCandidates:
-      [60, 120],
+      [60, 120, 300],
 
     aroon: {
       period: 10,
@@ -3404,28 +3404,12 @@ export class TickHub extends DurableObject {
       }
     }
 
-    // Experimental 60s / 120s settlements
+    // 60s, 120s, and 300s shadow settlements
     for (const p of shortPending) {
-      if (!p.result60) {
-        const exp60 = Number(p.expiry60At || 0);
-
-        next = Math.min(
-          next,
-          exp60 > now
-            ? exp60
-            : now + 2000
-        );
-      }
-
-      if (!p.result120) {
-        const exp120 = Number(p.expiry120At || 0);
-
-        next = Math.min(
-          next,
-          exp120 > now
-            ? exp120
-            : now + 2000
-        );
+      for (const seconds of SHORT_SHADOW_EXPIRIES) {
+        if (p[`result${seconds}`]) continue;
+        const expiryAt = Number(p[`expiry${seconds}At`] || 0);
+        next = Math.min(next, expiryAt > now ? expiryAt : now + 2000);
       }
     }
 
@@ -3719,6 +3703,11 @@ export class TickHub extends DurableObject {
             !x.result120 &&
             Number(x.expiry120At || 0) <=
             now + 2000
+          ) ||
+          (
+            !x.result300 &&
+            Number(x.expiry300At || 0) <=
+            now + 2000
           )
         )
         .map(x => x.symbol);
@@ -3750,7 +3739,7 @@ export class TickHub extends DurableObject {
       await this.settlePendingSignals();
 
       // Independent short-expiry settlement
-      await this.settleShortShadow(now);
+      await this.settleShortShadowV2(now);
 
     } catch (e) {
       this.lastStatus =
@@ -5592,12 +5581,28 @@ export class TickHub extends DurableObject {
             now >= Number(x.expiry120At)
         ).length,
 
+      due300:
+        pending.filter(
+          x =>
+            Number(x?.expiry300At || 0) > 0 &&
+            now >= Number(x.expiry300At)
+        ).length,
+
       overdue120:
         pending.filter(
           x =>
             Number(x?.expiry120At || 0) > 0 &&
             now >
             Number(x.expiry120At) +
+            15000
+        ).length,
+
+      overdue300:
+        pending.filter(
+          x =>
+            Number(x?.expiry300At || 0) > 0 &&
+            now >
+            Number(x.expiry300At) +
             15000
         ).length,
 
@@ -5732,6 +5737,12 @@ export class TickHub extends DurableObject {
           summarizeSubset(
             pairRecords,
             "result120"
+          ),
+
+        expiry300:
+          summarizeSubset(
+            pairRecords,
+            "result300"
           )
       };
     }
@@ -5779,6 +5790,12 @@ export class TickHub extends DurableObject {
           summarizeSubset(
             directionRecords,
             "result120"
+          ),
+
+        expiry300:
+          summarizeSubset(
+            directionRecords,
+            "result300"
           )
       };
     }
@@ -5856,6 +5873,12 @@ export class TickHub extends DurableObject {
           summarizeSubset(
             sessionRecords,
             "result120"
+          ),
+
+        expiry300:
+          summarizeSubset(
+            sessionRecords,
+            "result300"
           )
       };
     }
@@ -5900,7 +5923,10 @@ export class TickHub extends DurableObject {
           rec.result60 || null,
 
         result120:
-          rec.result120 || null
+          rec.result120 || null,
+
+        result300:
+          rec.result300 || null
       });
 
       clusterMap.set(
@@ -6145,6 +6171,11 @@ export class TickHub extends DurableObject {
       expiry120:
         summarizeClusterPerformance(
           "result120"
+        ),
+
+      expiry300:
+        summarizeClusterPerformance(
+          "result300"
         )
     };
 
@@ -6169,6 +6200,12 @@ export class TickHub extends DurableObject {
         expiry120:
           summarizeClusterPerformance(
             "result120",
+            session
+          ),
+
+        expiry300:
+          summarizeClusterPerformance(
+            "result300",
             session
           )
       };
@@ -6195,7 +6232,16 @@ export class TickHub extends DurableObject {
               )
             );
 
-          return wl60 && wl120;
+          const wl300 =
+            setups.some(x =>
+              ["WIN", "LOSS"].includes(
+                String(
+                  x?.result300 || ""
+                ).toUpperCase()
+              )
+            );
+
+          return wl60 && wl120 && wl300;
         })
         .length;
 
@@ -6258,6 +6304,11 @@ export class TickHub extends DurableObject {
       expiry120:
         summarize(
           "result120"
+        ),
+
+      expiry300:
+        summarize(
+          "result300"
         ),
 
       byPair,
@@ -6339,12 +6390,16 @@ export class TickHub extends DurableObject {
       entryAt,
       expiry60At: entryAt + 60 * 1000,
       expiry120At: entryAt + 120 * 1000,
+      expiry300At: entryAt + 300 * 1000,
       result60: null,
       result120: null,
+      result300: null,
       exit60Price: null,
       exit120Price: null,
+      exit300Price: null,
       exit60TickAt: null,
       exit120TickAt: null,
+      exit300TickAt: null,
       features: body?.features || null,
       capturedAt: Date.now()
     };
@@ -6370,7 +6425,8 @@ export class TickHub extends DurableObject {
       entryPrice,
       entryAt,
       expiry60At: record.expiry60At,
-      expiry120At: record.expiry120At
+      expiry120At: record.expiry120At,
+      expiry300At: record.expiry300At
     };
   }
 
@@ -6522,294 +6578,93 @@ export class TickHub extends DurableObject {
       completed
     };
   }
-  async settleShortShadowV2(
-    now = Date.now()
-  ) {
-    const state =
-      this.shortShadowState;
-
-
-    if (
-      !state ||
-      !Array.isArray(state.pending) ||
-      !state.pending.length
-    ) {
-      return {
-        ok: true,
-        settled60: 0,
-        settled120: 0,
-        completed: 0
-      };
+  async settleShortShadowV2(now = Date.now()) {
+    const state = this.shortShadowState;
+    if (!state || !Array.isArray(state.pending) || !state.pending.length) {
+      return { ok: true, settled60: 0, settled120: 0, settled300: 0, completed: 0 };
     }
 
-
-    const resolveOutcome = (
-      direction,
-      entryPrice,
-      exitPrice
-    ) => {
-      const delta =
-        Number(exitPrice) -
-        Number(entryPrice);
-
-      if (
-        Math.abs(delta) <=
-        1e-12
-      ) {
-        return "DRAW";
-      }
-
-      const won =
-        direction === "CALL"
-          ? delta > 0
-          : delta < 0;
-
-      return won
-        ? "WIN"
-        : "LOSS";
+    const resolveOutcome = (direction, entryPrice, exitPrice) => {
+      const delta = Number(exitPrice) - Number(entryPrice);
+      if (Math.abs(delta) <= 1e-12) return "DRAW";
+      const won = direction === "CALL" ? delta > 0 : delta < 0;
+      return won ? "WIN" : "LOSS";
     };
-
-
-    // -------------------------------------------------
-    // Use persisted Tiingo S30 context only for pairs
-    // that actually have an expiry due.
-    // -------------------------------------------------
 
     const dueSymbols = [
       ...new Set(
         state.pending
-          .filter(rec =>
-            (
-              !rec.result60 &&
-              now >=
-              Number(
-                rec.expiry60At
-              )
-            ) ||
-            (
-              !rec.result120 &&
-              now >=
-              Number(
-                rec.expiry120At
-              )
-            )
-          )
-          .map(
-            rec =>
-              normalizeSymbol(
-                rec.symbol
-              )
-          )
+          .filter(rec => SHORT_SHADOW_EXPIRIES.some(seconds =>
+            !rec[`result${seconds}`] &&
+            now >= Number(rec[`expiry${seconds}At`] || 0)
+          ))
+          .map(rec => normalizeSymbol(rec.symbol))
           .filter(Boolean)
       )
     ];
 
-
-    const barsBySymbol =
-      new Map();
-
-
-    for (
-      const symbol
-      of dueSymbols
-    ) {
+    const barsBySymbol = new Map();
+    for (const symbol of dueSymbols) {
       try {
-        const bars =
-          await this.getTiingo30SecondBars(symbol, 80);
-
-        barsBySymbol.set(
-          symbol,
-          bars
-        );
+        barsBySymbol.set(symbol, await this.getTiingo30SecondBars(symbol, 80));
       } catch (_) {
-        // Do not fail the entire settlement pass
-        // because one pair's Tiingo S30 history is still warming.
+        // Keep this pair pending; one unavailable feed must not block others.
       }
     }
 
-
-    let settled60 = 0;
-    let settled120 = 0;
+    const settled = { 60: 0, 120: 0, 300: 0 };
     let completed = 0;
     let changed = false;
-
     const keep = [];
     const finished = [];
 
+    for (const original of state.pending) {
+      const rec = { ...original };
+      const bars = barsBySymbol.get(normalizeSymbol(rec.symbol)) || [];
 
-    for (
-      const original
-      of state.pending
-    ) {
-      const rec = {
-        ...original
-      };
+      for (const seconds of SHORT_SHADOW_EXPIRIES) {
+        const resultKey = `result${seconds}`;
+        const expiryKey = `expiry${seconds}At`;
+        const exitPriceKey = `exit${seconds}Price`;
+        const exitAtKey = `exit${seconds}TickAt`;
+        if (rec[resultKey] || now < Number(rec[expiryKey] || 0)) continue;
 
-      const symbol =
-        normalizeSymbol(
-          rec.symbol
-        );
-
-      const bars =
-        barsBySymbol.get(
-          symbol
-        ) || [];
-
-
-      // -------------------------------------------------
-      // 60-SECOND DIAGNOSTIC EXPIRY
-      // -------------------------------------------------
-
-      if (
-        !rec.result60 &&
-        now >=
-        Number(
-          rec.expiry60At
-        )
-      ) {
-        const settlement =
-          cruzS30SettlementPrice(
-            bars,
-            rec.expiry60At
-          );
-
-
+        const settlement = cruzS30SettlementPrice(bars, rec[expiryKey]);
         if (settlement) {
-          rec.exit60Price =
-            settlement.price;
-
-          rec.exit60TickAt =
-            settlement.candleCloseAt;
-
-          rec.result60 =
-            resolveOutcome(
-              rec.direction,
-              rec.entryPrice,
-              settlement.price
-            );
-
-          settled60++;
+          rec[exitPriceKey] = settlement.price;
+          rec[exitAtKey] = settlement.candleCloseAt;
+          rec[resultKey] = resolveOutcome(rec.direction, rec.entryPrice, settlement.price);
+          settled[seconds]++;
           changed = true;
-        } else if (
-          now -
-          Number(
-            rec.expiry60At
-          ) >=
-          15000
-        ) {
-          rec.result60 =
-            "VOID";
-
-          settled60++;
+        } else if (now - Number(rec[expiryKey]) >= 15000) {
+          rec[resultKey] = "VOID";
+          settled[seconds]++;
           changed = true;
         }
       }
 
-
-      // -------------------------------------------------
-      // 120-SECOND PRIMARY EXPIRY
-      // -------------------------------------------------
-
-      if (
-        !rec.result120 &&
-        now >=
-        Number(
-          rec.expiry120At
-        )
-      ) {
-        const settlement =
-          cruzS30SettlementPrice(
-            bars,
-            rec.expiry120At
-          );
-
-
-        if (settlement) {
-          rec.exit120Price =
-            settlement.price;
-
-          rec.exit120TickAt =
-            settlement.candleCloseAt;
-
-          rec.result120 =
-            resolveOutcome(
-              rec.direction,
-              rec.entryPrice,
-              settlement.price
-            );
-
-          settled120++;
-          changed = true;
-        } else if (
-          now -
-          Number(
-            rec.expiry120At
-          ) >=
-          15000
-        ) {
-          rec.result120 =
-            "VOID";
-
-          settled120++;
-          changed = true;
-        }
-      }
-
-
-      if (
-        rec.result60 &&
-        rec.result120
-      ) {
-        rec.completedAt =
-          now;
-
-        finished.push(
-          rec
-        );
-
+      if (SHORT_SHADOW_EXPIRIES.every(seconds => Boolean(rec[`result${seconds}`]))) {
+        rec.completedAt = now;
+        finished.push(rec);
         completed++;
         changed = true;
       } else {
-        keep.push(
-          rec
-        );
+        keep.push(rec);
       }
     }
 
-
-    state.pending =
-      keep;
-
-
-    if (
-      finished.length
-    ) {
-      state.history = [
-        ...finished,
-        ...(state.history || [])
-      ].slice(
-        0,
-        SHORT_SHADOW_MAX_HISTORY
-      );
+    state.pending = keep;
+    if (finished.length) {
+      state.history = [...finished, ...(state.history || [])].slice(0, SHORT_SHADOW_MAX_HISTORY);
     }
-
-
-    if (changed) {
-      await this.ctx.storage.put(
-        "shortShadowState",
-        state
-      );
-    }
-
+    if (changed) await this.ctx.storage.put("shortShadowState", state);
 
     return {
       ok: true,
-
-      settlementSource:
-        "tiingo-websocket-s30",
-
-      settled60,
-      settled120,
+      settlementSource: "tiingo-websocket-s30",
+      settled60: settled[60],
+      settled120: settled[120],
+      settled300: settled[300],
       completed
     };
   }
@@ -7027,7 +6882,7 @@ export class TickHub extends DurableObject {
             "30s",
 
           primaryExpirySeconds:
-            120,
+            300,
 
           expiryCandidates:
             candidate.expiryCandidates,
@@ -8326,6 +8181,11 @@ export default {
                 ? "n/a"
                 : Number(st.expiry120.winRate).toFixed(1) + "%";
 
+            const wr300 =
+              st.expiry300?.winRate == null
+                ? "n/a"
+                : Number(st.expiry300.winRate).toFixed(1) + "%";
+
             const formatBucket = bucket => {
               const b = bucket || {};
 
@@ -8365,7 +8225,8 @@ export default {
                   return (
                     `${symbol} — ` +
                     `60s ${formatBucket(row.expiry60)} | ` +
-                    `120s ${formatBucket(row.expiry120)}` +
+                    `120s ${formatBucket(row.expiry120)} | ` +
+                    `300s ${formatBucket(row.expiry300)}` +
                     `${Number(row.pending || 0) > 0
                       ? ` | P:${row.pending}`
                       : ""
@@ -8408,7 +8269,8 @@ export default {
                   return (
                     `${label}\n` +
                     `60s ${formatBucket(row.expiry60)} | ` +
-                    `120s ${formatBucket(row.expiry120)}` +
+                    `120s ${formatBucket(row.expiry120)} | ` +
+                    `300s ${formatBucket(row.expiry300)}` +
                     `${Number(row.pending || 0) > 0
                       ? ` | Pending: ${row.pending}`
                       : ""
@@ -8426,7 +8288,8 @@ export default {
                   return (
                     `${label}\n` +
                     `60s ${formatClusterBucket(row.expiry60)}\n` +
-                    `120s ${formatClusterBucket(row.expiry120)}`
+                    `120s ${formatClusterBucket(row.expiry120)}\n` +
+                    `300s ${formatClusterBucket(row.expiry300)}`
                   );
                 })
                 .join("\n");
@@ -8439,6 +8302,9 @@ export default {
 
             const adjusted120 =
               st.clusterAdjusted?.expiry120 || {};
+
+            const adjusted300 =
+              st.clusterAdjusted?.expiry300 || {};
 
 
             const adjustedWr60 =
@@ -8453,6 +8319,13 @@ export default {
                 ? "n/a"
                 : Number(
                   adjusted120.equalClusterWinRate
+                ).toFixed(1) + "%";
+
+            const adjustedWr300 =
+              adjusted300.equalClusterWinRate == null
+                ? "n/a"
+                : Number(
+                  adjusted300.equalClusterWinRate
                 ).toFixed(1) + "%";
 
             const pendingHealth =
@@ -8502,7 +8375,8 @@ export default {
               `Total: ${pendingHealth.total || 0}\n` +
               `Due 60s: ${pendingHealth.due60 || 0}\n` +
               `Due 120s: ${pendingHealth.due120 || 0}\n` +
-              `Overdue >15s: ${pendingHealth.overdue120 || 0}\n` +
+              `Due 300s: ${pendingHealth.due300 || 0}\n` +
+              `Overdue >15s: ${pendingHealth.overdue300 || 0}\n` +
               `Oldest age: ${oldestPendingAge}s\n\n` +
 
               `60 SECOND\n` +
@@ -8521,13 +8395,23 @@ export default {
               `Voids: ${st.expiry120?.voids || 0}\n` +
               `W/L win rate: ${wr120}\n\n` +
 
+              `300 SECOND (5 MINUTES)\n` +
+              `Settled: ${st.expiry300?.settled || 0}\n` +
+              `Wins: ${st.expiry300?.wins || 0}\n` +
+              `Losses: ${st.expiry300?.losses || 0}\n` +
+              `Draws: ${st.expiry300?.draws || 0}\n` +
+              `Voids: ${st.expiry300?.voids || 0}\n` +
+              `W/L win rate: ${wr300}\n\n` +
+
               `BY DIRECTION\n` +
               `CALL — 60s ${formatBucket(callStats.expiry60)} | ` +
               `120s ${formatBucket(callStats.expiry120)} | ` +
+              `300s ${formatBucket(callStats.expiry300)} | ` +
               `Pending: ${callStats.pending || 0}\n` +
 
               `PUT — 60s ${formatBucket(putStats.expiry60)} | ` +
               `120s ${formatBucket(putStats.expiry120)} | ` +
+              `300s ${formatBucket(putStats.expiry300)} | ` +
               `Pending: ${putStats.pending || 0}\n\n` +
 
               `BY UTC MARKET WINDOW\n` +
@@ -8557,6 +8441,12 @@ export default {
               `Winning: ${adjusted120.winningClusters || 0} | ` +
               `Losing: ${adjusted120.losingClusters || 0} | ` +
               `Tied: ${adjusted120.tiedClusters || 0}\n\n` +
+
+              `300s — ${adjustedWr300}\n` +
+              `Settled clusters: ${adjusted300.settledClusters || 0}\n` +
+              `Winning: ${adjusted300.winningClusters || 0} | ` +
+              `Losing: ${adjusted300.losingClusters || 0} | ` +
+              `Tied: ${adjusted300.tiedClusters || 0}\n\n` +
               `EVIDENCE PROGRESS\n` +
               `Scored independent clusters: ${evidence.settledClusters || 0}\n` +
               `Minimum target: ${evidence.minimumTarget || 50}\n` +
