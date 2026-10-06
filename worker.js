@@ -1,7 +1,7 @@
 // V13.9.2 — intrabar video-derived SuperTrend/MACD shadow collection
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.9.2-pocket-option-supertrend-macd-shadow";
+export const VERSION = "13.9.3-pocket-option-intrabar-settlement-fix";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -15,7 +15,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "CAD/JPY"
 ]);
 export const SHORT_SHADOW_ID =
-  "pocketoption-30s-supertrend-atr10-mult2-macd10-20-5-60-120-intrabar-shadow-v3";
+  "pocketoption-30s-supertrend-atr10-mult2-macd10-20-5-60-120-intrabar-shadow-v4";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
 export const VIDEO_SUPERTREND_MULTIPLIER = 2;
@@ -6876,27 +6876,6 @@ export class TickHub extends DurableObject {
       return won ? "WIN" : "LOSS";
     };
 
-    const dueSymbols = [
-      ...new Set(
-        state.pending
-          .filter(rec => SHORT_SHADOW_EXPIRIES.some(seconds =>
-            !rec[`result${seconds}`] &&
-            now >= Number(rec[`expiry${seconds}At`] || 0)
-          ))
-          .map(rec => normalizeSymbol(rec.symbol))
-          .filter(Boolean)
-      )
-    ];
-
-    const barsBySymbol = new Map();
-    for (const symbol of dueSymbols) {
-      try {
-        barsBySymbol.set(symbol, await this.getTiingo30SecondBars(symbol, 80));
-      } catch (_) {
-        // Keep this pair pending; one unavailable feed must not block others.
-      }
-    }
-
     const settled = { 60: 0, 120: 0, 300: 0 };
     let completed = 0;
     let changed = false;
@@ -6905,24 +6884,34 @@ export class TickHub extends DurableObject {
 
     for (const original of state.pending) {
       const rec = { ...original };
-      const bars = barsBySymbol.get(normalizeSymbol(rec.symbol)) || [];
+      const ticks = this.ticks.get(normalizeSymbol(rec.symbol)) || [];
 
       for (const seconds of SHORT_SHADOW_EXPIRIES) {
         const resultKey = `result${seconds}`;
         const expiryKey = `expiry${seconds}At`;
         const exitPriceKey = `exit${seconds}Price`;
         const exitAtKey = `exit${seconds}TickAt`;
-        if (rec[resultKey] || now < Number(rec[expiryKey] || 0)) continue;
+        const expiryAt = Number(rec[expiryKey]);
 
-        const settlement = cruzS30SettlementPrice(bars, rec[expiryKey]);
-        if (settlement) {
-          rec[exitPriceKey] = settlement.price;
-          rec[exitAtKey] = settlement.candleCloseAt;
-          rec[resultKey] = resolveOutcome(rec.direction, rec.entryPrice, settlement.price);
+        if (rec[resultKey] || !Number.isFinite(expiryAt) || now < expiryAt) continue;
+
+        // Intrabar entries occur at arbitrary millisecond times, so their
+        // 60s/120s expiries do not generally land on an S30 candle boundary.
+        // Settle against the first fresh Tiingo quote received at/after the
+        // exact expiry instant, matching the entry's receive-time clock.
+        const exitTick = ticks.find(t => Number(t.r || t.t) >= expiryAt);
+
+        if (exitTick && Number.isFinite(Number(exitTick.p))) {
+          rec[exitPriceKey] = Number(exitTick.p);
+          rec[exitAtKey] = Number(exitTick.r || exitTick.t);
+          rec[resultKey] = resolveOutcome(rec.direction, rec.entryPrice, exitTick.p);
           settled[seconds]++;
           changed = true;
-        } else if (now - Number(rec[expiryKey]) >= 15000) {
+        } else if (now - expiryAt >= 15000) {
           rec[resultKey] = "VOID";
+          rec[exitPriceKey] = null;
+          rec[exitAtKey] = null;
+          rec[`voidReason${seconds}`] = "no Tiingo quote received at/after expiry within 15s";
           settled[seconds]++;
           changed = true;
         }
@@ -6946,7 +6935,7 @@ export class TickHub extends DurableObject {
 
     return {
       ok: true,
-      settlementSource: "tiingo-websocket-s30",
+      settlementSource: "tiingo-websocket-quotes",
       settled60: settled[60],
       settled120: settled[120],
       settled300: settled[300],
