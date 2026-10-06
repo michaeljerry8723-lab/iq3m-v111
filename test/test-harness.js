@@ -3650,7 +3650,7 @@ console.log(
 
       shortShadowState: {
         strategyId:
-          "cruz-1m-ichimoku-dmi-shadow-v1",
+          "cruz-30s-aroon10-osma5-13-4-ema20-50-context-300s-shadow-v8",
 
         startedAt:
           start - 86400000,
@@ -3658,14 +3658,14 @@ console.log(
         pending: [
           {
             id:
-              "old-v1-pending"
+              "old-v8-pending"
           }
         ],
 
         history: [
           {
             id:
-              "old-v1-history"
+              "old-v8-history"
           }
         ]
       }
@@ -3698,7 +3698,7 @@ console.log(
   // -------------------------------------------------
 
   assert(
-    SHORT_SHADOW_ID === "cruz-30s-aroon10-osma5-13-4-ema20-50-context-300s-shadow-v8",
+    SHORT_SHADOW_ID === "cruz-30s-aroon10-osma5-13-4-ema20-50-context-300s-shadow-v9",
     "300-second shadow revision uses a distinct fresh dataset ID"
   );
 
