@@ -2032,10 +2032,10 @@ console.log(
 
   assert(
     callScore.aroon?.period === 10 &&
-    callScore.osma?.fastPeriod === 10 &&
-    callScore.osma?.slowPeriod === 20 &&
-    callScore.osma?.signalPeriod === 10,
-    "Cruz V2 CALL preserves Aroon(10) and OsMA(10,20,10) settings"
+    callScore.osma?.fastPeriod === 5 &&
+    callScore.osma?.slowPeriod === 13 &&
+    callScore.osma?.signalPeriod === 4,
+    "Cruz shadow CALL preserves Aroon(10) and OsMA(5,13,4) settings"
   );
 
 
@@ -3005,7 +3005,7 @@ console.log(
 
     assert(
       record.features?.model ===
-      "cruz-30s-aroon10-osma10-20-10" &&
+      "cruz-30s-aroon10-osma5-13-4" &&
       record.features?.dataSource ===
       "tiingo-websocket-s30" &&
       record.features?.timeframe ===
@@ -3015,12 +3015,12 @@ console.log(
       record.features?.aroon?.period ===
       10 &&
       record.features?.osma?.fastPeriod ===
-      10 &&
+      5 &&
       record.features?.osma?.slowPeriod ===
-      20 &&
+      13 &&
       record.features?.osma?.signalPeriod ===
-      10,
-      "Captured V2 record preserves exact 30s Aroon(10) and OsMA(10,20,10) configuration"
+      4,
+      "Captured V2 record preserves exact 30s Aroon(10) and OsMA(5,13,4) configuration"
     );
   } finally {
     Date.now =
@@ -3216,7 +3216,7 @@ console.log(
 
     assert(
       record.features?.model ===
-      "cruz-30s-aroon10-osma10-20-10" &&
+      "cruz-30s-aroon10-osma5-13-4" &&
       record.features?.dataSource ===
       "tiingo-websocket-s30" &&
       record.features?.timeframe ===
@@ -3226,12 +3226,12 @@ console.log(
       record.features?.aroon?.period ===
       10 &&
       record.features?.osma?.fastPeriod ===
-      10 &&
+      5 &&
       record.features?.osma?.slowPeriod ===
-      20 &&
+      13 &&
       record.features?.osma?.signalPeriod ===
-      10,
-      "Captured PUT record preserves exact V2 indicator configuration"
+      4,
+      "Captured PUT record preserves exact accelerated OsMA indicator configuration"
     );
   } finally {
     Date.now =
@@ -3422,7 +3422,7 @@ console.log(
 
           features: {
             model:
-              "cruz-30s-aroon10-osma10-20-10",
+              "cruz-30s-aroon10-osma5-13-4",
 
             dataSource:
               "tiingo-websocket-s30",
@@ -3698,7 +3698,7 @@ console.log(
   // -------------------------------------------------
 
   assert(
-    SHORT_SHADOW_ID === "cruz-30s-aroon10-osma10-20-10-ema20-50-context-300s-shadow-v7",
+    SHORT_SHADOW_ID === "cruz-30s-aroon10-osma5-13-4-ema20-50-context-300s-shadow-v8",
     "300-second shadow revision uses a distinct fresh dataset ID"
   );
 
@@ -3758,7 +3758,7 @@ console.log(
       SHORT_SHADOW_ID &&
       hub.shortShadowState.pending[0]
         ?.features?.model ===
-      "cruz-30s-aroon10-osma10-20-10" &&
+      "cruz-30s-aroon10-osma5-13-4" &&
       hub.shortShadowState.pending[0]
         ?.features?.dataSource ===
       "tiingo-websocket-s30",
