@@ -31,6 +31,7 @@ import {
   cruzAroonSnapshot,
   cruzOsmaSnapshot,
   scoreCruz30sAroonOsma,
+  scorePocketOption30sSuperTrendMacd,
   aggregateCruzFiveMinuteBars,
   cruzFiveMinuteEmaSnapshot,
   cruzS30SettlementPrice,
@@ -715,8 +716,8 @@ console.log(`Test 11: Short-expiry alarm scheduling`);
 
   const thirdAlarm = await storage.getAlarm();
   assert(
-    thirdAlarm >= now + 299000 && thirdAlarm <= now + 301000,
-    "After 120s settlement, alarm advances to 300s expiry"
+    thirdAlarm >= now + 250 && thirdAlarm <= now + 1500,
+    "Alarm schedules cleanup after the 120s shadow result settles"
   );
 
   hub.shortShadowState.pending = [];
@@ -1499,7 +1500,7 @@ console.log(
   assert(
     hub.shortShadowState.history[0].result60 === "VOID" &&
     hub.shortShadowState.history[0].result120 === "VOID" &&
-    hub.shortShadowState.history[0].result300 === "VOID",
+    hub.shortShadowState.history[0].result300 == null,
     "All overdue expiries settle VOID when no S30 settlement candle is available"
   );
 }
@@ -1596,7 +1597,7 @@ console.log(
     hub.shortShadowState.history.length === 1 &&
     hub.shortShadowState.history[0].result60 === "VOID" &&
     hub.shortShadowState.history[0].result120 === "VOID" &&
-    hub.shortShadowState.history[0].result300 === "VOID",
+    hub.shortShadowState.history[0].result300 == null,
     "Scheduler settlement endpoint moves overdue record to history as VOID"
   );
 }
@@ -2807,10 +2808,10 @@ console.log(
 console.log();
 
 // -----------------------------------------------------------------------------
-// Test 27: Cruz V2 evaluator captures deterministic Tiingo S30 CALL
+// Test 27: video-derived strategy captures Tiingo S30 CALL
 // -----------------------------------------------------------------------------
 console.log(
-  "Test 27: Cruz V2 evaluator captures Tiingo S30 CALL"
+  "Test 27: Video strategy captures Tiingo S30 CALL"
 );
 
 {
@@ -2850,52 +2851,23 @@ console.log(
 
 
   const bars30 = [];
-
-  for (let i = 0; i < 32; i++) {
-    bars30.push(
-      makeBar(i)
-    );
+  let priorClose = 1.1000;
+  for (let i = 0; i < 31; i++) {
+    const close = priorClose - 0.00002;
+    bars30.push(makeBar(i, {
+      open: priorClose,
+      high: priorClose + 0.0001,
+      low: close - 0.0001,
+      close
+    }));
+    priorClose = close;
   }
-
-
-  // Old Aroon high.
-  bars30[20] =
-    makeBar(
-      20,
-      {
-        open: 1.1000,
-        high: 1.1100,
-        low: 1.0995,
-        close: 1.1000
-      }
-    );
-
-
-  // Fresh low makes Aroon-Down dominant.
-  bars30[30] =
-    makeBar(
-      30,
-      {
-        open: 1.1000,
-        high: 1.1005,
-        low: 1.0990,
-        close: 1.1000
-      }
-    );
-
-
-  // Fresh bullish breakout:
-  // Aroon-Up crossover + bullish OsMA transition.
-  bars30[31] =
-    makeBar(
-      31,
-      {
-        open: 1.1000,
-        high: 1.1120,
-        low: 1.1005,
-        close: 1.1015
-      }
-    );
+  bars30.push(makeBar(31, {
+    open: priorClose - 0.0005,
+    high: priorClose + 0.0011,
+    low: priorClose - 0.0006,
+    close: priorClose + 0.0010
+  }));
 
 
   const expectedEntryAt =
@@ -2931,13 +2903,6 @@ console.log(
 
     await ctx.waitForInit();
 
-    let contextDirection = "PUT";
-    hub.getCruzFiveMinuteTrend = () => ({
-      ready: true, timeframe: "5m", bars: 100, requiredBars: 100,
-      fastPeriod: 20, slowPeriod: 50, emaFast: 1.099, emaSlow: 1.100,
-      direction: contextDirection
-    });
-
     // Use deterministic completed Tiingo S30 bars without a provider call.
     hub.getTiingo30SecondBars = (
       symbol,
@@ -2946,25 +2911,13 @@ console.log(
       assert(
         symbol === "EUR/USD" &&
         count === 80,
-        "Cruz V2 evaluator reads 80 persisted Tiingo S30 bars"
+        "video strategy reads persisted Tiingo S30 bars"
       );
 
       return bars30;
     };
 
 
-    const filtered =
-      await hub.evaluateShortShadowV2("EUR/USD");
-
-    assert(
-      filtered.ok === false &&
-      filtered.captured === false &&
-      /trend disagrees/i.test(filtered.reason) &&
-      hub.shortShadowState.pending.length === 0,
-      "5-minute EMA(20/50) blocks a CALL against a bearish trend"
-    );
-
-    contextDirection = "CALL";
     const result =
       await hub.evaluateShortShadowV2("EUR/USD");
 
@@ -2972,13 +2925,13 @@ console.log(
       result.ok === true &&
       result.captured === true &&
       result.direction === "CALL",
-      "Cruz V2 evaluator captures aligned Aroon/OsMA CALL"
+      "Video strategy captures aligned SuperTrend/MACD CALL"
     );
 
 
     assert(
       hub.shortShadowState.pending.length === 1,
-      "Cruz V2 captured setup enters the pending settlement queue"
+      "Video strategy setup enters the pending settlement queue"
     );
 
 
@@ -2993,34 +2946,23 @@ console.log(
       ) &&
       record.entryAt ===
       expectedEntryAt &&
-      record.expiry120At ===
-      expectedEntryAt +
-      120000 &&
-      record.expiry300At ===
-      expectedEntryAt +
-      300000,
-      "Cruz V2 captures 120-second diagnostic and 300-second primary expiries"
+      record.expiry60At === expectedEntryAt + 60000 &&
+      record.expiry120At === expectedEntryAt + 120000,
+      "Video strategy captures 60- and 120-second shadow expiries"
     );
 
 
     assert(
-      record.features?.model ===
-      "cruz-30s-aroon10-osma5-13-4" &&
-      record.features?.dataSource ===
-      "tiingo-websocket-s30" &&
-      record.features?.timeframe ===
-      "30s" &&
-      record.features?.primaryExpirySeconds ===
-      300 &&
-      record.features?.aroon?.period ===
-      10 &&
-      record.features?.osma?.fastPeriod ===
-      5 &&
-      record.features?.osma?.slowPeriod ===
-      13 &&
-      record.features?.osma?.signalPeriod ===
-      4,
-      "Captured V2 record preserves exact 30s Aroon(10) and OsMA(5,13,4) configuration"
+      record.features?.model === "video-30s-supertrend10x2-macd10-20-5" &&
+      record.features?.dataSource === "tiingo-websocket-s30" &&
+      record.features?.timeframe === "30s" &&
+      record.features?.primaryExpirySeconds === 60 &&
+      record.features?.supertrend?.period === 10 &&
+      record.features?.supertrend?.multiplier === 2 &&
+      record.features?.macd?.fastPeriod === 10 &&
+      record.features?.macd?.slowPeriod === 20 &&
+      record.features?.macd?.signalPeriod === 5,
+      "Captured record preserves video-derived 30s SuperTrend(10,2) and MACD(10,20,5)"
     );
   } finally {
     Date.now =
@@ -3074,52 +3016,23 @@ console.log(
 
 
   const bars30 = [];
-
-  for (let i = 0; i < 32; i++) {
-    bars30.push(
-      makeBar(i)
-    );
+  let priorClose = 1.1000;
+  for (let i = 0; i < 50; i++) {
+    const close = priorClose - 0.00002;
+    bars30.push(makeBar(i, {
+      open: priorClose,
+      high: priorClose + 0.0001,
+      low: close - 0.0001,
+      close
+    }));
+    priorClose = close;
   }
-
-
-  // Old Aroon low.
-  bars30[20] =
-    makeBar(
-      20,
-      {
-        open: 1.1000,
-        high: 1.1005,
-        low: 1.0900,
-        close: 1.1000
-      }
-    );
-
-
-  // Fresh high makes Aroon-Up dominant.
-  bars30[30] =
-    makeBar(
-      30,
-      {
-        open: 1.1000,
-        high: 1.1010,
-        low: 1.0995,
-        close: 1.1000
-      }
-    );
-
-
-  // Fresh bearish breakdown:
-  // Aroon-Down crossover + bearish OsMA transition.
-  bars30[31] =
-    makeBar(
-      31,
-      {
-        open: 1.1000,
-        high: 1.0995,
-        low: 1.0880,
-        close: 1.0985
-      }
-    );
+  bars30.push(makeBar(50, {
+    open: priorClose - 0.0010,
+    high: priorClose - 0.0009,
+    low: priorClose - 0.0021,
+    close: priorClose - 0.0020
+  }));
 
 
   const expectedEntryAt =
@@ -3166,7 +3079,7 @@ console.log(
       assert(
         symbol === "GBP/USD" &&
         count === 80,
-        "Cruz V2 PUT evaluator reads 80 persisted Tiingo S30 bars"
+        "Video strategy PUT evaluator reads persisted Tiingo S30 bars"
       );
 
       return bars30;
@@ -3183,13 +3096,13 @@ console.log(
       result.ok === true &&
       result.captured === true &&
       result.direction === "PUT",
-      "Cruz V2 evaluator captures aligned Aroon/OsMA PUT"
+      "Video strategy captures aligned SuperTrend/MACD PUT"
     );
 
 
     assert(
       hub.shortShadowState.pending.length === 1,
-      "Cruz V2 PUT setup enters the pending settlement queue"
+      "Video strategy PUT setup enters the pending settlement queue"
     );
 
 
@@ -3204,34 +3117,23 @@ console.log(
       ) &&
       record.entryAt ===
       expectedEntryAt &&
-      record.expiry120At ===
-      expectedEntryAt +
-      120000 &&
-      record.expiry300At ===
-      expectedEntryAt +
-      300000,
-      "Cruz V2 PUT captures 120-second diagnostic and 300-second primary expiries"
+      record.expiry60At === expectedEntryAt + 60000 &&
+      record.expiry120At === expectedEntryAt + 120000,
+      "Video strategy PUT captures 60- and 120-second shadow expiries"
     );
 
 
     assert(
-      record.features?.model ===
-      "cruz-30s-aroon10-osma5-13-4" &&
-      record.features?.dataSource ===
-      "tiingo-websocket-s30" &&
-      record.features?.timeframe ===
-      "30s" &&
-      record.features?.primaryExpirySeconds ===
-      300 &&
-      record.features?.aroon?.period ===
-      10 &&
-      record.features?.osma?.fastPeriod ===
-      5 &&
-      record.features?.osma?.slowPeriod ===
-      13 &&
-      record.features?.osma?.signalPeriod ===
-      4,
-      "Captured PUT record preserves exact accelerated OsMA indicator configuration"
+      record.features?.model === "video-30s-supertrend10x2-macd10-20-5" &&
+      record.features?.dataSource === "tiingo-websocket-s30" &&
+      record.features?.timeframe === "30s" &&
+      record.features?.primaryExpirySeconds === 60 &&
+      record.features?.supertrend?.period === 10 &&
+      record.features?.supertrend?.multiplier === 2 &&
+      record.features?.macd?.fastPeriod === 10 &&
+      record.features?.macd?.slowPeriod === 20 &&
+      record.features?.macd?.signalPeriod === 5,
+      "Captured PUT record preserves SuperTrend(10,2) and MACD(10,20,5)"
     );
   } finally {
     Date.now =
@@ -3480,9 +3382,9 @@ console.log(
     assert(
       settled.settled60 === 1 &&
       settled.settled120 === 1 &&
-      settled.settled300 === 1 &&
+      settled.settled300 === 0 &&
       settled.completed === 1,
-      "Both 60s diagnostic and 120s primary expiries settle in one pass"
+      "The 60s and 120s video-strategy outcomes settle without a 300s result"
     );
 
 
@@ -3506,10 +3408,8 @@ console.log(
       record.exit120Price === 1.0990 &&
       record.exit120TickAt ===
       expiry120At &&
-      record.result300 === "LOSS" &&
-      record.exit300Price === 1.0980 &&
-      record.exit300TickAt === expiry300At,
-      "Cruz V2 scores the exact 60s, 120s, and 300s S30 closes"
+      record.result300 == null,
+      "Video strategy records exact 60s and 120s S30 closes only"
     );
   } finally {
     Date.now =
@@ -3523,7 +3423,7 @@ console.log();
 // Test 30: Production short-shadow routes switch cleanly from V1 to V2
 // -----------------------------------------------------------------------------
 console.log(
-  "Test 30: Cruz V2 production route switch"
+  "Test 30: Video strategy production route switch"
 );
 
 {
@@ -3563,50 +3463,25 @@ console.log(
 
 
   // -------------------------------------------------
-  // Build deterministic V2 CALL signal
-  // -------------------------------------------------
-
+  // Build deterministic video-derived CALL signal.
   const signalBars = [];
-
-  for (let i = 0; i < 32; i++) {
-    signalBars.push(
-      makeBar(i)
-    );
+  let priorClose = 1.1000;
+  for (let i = 0; i < 31; i++) {
+    const close = priorClose - 0.00002;
+    signalBars.push(makeBar(i, {
+      open: priorClose,
+      high: priorClose + 0.0001,
+      low: close - 0.0001,
+      close
+    }));
+    priorClose = close;
   }
-
-
-  signalBars[20] =
-    makeBar(
-      20,
-      {
-        high: 1.1100,
-        low: 1.0995,
-        close: 1.1000
-      }
-    );
-
-
-  signalBars[30] =
-    makeBar(
-      30,
-      {
-        high: 1.1005,
-        low: 1.0990,
-        close: 1.1000
-      }
-    );
-
-
-  signalBars[31] =
-    makeBar(
-      31,
-      {
-        open: 1.1000,
-        high: 1.1120,
-        low: 1.1005,
-        close: 1.1015
-      }
-    );
+  signalBars.push(makeBar(31, {
+    open: priorClose - 0.0005,
+    high: priorClose + 0.0011,
+    low: priorClose - 0.0006,
+    close: priorClose + 0.0010
+  }));
 
 
   const entryAt =
@@ -3650,7 +3525,7 @@ console.log(
 
       shortShadowState: {
         strategyId:
-          "cruz-30s-aroon10-osma5-13-4-ema20-50-context-300s-shadow-v8",
+          "cruz-30s-aroon10-osma5-13-4-ema20-50-context-300s-shadow-v9",
 
         startedAt:
           start - 86400000,
@@ -3698,7 +3573,7 @@ console.log(
   // -------------------------------------------------
 
   assert(
-    SHORT_SHADOW_ID === "cruz-30s-aroon10-osma5-13-4-ema20-50-context-300s-shadow-v9",
+    SHORT_SHADOW_ID === "pocketoption-30s-supertrend-atr10-mult2-macd10-20-5-60-120-shadow-v1",
     "300-second shadow revision uses a distinct fresh dataset ID"
   );
 
@@ -3709,7 +3584,7 @@ console.log(
     0 &&
     hub.shortShadowState.history.length ===
     0,
-    "Changing to Cruz V2 strategy ID starts a completely fresh short-shadow dataset"
+    "Changing strategy ID starts a completely fresh shadow dataset"
   );
 
 
@@ -3758,7 +3633,7 @@ console.log(
       SHORT_SHADOW_ID &&
       hub.shortShadowState.pending[0]
         ?.features?.model ===
-      "cruz-30s-aroon10-osma5-13-4" &&
+      "video-30s-supertrend10x2-macd10-20-5" &&
       hub.shortShadowState.pending[0]
         ?.features?.dataSource ===
       "tiingo-websocket-s30",
@@ -3811,7 +3686,7 @@ console.log(
           open: 1.1010,
           high: 1.1011,
           low: 1.1000,
-          close: 1.1005
+          close: 1.1000
         }
       ),
 
@@ -3878,12 +3753,9 @@ console.log(
       record.exit60Price ===
       1.1020 &&
       record.result120 === "LOSS" &&
-      record.exit120Price ===
-      1.1005 &&
-      record.result300 === "LOSS" &&
-      record.exit300Price === 1.0995 &&
-      record.expiry300At === expiry300At,
-      "Production V2 route scores exact 60s, 120s, and 300s S30 outcomes"
+      record.exit120Price === 1.1000 &&
+      record.result300 == null,
+      "Production route scores exact 60s and 120s S30 outcomes"
     );
 
   } finally {
