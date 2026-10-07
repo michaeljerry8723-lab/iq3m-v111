@@ -8893,6 +8893,7 @@ export default {
         }
         if (/^\/shortdiag$/i.test(text)) {
           try {
+            await hub(env, "/prime-otc?ms=5000");
             const rows = [];
             let websocketConnected = null;
             let source = "otcharts-pocket-option-otc-s30";
