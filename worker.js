@@ -1,7 +1,7 @@
-// V13.9.6 — quote-to-quote intrabar MACD crossover entry
+// V13.9.7 — first live quote where SuperTrend and MACD states align
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.9.6-pocket-option-tick-cross-entry";
+export const VERSION = "13.9.7-pocket-option-dual-indicator-alignment";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -15,7 +15,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "CAD/JPY"
 ]);
 export const SHORT_SHADOW_ID =
-  "pocketoption-30s-supertrend-atr10-mult2-macd10-20-5-60-120-intrabar-shadow-v7";
+  "pocketoption-30s-supertrend10x2-macd10-20-5-60-120-alignment-shadow-v8";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
 export const VIDEO_SUPERTREND_MULTIPLIER = 2;
@@ -1077,9 +1077,9 @@ export function scorePocketOption30sSuperTrendMacd(bars30, previousLiveMacd = nu
     close > open ? "CALL" :
     close < open ? "PUT" : "NEUTRAL";
 
-  // Video entry: SuperTrend supplies direction; the MACD main/signal
-  // crossover is detected between consecutive live quote snapshots of the
-  // forming S30 candle. No candle close is needed.
+  // Video entry: capture on the first live quote where SuperTrend direction
+  // and MACD main/signal state agree. The indicators may align on separate
+  // quote updates; do not wait for the S30 candle to close.
   const lineBelowPrice =
     supertrend.line < supertrend.close;
   const lineAbovePrice =
@@ -1087,17 +1087,16 @@ export function scorePocketOption30sSuperTrendMacd(bars30, previousLiveMacd = nu
   const call =
     supertrend.direction === "CALL" &&
     lineBelowPrice &&
-    macd.crossUp;
+    macd.bullish;
   const put =
     supertrend.direction === "PUT" &&
     lineAbovePrice &&
-    macd.crossDown;
+    macd.bearish;
 
   if (!call && !put) {
-    let reason = "SuperTrend direction and MACD crossover are not aligned";
-    if (!macd.crossUp && !macd.crossDown) reason = "no quote-to-quote MACD(10,20,5) line crossover in the active 30-second candle";
-    else if (macd.crossUp && (supertrend.direction !== "CALL" || !lineBelowPrice)) reason = "bullish MACD crossover lacks a green SuperTrend line below price";
-    else if (macd.crossDown && (supertrend.direction !== "PUT" || !lineAbovePrice)) reason = "bearish MACD crossover lacks a red SuperTrend line above price";
+    let reason = "SuperTrend direction and MACD line state are not aligned";
+    if (supertrend.direction === "CALL" && lineBelowPrice && !macd.bullish) reason = "green SuperTrend is below price but MACD main line is not above signal";
+    else if (supertrend.direction === "PUT" && lineAbovePrice && !macd.bearish) reason = "red SuperTrend is above price but MACD main line is not below signal";
     return {
       ok: false,
       reason,
@@ -1127,12 +1126,12 @@ export function scorePocketOption30sSuperTrendMacd(bars30, previousLiveMacd = nu
     ok: true,
     strategyId: SHORT_SHADOW_ID,
     patternRevision:
-      "Video-derived reconstruction: on a 30-second chart, CALL when the SuperTrend line is green/below price and MACD(10,20,5) main line crosses above signal between consecutive live quote readings; PUT when SuperTrend is red/above price and MACD main line crosses below signal between consecutive live quote readings. Capture on the crossover without waiting for candle close or adding a candle-colour filter. This reconstructs the video entry conditions; the video uses one-minute expiry, while the bot shadows 60s and 120s.",
+      "Video-derived reconstruction: on a 30-second chart, CALL when the SuperTrend line is green/below price and MACD(10,20,5) main line is above signal; PUT when SuperTrend is red/above price and MACD main line is below signal. Capture on the first live quote where both states align, even if the indicators align on separate updates; do not wait for candle close or add a candle-colour filter. The bot shadows 60s and 120s.",
     direction,
     trigger:
       direction === "CALL"
-        ? "Green SuperTrend line below price; MACD main line crossed above signal intrabar"
-        : "Red SuperTrend line above price; MACD main line crossed below signal intrabar",
+        ? "Green SuperTrend line below price and MACD main line above signal; first live quote of aligned state"
+        : "Red SuperTrend line above price and MACD main line below signal; first live quote of aligned state",
     timeframe: "30s",
     expiryCandidates: [60, 120],
     supertrend: {
@@ -1156,8 +1155,8 @@ export function scorePocketOption30sSuperTrendMacd(bars30, previousLiveMacd = nu
     candleDirection,
     reasons: [
       direction === "CALL"
-        ? "SuperTrend bullish with a fresh upward MACD line/signal crossover"
-        : "SuperTrend bearish with a fresh downward MACD line/signal crossover"
+        ? "SuperTrend bullish with MACD main line above signal"
+        : "SuperTrend bearish with MACD main line below signal"
     ]
   };
 }
@@ -3385,6 +3384,7 @@ export class TickHub extends DurableObject {
     this.lastStatus = "starting"; this.lastSubscribeStatus = null; this.connecting = false; this.cryptoConnecting = false; this.provider = "tiingo"; this.lastCryptoStatus = "starting"; this.lastCryptoSubscribeStatus = null; this.lastCryptoWsMessageAt = 0;
     this.lastWsMessageAt = 0; this.lastWsQuoteAt = 0; this.lastPriceReceivedAt = 0; this.lastConnectAt = 0; this.reconnectCount = 0; this.oneMinuteCache = new Map(); this.oneMinuteCacheDirty = false; this.quotaBlockedUntil = 0; this.pendingSignals = []; this.signalStats = { total: 0, wins: 0, losses: 0, draws: 0, voids: 0 }; this.signalHistory = []; this.forwardStats = null; this.alertChats = []; this.setupStates = {}; this.readyAlertClaims = {}; this.readyAudit = [];
     this.current30sBars = new Map(); this.completed30sBars = new Map(); this.completedFiveMinuteBars = new Map(); this.lastFinalized30sBucket = new Map(); this.s30Dirty = false;
+    this.videoAlignedDirection = new Map();
 
     this.shortShadowState = {
       strategyId: SHORT_SHADOW_ID,
@@ -7022,7 +7022,19 @@ export class TickHub extends DurableObject {
 
     const candidate = scorePocketOption30sSuperTrendMacd(bars30, previousLiveMacd);
     if (!candidate.ok) {
+      this.videoAlignedDirection.set(symbol, null);
       return { ...candidate, symbol, captured: false };
+    }
+
+    const priorAlignedDirection = this.videoAlignedDirection.get(symbol) || null;
+    this.videoAlignedDirection.set(symbol, candidate.direction);
+    if (priorAlignedDirection === candidate.direction) {
+      return {
+        ...candidate,
+        symbol,
+        captured: false,
+        reason: "both indicators remain aligned; this alignment was already recorded"
+      };
     }
 
     // The current candle is still forming. Use the live quote that caused
@@ -7036,6 +7048,7 @@ export class TickHub extends DurableObject {
       !Number.isFinite(entryAt) ||
       !Number.isFinite(signalBarOpenAt)
     ) {
+      this.videoAlignedDirection.set(symbol, null);
       return {
         ok: false,
         symbol,
