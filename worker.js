@@ -1,7 +1,7 @@
 // V13.9.7 — first live quote where SuperTrend and MACD states align
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.9.8-pocket-option-v9-fresh-collection";
+export const VERSION = "13.10.0-pocket-option-otc-shadow-v10";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -14,8 +14,9 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "AUD/JPY",
   "CAD/JPY"
 ]);
-export const SHORT_SHADOW_ID =
-  "pocketoption-30s-supertrend10x2-macd10-20-5-60-120-alignment-shadow-v9";
+export const OTC_SHADOW_UNIVERSE = Object.freeze(["EUR/USD","GBP/USD","USD/JPY","AUD/USD","USD/CAD"]);
+export const OTC_SHADOW_VENDOR_SYMBOLS = Object.freeze({"EUR/USD":"EURUSD_otc","GBP/USD":"GBPUSD_otc","USD/JPY":"USDJPY_otc","AUD/USD":"AUDUSD_otc","USD/CAD":"USDCAD_otc"});
+export const SHORT_SHADOW_ID = "pocketoption-30s-supertrend10x2-macd10-20-5-60-120-otc-shadow-v10";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
 export const VIDEO_SUPERTREND_MULTIPLIER = 2;
@@ -3385,6 +3386,10 @@ export class TickHub extends DurableObject {
     this.lastWsMessageAt = 0; this.lastWsQuoteAt = 0; this.lastPriceReceivedAt = 0; this.lastConnectAt = 0; this.reconnectCount = 0; this.oneMinuteCache = new Map(); this.oneMinuteCacheDirty = false; this.quotaBlockedUntil = 0; this.pendingSignals = []; this.signalStats = { total: 0, wins: 0, losses: 0, draws: 0, voids: 0 }; this.signalHistory = []; this.forwardStats = null; this.alertChats = []; this.setupStates = {}; this.readyAlertClaims = {}; this.readyAudit = [];
     this.current30sBars = new Map(); this.completed30sBars = new Map(); this.completedFiveMinuteBars = new Map(); this.lastFinalized30sBucket = new Map(); this.s30Dirty = false;
     this.videoAlignedDirection = new Map();
+    this.otcTicks = new Map(); this.otcCurrent30sBars = new Map(); this.otcCompleted30sBars = new Map();
+    this.otcLastFinalized30sBucket = new Map(); this.otcS30Dirty = false;
+    this.otcConnecting = false; this.otcStreamActive = false; this.otcAbortController = null; this.otcStreamStatus = "not_started";
+    this.otcReconnectCount = 0; this.otcLastEventAt = 0; this.otcLastQuoteAt = 0;
 
     this.shortShadowState = {
       strategyId: SHORT_SHADOW_ID,
@@ -3510,6 +3515,21 @@ export class TickHub extends DurableObject {
       const persistedContext = (await this.ctx.storage.get("oneMinuteCacheData")) || {};
       for (const [symbol, value] of Object.entries(persistedContext)) {
         if (value && Array.isArray(value.bars)) this.oneMinuteCache.set(symbol, value);
+      }
+
+      const otcState = (await this.ctx.storage.get("otcS30State")) || {};
+      for (const symbol of OTC_SHADOW_UNIVERSE) {
+        const bars = Array.isArray(otcState.completed?.[symbol]) ? otcState.completed[symbol]
+          .filter(b => Number.isFinite(Number(b?.t)) && [b?.o,b?.h,b?.l,b?.c].every(v => Number.isFinite(Number(v))))
+          .map(b => ({t:Number(b.t),o:Number(b.o),h:Number(b.h),l:Number(b.l),c:Number(b.c),n:Number(b.n||0)}))
+          .sort((a,b)=>a.t-b.t).slice(-160) : [];
+        if (bars.length) this.otcCompleted30sBars.set(symbol,bars);
+        const cur=otcState.current?.[symbol];
+        if (cur && Number.isFinite(Number(cur.t)) && [cur.o,cur.h,cur.l,cur.c].every(v=>Number.isFinite(Number(v))))
+          this.otcCurrent30sBars.set(symbol,{t:Number(cur.t),o:Number(cur.o),h:Number(cur.h),l:Number(cur.l),c:Number(cur.c),n:Number(cur.n||0)});
+        const finalized=Number(otcState.lastFinalized?.[symbol]);
+        if(Number.isFinite(finalized))this.otcLastFinalized30sBucket.set(symbol,finalized);
+        else if(bars.length)this.otcLastFinalized30sBucket.set(symbol,bars.at(-1).t);
       }
 
       // Restore persisted Tiingo-native 30-second OHLC history.
@@ -3852,6 +3872,7 @@ export class TickHub extends DurableObject {
     }
 
     this.finalizeTiingo30SecondBars(Date.now());
+    this.finalizeOtc30SecondBars(Date.now());
 
     if (this.oneMinuteCacheDirty) {
       try {
@@ -3867,6 +3888,10 @@ export class TickHub extends DurableObject {
       } catch (e) {
         this.lastStatus = `S30 persist error: ${String(e?.message || e)}`;
       }
+    }
+    if (this.otcS30Dirty) {
+      try { await this.persistOtc30SecondState(); }
+      catch (e) { this.otcStreamStatus = String(e?.message || e); }
     }
 
     // Crypto is not part of the current universe, so it can still sleep.
@@ -4062,6 +4087,182 @@ export class TickHub extends DurableObject {
     this.cryptoConnecting = false;
     await sleep(150);
     await this.ensureCryptoSocket(true);
+  }
+
+  async ensureOtcStream() {
+    const key = String(this.env.OTCHARTS_API_KEY || "").trim();
+    if (!key) { this.otcStreamStatus = "missing OTCHARTS_API_KEY"; return false; }
+    if (this.otcStreamActive && Date.now() - Number(this.otcLastEventAt || 0) > 90000) {
+      try { this.otcAbortController?.abort(); } catch (_) { }
+      this.otcStreamActive = false;
+      this.otcStreamStatus = "stale_stream_reconnecting";
+    }
+    if (this.otcStreamActive || this.otcConnecting) return true;
+    this.otcConnecting = true;
+    this.ctx.waitUntil(this.consumeOtcStream(key));
+    return true;
+  }
+
+  async consumeOtcStream(key) {
+    let reader = null;
+    let reconnectAfterEnd = false;
+    const controller = new AbortController();
+    this.otcAbortController = controller;
+    try {
+      const url = new URL("https://otcharts.com/v1/stream");
+      url.searchParams.set("venue", "otc");
+      url.searchParams.set("symbol", OTC_SHADOW_UNIVERSE.map(s => OTC_SHADOW_VENDOR_SYMBOLS[s]).join(","));
+      const response = await fetch(url.toString(), {
+        headers: { authorization: "Bearer " + key, accept: "text/event-stream" },
+        signal: controller.signal
+      });
+      if (!response.ok || !response.body) {
+        const detail = (await response.text().catch(() => "")).slice(0, 200);
+        throw new Error("OTCharts stream refused (" + response.status + ") " + detail);
+      }
+      this.otcConnecting = false;
+      this.otcStreamActive = true;
+      this.otcStreamStatus = "connected";
+      this.otcReconnectCount++;
+      reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const part = await reader.read();
+        if (part.done) { reconnectAfterEnd = true; break; }
+        buffer += decoder.decode(part.value, { stream: true });
+        const events = buffer.split(/\r?\n\r?\n/);
+        buffer = events.pop() || "";
+        for (const raw of events) {
+          const data = raw.split(/\r?\n/).filter(x => x.startsWith("data:"))
+            .map(x => x.slice(5).trimStart()).join("\n");
+          this.otcLastEventAt = Date.now();
+          if (!data) continue;
+          let event;
+          try { event = JSON.parse(data); } catch (_) { continue; }
+          if (Array.isArray(event.symbols)) { this.otcStreamStatus = "connected"; continue; }
+          const symbol = Object.keys(OTC_SHADOW_VENDOR_SYMBOLS)
+            .find(pair => OTC_SHADOW_VENDOR_SYMBOLS[pair] === String(event.symbol || ""));
+          const time = tsMs(event.time) - 2 * 60 * 60 * 1000;
+          const price = Number(event.price);
+          if (symbol && Number.isFinite(time) && Number.isFinite(price) && price > 0) {
+            this.pushOtcTick(symbol, time, price);
+          }
+        }
+      }
+      this.otcStreamStatus = "stream_ended";
+    } catch (e) {
+      this.otcStreamStatus = String(e?.message || e).slice(0, 280);
+    } finally {
+      try { reader?.releaseLock(); } catch (_) { }
+      if (this.otcAbortController === controller) {
+        this.otcConnecting = false;
+        this.otcStreamActive = false;
+        this.otcAbortController = null;
+        if (reconnectAfterEnd && String(this.env.OTCHARTS_API_KEY || "").trim()) {
+          this.ctx.waitUntil(sleep(1500).then(() => this.ensureOtcStream()));
+        }
+      }
+      this.finalizeOtc30SecondBars(Date.now());
+      if (this.otcS30Dirty) {
+        try { await this.persistOtc30SecondState(); } catch (_) { }
+      }
+    }
+  }
+
+  pushOtcTick(symbol, time, price) {
+    if (!OTC_SHADOW_UNIVERSE.includes(symbol) || !Number.isFinite(time) || !Number.isFinite(price)) return false;
+    const ticks = this.otcTicks.get(symbol) || [];
+    const last = ticks.at(-1);
+    if (last && time < Number(last.t)) return false;
+    const receivedAt = Date.now();
+    ticks.push({ t: time, p: price, r: receivedAt, bid: null, ask: null });
+    while (ticks.length && Number(ticks[0].r) < receivedAt - 600000) ticks.shift();
+    if (ticks.length > 20000) ticks.splice(0, ticks.length - 20000);
+    this.otcTicks.set(symbol, ticks);
+    this.otcLastQuoteAt = receivedAt;
+    this.updateOtc30SecondCandle(symbol, time, price);
+    return true;
+  }
+
+  commitOtc30SecondBar(symbol, raw) {
+    const bar = { t:Number(raw?.t), o:Number(raw?.o), h:Number(raw?.h), l:Number(raw?.l), c:Number(raw?.c), n:Number(raw?.n||0) };
+    if (!OTC_SHADOW_UNIVERSE.includes(symbol) || !Number.isFinite(bar.t) ||
+        ![bar.o,bar.h,bar.l,bar.c].every(Number.isFinite)) return false;
+    const history = this.otcCompleted30sBars.get(symbol) || [];
+    const last = history.at(-1);
+    if (last && last.t === bar.t) history[history.length-1] = bar;
+    else if (!last || bar.t > last.t) history.push(bar);
+    else return false;
+    if (history.length > 160) history.splice(0,history.length-160);
+    this.otcCompleted30sBars.set(symbol,history);
+    this.otcLastFinalized30sBucket.set(symbol,bar.t);
+    this.otcS30Dirty = true;
+    return true;
+  }
+
+  updateOtc30SecondCandle(symbol, timestamp, price) {
+    const t=Number(timestamp), p=Number(price);
+    if (!OTC_SHADOW_UNIVERSE.includes(symbol) || !Number.isFinite(t) || !Number.isFinite(p)) return false;
+    const bucket=Math.floor(t/30000)*30000;
+    const finalized=Number(this.otcLastFinalized30sBucket.get(symbol));
+    if(Number.isFinite(finalized)&&bucket<=finalized)return false;
+    const current=this.otcCurrent30sBars.get(symbol);
+    if(!current){this.otcCurrent30sBars.set(symbol,{t:bucket,o:p,h:p,l:p,c:p,n:1});this.otcS30Dirty=true;return true;}
+    if(Number(current.t)===bucket){current.h=Math.max(current.h,p);current.l=Math.min(current.l,p);current.c=p;current.n=Number(current.n||0)+1;this.otcS30Dirty=true;return true;}
+    if(bucket>Number(current.t)){this.commitOtc30SecondBar(symbol,current);this.otcCurrent30sBars.set(symbol,{t:bucket,o:p,h:p,l:p,c:p,n:1});this.otcS30Dirty=true;return true;}
+    return false;
+  }
+
+  finalizeOtc30SecondBars(now=Date.now()) {
+    let changed=false;
+    for(const [symbol,current] of this.otcCurrent30sBars.entries()){
+      if(current&&Number(current.t)+30000<=Number(now)){changed=this.commitOtc30SecondBar(symbol,current)||changed;this.otcCurrent30sBars.delete(symbol);}
+    }
+    return changed;
+  }
+
+  async persistOtc30SecondState() {
+    this.finalizeOtc30SecondBars(Date.now());
+    const completed={},current={},lastFinalized={};
+    for(const symbol of OTC_SHADOW_UNIVERSE){
+      completed[symbol]=(this.otcCompleted30sBars.get(symbol)||[]).slice(-160);
+      const active=this.otcCurrent30sBars.get(symbol);if(active)current[symbol]={...active};
+      const finalized=Number(this.otcLastFinalized30sBucket.get(symbol));if(Number.isFinite(finalized))lastFinalized[symbol]=finalized;
+    }
+    await this.ctx.storage.put("otcS30State",{version:1,source:"otcharts-pocket-option-otc-s30",updatedAt:Date.now(),completed,current,lastFinalized});
+    this.otcS30Dirty=false;
+  }
+
+  getOtc30SecondBars(symbol,count=80,includeActive=false) {
+    if(!OTC_SHADOW_UNIVERSE.includes(symbol))throw new Error("invalid Pocket Option OTC symbol");
+    this.finalizeOtc30SecondBars(Date.now());
+    const bars=(this.otcCompleted30sBars.get(symbol)||[]).slice(-Math.max(40,Math.min(160,Number(count)||80))).map(b=>({...b}));
+    if(bars.length<32)throw new Error("Pocket Option OTC S30 warm-up in progress ("+bars.length+"/32 candles)");
+    const closeAt=Number(bars.at(-1)?.t)+30000,age=Date.now()-closeAt;
+    if(!Number.isFinite(closeAt)||age< -5000||age>45000)throw new Error("Pocket Option OTC S30 candle is stale");
+    for(let i=bars.length-31;i<bars.length;i++)if(Number(bars[i]?.t)-Number(bars[i-1]?.t)!==30000)throw new Error("Pocket Option OTC S30 history has a gap");
+    if(includeActive){
+      const active=this.otcCurrent30sBars.get(symbol);
+      const last=bars.at(-1);
+      if(active&&last&&Number(active.t)===Number(last.t)+30000)bars.push({...active});
+    }
+    return bars;
+  }
+
+  async primeOtcFlow(ms=5000) {
+    const before=this.otcLastQuoteAt;
+    await this.ensureOtcStream();
+    await sleep(Math.max(2000,Math.min(8000,Number(ms)||5000)));
+    return {ok:Boolean(String(this.env.OTCHARTS_API_KEY||"").trim()),provider:"otcharts-pocket-option-otc",streamStatus:this.otcStreamStatus,streamActive:this.otcStreamActive,quoteReceived:this.otcLastQuoteAt>before,lastQuoteAgeSeconds:this.otcLastQuoteAt?Math.max(0,(Date.now()-this.otcLastQuoteAt)/1000):null,reconnectCount:this.otcReconnectCount,symbols:OTC_SHADOW_UNIVERSE};
+  }
+
+  async otcStatus(symbol) {
+    this.finalizeOtc30SecondBars(Date.now());
+    if(this.otcS30Dirty)await this.persistOtc30SecondState();
+    const pairs=symbol&&OTC_SHADOW_UNIVERSE.includes(symbol)?[symbol]:OTC_SHADOW_UNIVERSE;
+    const rows=pairs.map(pair=>{const bars=this.otcCompleted30sBars.get(pair)||[],q=(this.otcTicks.get(pair)||[]).at(-1);return {symbol:pair,ready:bars.length>=32&&Boolean(q&&Date.now()-Number(q.r||0)<=10000),completedBars:bars.length,currentBarTicks:Number(this.otcCurrent30sBars.get(pair)?.n||0),quoteAgeSeconds:q?Math.max(0,(Date.now()-Number(q.r||0))/1000):null};});
+    return {ok:Boolean(String(this.env.OTCHARTS_API_KEY||"").trim()),provider:"otcharts-pocket-option-otc",apiKeyConfigured:Boolean(String(this.env.OTCHARTS_API_KEY||"").trim()),streamActive:this.otcStreamActive,streamStatus:this.otcStreamStatus,lastQuoteAgeSeconds:this.otcLastQuoteAt?Math.max(0,(Date.now()-this.otcLastQuoteAt)/1000):null,reconnectCount:this.otcReconnectCount,rows};
   }
 
   async ensureSocket(force = false) {
@@ -6905,7 +7106,7 @@ export class TickHub extends DurableObject {
 
     for (const original of state.pending) {
       const rec = { ...original };
-      const ticks = this.ticks.get(normalizeSymbol(rec.symbol)) || [];
+      const ticks = this.otcTicks.get(normalizeSymbol(rec.symbol)) || [];
 
       for (const seconds of SHORT_SHADOW_EXPIRIES) {
         const resultKey = `result${seconds}`;
@@ -6918,7 +7119,7 @@ export class TickHub extends DurableObject {
 
         // Intrabar entries occur at arbitrary millisecond times, so their
         // 60s/120s expiries do not generally land on an S30 candle boundary.
-        // Settle against the first fresh Tiingo quote received at/after the
+        // Settle against the first fresh Pocket Option OTC quote received at/after the
         // exact expiry instant, matching the entry's receive-time clock.
         const exitTick = ticks.find(t => Number(t.r || t.t) >= expiryAt);
 
@@ -6932,7 +7133,7 @@ export class TickHub extends DurableObject {
           rec[resultKey] = "VOID";
           rec[exitPriceKey] = null;
           rec[exitAtKey] = null;
-          rec[`voidReason${seconds}`] = "no Tiingo quote received at/after expiry within 15s";
+          rec[`voidReason${seconds}`] = "no Pocket Option OTC quote received at/after expiry within 15s";
           settled[seconds]++;
           changed = true;
         }
@@ -6956,7 +7157,7 @@ export class TickHub extends DurableObject {
 
     return {
       ok: true,
-      settlementSource: "tiingo-websocket-quotes",
+      settlementSource: "otcharts-pocket-option-otc-live-quotes",
       settled60: settled[60],
       settled120: settled[120],
       settled300: settled[300],
@@ -6973,7 +7174,8 @@ export class TickHub extends DurableObject {
       };
     }
 
-    const ticks = this.ticks.get(symbol) || [];
+    if (!OTC_SHADOW_UNIVERSE.includes(symbol)) return {ok:false,error:"symbol is not enabled in Pocket Option OTC shadow universe"};
+    const ticks = this.otcTicks.get(symbol) || [];
     const quote = ticks.at(-1);
     const quoteReceivedAt = Number(quote?.r || 0);
     const now = Date.now();
@@ -6993,18 +7195,18 @@ export class TickHub extends DurableObject {
 
     let bars30;
     try {
-      bars30 = this.getTiingo30SecondBars(symbol, 80, true);
+      bars30 = this.getOtc30SecondBars(symbol, 80, true);
     } catch (e) {
       return {
         ok: false,
         symbol,
         captured: false,
-        reason: `Video strategy Tiingo S30 context unavailable: ${String(e?.message || e)}`
+        reason: `Video strategy Pocket Option OTC S30 context unavailable: ${String(e?.message || e)}`
       };
     }
 
     const signalBar = bars30.at(-1);
-    const activeBar = this.current30sBars.get(symbol);
+    const activeBar = this.otcCurrent30sBars.get(symbol);
     const quoteBucket = Math.floor(Number(quote.t) / 30000) * 30000;
 
     if (
@@ -7069,7 +7271,7 @@ export class TickHub extends DurableObject {
       sourceKey,
       features: {
         model: "video-30s-supertrend10x2-macd10-20-5-intrabar",
-        dataSource: "tiingo-websocket-s30",
+        dataSource: "otcharts-pocket-option-otc-s30",
         timeframe: "30s",
         entryMode: "intrabar-indicator-confirmation",
         signalBarOpenAt,
@@ -7094,7 +7296,7 @@ export class TickHub extends DurableObject {
       entryAt,
       signalBarOpenAt,
       entryMode: "intrabar-indicator-confirmation",
-      dataSource: "tiingo-websocket-s30"
+      dataSource: "otcharts-pocket-option-otc-s30"
     };
   }
 
@@ -7444,7 +7646,7 @@ export class TickHub extends DurableObject {
 
     // CRUZ V2 — 30s Aroon(10) + OsMA(10,20,10)
     if (u.pathname === "/short-shadow") {
-      if (!symbol) {
+      if (!symbol || !OTC_SHADOW_UNIVERSE.includes(symbol)) {
         return json(
           {
             ok: false,
@@ -7477,29 +7679,21 @@ export class TickHub extends DurableObject {
           "EUR/USD"
         );
 
-      if (!checkSymbol || !SHORT_SHADOW_UNIVERSE.includes(checkSymbol)) {
+      if (!checkSymbol || !OTC_SHADOW_UNIVERSE.includes(checkSymbol)) {
         return json({
           ok: false,
           ready: false,
           symbol: checkSymbol,
-          dataSource: "tiingo-websocket-s30",
+          dataSource: "otcharts-pocket-option-otc-s30",
           error: "invalid S30 symbol"
         }, 400);
       }
 
       try {
-        this.finalizeTiingo30SecondBars(Date.now());
-
-        if (this.s30Dirty) {
-          await this.persistTiingo30SecondState();
-        }
-
-        const bars =
-          (this.completed30sBars.get(checkSymbol) || [])
-            .slice(-80);
-
-        const current =
-          this.current30sBars.get(checkSymbol) || null;
+        this.finalizeOtc30SecondBars(Date.now());
+        if (this.otcS30Dirty) await this.persistOtc30SecondState();
+        const bars = (this.otcCompleted30sBars.get(checkSymbol) || []).slice(-80);
+        const current = this.otcCurrent30sBars.get(checkSymbol) || null;
 
         const last =
           bars.at(-1) || null;
@@ -7515,9 +7709,8 @@ export class TickHub extends DurableObject {
           ready,
           warming: !ready,
           symbol: checkSymbol,
-          dataSource: "tiingo-websocket-s30",
-          websocketConnected:
-            Boolean(this.ws && this.ws.readyState === 1),
+          dataSource: "otcharts-pocket-option-otc-s30",
+          websocketConnected: Boolean(this.otcStreamActive),
           completedBars: bars.length,
           requiredBars: 32,
           remainingBars,
@@ -7568,7 +7761,7 @@ export class TickHub extends DurableObject {
           ok: false,
           ready: false,
           symbol: checkSymbol,
-          dataSource: "tiingo-websocket-s30",
+          dataSource: "otcharts-pocket-option-otc-s30",
           error:
             String(
               e?.message || e
@@ -7605,6 +7798,11 @@ export class TickHub extends DurableObject {
       const ms = Math.max(2000, Math.min(8000, Number(u.searchParams.get("ms") || 5000)));
       return json(await this.primeLiveFlow(ms));
     }
+    if (u.pathname === "/prime-otc") {
+      const ms = Math.max(2000, Math.min(8000, Number(u.searchParams.get("ms") || 5000)));
+      return json(await this.primeOtcFlow(ms));
+    }
+    if (u.pathname === "/otc-status") return json(await this.otcStatus(symbol));
     if (u.pathname === "/top-health") return json(await this.getTopHealth());
     if (u.pathname === "/risk") return json(this.getRiskGate());
     if (u.pathname === "/register-chat" && req.method === "POST") return json(await this.registerAlertChat(req));
@@ -7902,7 +8100,7 @@ async function scanShortShadowUniverse(env) {
   const checked = [];
   const captured = [];
 
-  for (const symbol of SHORT_SHADOW_UNIVERSE) {
+  for (const symbol of OTC_SHADOW_UNIVERSE) {
     try {
       const result = await hub(
         env,
@@ -7952,12 +8150,8 @@ async function autoScanShortShadow(env) {
       "/settle-short-shadow"
     );
 
-    // Briefly obtain fresh live quotes for
-    // entry-price and settlement support.
-    await hub(
-      env,
-      "/prime-live?ms=5000"
-    );
+    // Start the Pocket Option OTC quote stream before scanning.
+    await hub(env, "/prime-otc?ms=5000");
 
     const shortShadow =
       await scanShortShadowUniverse(
@@ -8006,6 +8200,7 @@ async function autoScanAndAlert(env) {
       "/settle-short-shadow"
     );
     await hub(env, "/prime-live?ms=5000");
+    await hub(env, "/prime-otc?ms=5000");
 
     // -------------------------------------------------
     // SHORT-EXPIRY SHADOW
@@ -8506,6 +8701,8 @@ export default {
 
               `SHORT-EXPIRY SHADOW\n` +
               `Strategy: ${st.strategyId}\n` +
+              `Market data: Pocket Option OTC (OTCharts)\n` +
+              `Pairs: ${OTC_SHADOW_UNIVERSE.join(", ")}\n` +
               `Pending setups: ${st.pending || 0}\n\n` +
 
               `PENDING HEALTH\n` +
@@ -8698,7 +8895,7 @@ export default {
           try {
             const rows = [];
             let websocketConnected = null;
-            let source = "tiingo-websocket-s30";
+            let source = "otcharts-pocket-option-otc-s30";
             let readyCount = 0;
             let lastWsMessageAge = null;
             let lastWsQuoteAge = null;
@@ -8707,7 +8904,7 @@ export default {
             let websocketStatus = null;
             let subscribeStatus = null;
 
-            for (const pair of SHORT_SHADOW_UNIVERSE) {
+            for (const pair of OTC_SHADOW_UNIVERSE) {
               try {
                 const r =
                   await hub(
@@ -8802,7 +8999,7 @@ export default {
             }
 
             const totalPairs =
-              SHORT_SHADOW_UNIVERSE.length;
+              OTC_SHADOW_UNIVERSE.length;
 
             const readyAll =
               readyCount === totalPairs;
@@ -8810,17 +9007,17 @@ export default {
             await tgSend(
               env,
               chatId,
-              `CRUZ V2 S30 DATA CHECK\n` +
+              `POCKET OPTION OTC S30 DATA CHECK\n` +
               `Strategy: ${SHORT_SHADOW_ID}\n` +
               `Pairs: ${totalPairs}\n` +
               `Ready: ${readyCount}/${totalPairs}\n` +
-              `WebSocket: ${websocketConnected ? "CONNECTED" : "RECONNECTING"}\n` +
-              `Last WS message: ${lastWsMessageAge == null ? "n/a" : lastWsMessageAge.toFixed(1) + "s ago"}\n` +
-              `Last WS quote: ${lastWsQuoteAge == null ? "n/a" : lastWsQuoteAge.toFixed(1) + "s ago"}\n` +
-              `Last received price: ${lastPriceReceivedAge == null ? "n/a" : lastPriceReceivedAge.toFixed(1) + "s ago"}\n` +
+              `OTC stream: ${websocketConnected ? "CONNECTED" : "RECONNECTING"}\n` +
+              `Last OTC event: ${lastWsMessageAge == null ? "n/a" : lastWsMessageAge.toFixed(1) + "s ago"}\n` +
+              `Last OTC quote: ${lastWsQuoteAge == null ? "n/a" : lastWsQuoteAge.toFixed(1) + "s ago"}\n` +
+              `Last received OTC price: ${lastPriceReceivedAge == null ? "n/a" : lastPriceReceivedAge.toFixed(1) + "s ago"}\n` +
               `Reconnects: ${reconnectCount == null ? "n/a" : reconnectCount}\n` +
-              `WS status: ${websocketStatus || "n/a"}\n` +
-              `Subscription: ${subscribeStatus || "n/a"}\n` +
+              `SSE status: ${websocketStatus || "n/a"}\n` +
+              `Feed subscription: ${subscribeStatus || "n/a"}\n` +
               `Source: ${source}\n\n` +
               rows.join("\n") +
               `\n\n` +
@@ -8867,7 +9064,7 @@ export default {
             `Tiingo REST quota: ${quota}\n\n` +
 
             `SHORT-EXPIRY SHADOW\n` +
-            `Pairs checked last scan: ${Number(r.shortShadowChecked || 0)}/${SHORT_SHADOW_UNIVERSE.length}\n` +
+            `OTC pairs checked last scan: ${Number(r.shortShadowChecked || 0)}/${OTC_SHADOW_UNIVERSE.length}\n` +
             `Setups captured last scan: ${Number(r.shortShadowCaptured || 0)}\n` +
             `Captured pairs: ${Array.isArray(r.shortShadowSymbols) &&
               r.shortShadowSymbols.length
