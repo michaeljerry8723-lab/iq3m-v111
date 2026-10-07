@@ -1,7 +1,7 @@
-// V13.9.5 — video SuperTrend direction + live MACD crossover entry
+// V13.9.6 — quote-to-quote intrabar MACD crossover entry
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.9.5-pocket-option-video-cross-entry";
+export const VERSION = "13.9.6-pocket-option-tick-cross-entry";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -15,7 +15,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "CAD/JPY"
 ]);
 export const SHORT_SHADOW_ID =
-  "pocketoption-30s-supertrend-atr10-mult2-macd10-20-5-60-120-intrabar-shadow-v6";
+  "pocketoption-30s-supertrend-atr10-mult2-macd10-20-5-60-120-intrabar-shadow-v7";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
 export const VIDEO_SUPERTREND_MULTIPLIER = 2;
@@ -988,7 +988,8 @@ function videoMacdSnapshot(
   bars,
   fastPeriod = VIDEO_MACD_FAST_PERIOD,
   slowPeriod = VIDEO_MACD_SLOW_PERIOD,
-  signalPeriod = VIDEO_MACD_SIGNAL_PERIOD
+  signalPeriod = VIDEO_MACD_SIGNAL_PERIOD,
+  previousLive = null
 ) {
   const fast = Math.max(2, Math.floor(Number(fastPeriod) || 10));
   const slow = Math.max(fast + 1, Math.floor(Number(slowPeriod) || 20));
@@ -1020,6 +1021,10 @@ function videoMacdSnapshot(
     return { ready: false, fastPeriod: fast, slowPeriod: slow, signalPeriod: signal };
   }
 
+  const priorLiveMacd = Number(previousLive?.macd);
+  const priorLiveSignal = Number(previousLive?.signal);
+  const hasPriorLive = Number.isFinite(priorLiveMacd) && Number.isFinite(priorLiveSignal);
+
   return {
     ready: true,
     fastPeriod: fast,
@@ -1027,16 +1032,16 @@ function videoMacdSnapshot(
     signalPeriod: signal,
     macd: macd[i],
     signal: signalLine[i],
-    previousMacd: macd[prior],
-    previousSignal: signalLine[prior],
-    crossUp: macd[prior] <= signalLine[prior] && macd[i] > signalLine[i],
-    crossDown: macd[prior] >= signalLine[prior] && macd[i] < signalLine[i],
+    previousMacd: hasPriorLive ? priorLiveMacd : macd[prior],
+    previousSignal: hasPriorLive ? priorLiveSignal : signalLine[prior],
+    crossUp: hasPriorLive && priorLiveMacd <= priorLiveSignal && macd[i] > signalLine[i],
+    crossDown: hasPriorLive && priorLiveMacd >= priorLiveSignal && macd[i] < signalLine[i],
     bullish: macd[i] > signalLine[i],
     bearish: macd[i] < signalLine[i]
   };
 }
 
-export function scorePocketOption30sSuperTrendMacd(bars30) {
+export function scorePocketOption30sSuperTrendMacd(bars30, previousLiveMacd = null) {
   if (!Array.isArray(bars30) || bars30.length < 32) {
     return {
       ok: false,
@@ -1054,7 +1059,8 @@ export function scorePocketOption30sSuperTrendMacd(bars30) {
     bars30,
     VIDEO_MACD_FAST_PERIOD,
     VIDEO_MACD_SLOW_PERIOD,
-    VIDEO_MACD_SIGNAL_PERIOD
+    VIDEO_MACD_SIGNAL_PERIOD,
+    previousLiveMacd
   );
   if (!supertrend.ready || !macd.ready) {
     return { ok: false, reason: "SuperTrend/MACD indicator context is not ready" };
@@ -1071,10 +1077,9 @@ export function scorePocketOption30sSuperTrendMacd(bars30) {
     close > open ? "CALL" :
     close < open ? "PUT" : "NEUTRAL";
 
-  // Video entry: SuperTrend supplies directional context; the MACD main
-  // line crossing its signal line is the confirming trigger. Evaluate the
-  // still-forming S30 bar on each live quote, and enter without waiting for
-  // the candle to close.
+  // Video entry: SuperTrend supplies direction; the MACD main/signal
+  // crossover is detected between consecutive live quote snapshots of the
+  // forming S30 candle. No candle close is needed.
   const lineBelowPrice =
     supertrend.line < supertrend.close;
   const lineAbovePrice =
@@ -1090,7 +1095,7 @@ export function scorePocketOption30sSuperTrendMacd(bars30) {
 
   if (!call && !put) {
     let reason = "SuperTrend direction and MACD crossover are not aligned";
-    if (!macd.crossUp && !macd.crossDown) reason = "no fresh MACD(10,20,5) line crossover in the active 30-second candle";
+    if (!macd.crossUp && !macd.crossDown) reason = "no quote-to-quote MACD(10,20,5) line crossover in the active 30-second candle";
     else if (macd.crossUp && (supertrend.direction !== "CALL" || !lineBelowPrice)) reason = "bullish MACD crossover lacks a green SuperTrend line below price";
     else if (macd.crossDown && (supertrend.direction !== "PUT" || !lineAbovePrice)) reason = "bearish MACD crossover lacks a red SuperTrend line above price";
     return {
@@ -1122,7 +1127,7 @@ export function scorePocketOption30sSuperTrendMacd(bars30) {
     ok: true,
     strategyId: SHORT_SHADOW_ID,
     patternRevision:
-      "Video-derived reconstruction: on a 30-second chart, CALL when the SuperTrend line is green/below price and MACD(10,20,5) main line crosses above signal; PUT when SuperTrend is red/above price and MACD main line crosses below signal. Evaluate the active candle on live quotes and capture at the crossover without waiting for candle close or adding a candle-colour filter. This reconstructs the video entry conditions; the video uses one-minute expiry, while the bot shadows 60s and 120s.",
+      "Video-derived reconstruction: on a 30-second chart, CALL when the SuperTrend line is green/below price and MACD(10,20,5) main line crosses above signal between consecutive live quote readings; PUT when SuperTrend is red/above price and MACD main line crosses below signal between consecutive live quote readings. Capture on the crossover without waiting for candle close or adding a candle-colour filter. This reconstructs the video entry conditions; the video uses one-minute expiry, while the bot shadows 60s and 120s.",
     direction,
     trigger:
       direction === "CALL"
@@ -4199,6 +4204,11 @@ export class TickHub extends DurableObject {
       this.lastWsQuoteAt = Date.now();
       this.lastStatus = "ok";
       this.pushTick(symbol, t, p, bid, ask);
+      let previousLiveMacd = null;
+      try {
+        const previousBars30 = this.getTiingo30SecondBars(symbol, 80, true);
+        previousLiveMacd = videoMacdSnapshot(previousBars30);
+      } catch (_) { }
       const candleUpdated =
         this.updateTiingo30SecondCandle(symbol, t, p);
 
@@ -4209,7 +4219,7 @@ export class TickHub extends DurableObject {
         (this.completed30sBars.get(symbol) || []).length >= 32
       ) {
         this.ctx.waitUntil(
-          this.evaluateShortShadowV2(symbol).catch(e => {
+          this.evaluateShortShadowV2(symbol, previousLiveMacd).catch(e => {
             console.error(
               "intrabar short-shadow evaluation failed",
               symbol,
@@ -6952,7 +6962,7 @@ export class TickHub extends DurableObject {
       completed
     };
   }
-  async evaluateShortShadowV2(symbol) {
+  async evaluateShortShadowV2(symbol, previousLiveMacd = null) {
     symbol = normalizeSymbol(symbol);
 
     if (!symbol || !SHORT_SHADOW_UNIVERSE.includes(symbol)) {
@@ -7010,7 +7020,7 @@ export class TickHub extends DurableObject {
       };
     }
 
-    const candidate = scorePocketOption30sSuperTrendMacd(bars30);
+    const candidate = scorePocketOption30sSuperTrendMacd(bars30, previousLiveMacd);
     if (!candidate.ok) {
       return { ...candidate, symbol, captured: false };
     }
