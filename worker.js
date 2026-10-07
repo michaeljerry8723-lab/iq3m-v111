@@ -4191,15 +4191,36 @@ export class TickHub extends DurableObject {
     const before=this.otcLastQuoteAt;
     await this.ensureOtcStream();
     await sleep(Math.max(2000,Math.min(8000,Number(ms)||5000)));
-    return {ok:Boolean(String(this.env.OTCHARTS_API_KEY||"").trim()),provider:"otcharts-pocket-option-otc",streamStatus:this.otcStreamStatus,streamActive:this.otcStreamActive,quoteReceived:this.otcLastQuoteAt>before,lastQuoteAgeSeconds:this.otcLastQuoteAt?Math.max(0,(Date.now()-this.otcLastQuoteAt)/1000):null,reconnectCount:this.otcReconnectCount,symbols:OTC_SHADOW_UNIVERSE};
+    await this.ensureOtcStream();
+    return {
+      ok:Boolean(this.otcStreamActive),
+      provider:"pocketoption-community-library-otc",
+      feedSecretConfigured:Boolean(String(this.env.POCKETOPTION_FEED_SECRET||"").trim()),
+      streamStatus:this.otcStreamStatus,
+      streamActive:this.otcStreamActive,
+      quoteReceived:this.otcLastQuoteAt>before,
+      lastQuoteAgeSeconds:this.otcLastQuoteAt?Math.max(0,(Date.now()-this.otcLastQuoteAt)/1000):null,
+      reconnectCount:this.otcReconnectCount,
+      symbols:OTC_SHADOW_UNIVERSE
+    };
   }
 
   async otcStatus(symbol) {
+    await this.ensureOtcStream();
     this.finalizeOtc30SecondBars(Date.now());
     if(this.otcS30Dirty)await this.persistOtc30SecondState();
     const pairs=symbol&&OTC_SHADOW_UNIVERSE.includes(symbol)?[symbol]:OTC_SHADOW_UNIVERSE;
     const rows=pairs.map(pair=>{const bars=this.otcCompleted30sBars.get(pair)||[],q=(this.otcTicks.get(pair)||[]).at(-1);return {symbol:pair,ready:bars.length>=32&&Boolean(q&&Date.now()-Number(q.r||0)<=10000),completedBars:bars.length,currentBarTicks:Number(this.otcCurrent30sBars.get(pair)?.n||0),quoteAgeSeconds:q?Math.max(0,(Date.now()-Number(q.r||0))/1000):null};});
-    return {ok:Boolean(String(this.env.OTCHARTS_API_KEY||"").trim()),provider:"otcharts-pocket-option-otc",apiKeyConfigured:Boolean(String(this.env.OTCHARTS_API_KEY||"").trim()),streamActive:this.otcStreamActive,streamStatus:this.otcStreamStatus,lastQuoteAgeSeconds:this.otcLastQuoteAt?Math.max(0,(Date.now()-this.otcLastQuoteAt)/1000):null,reconnectCount:this.otcReconnectCount,rows};
+    return {
+      ok:Boolean(this.otcStreamActive),
+      provider:"pocketoption-community-library-otc",
+      feedSecretConfigured:Boolean(String(this.env.POCKETOPTION_FEED_SECRET||"").trim()),
+      streamActive:this.otcStreamActive,
+      streamStatus:this.otcStreamStatus,
+      lastQuoteAgeSeconds:this.otcLastQuoteAt?Math.max(0,(Date.now()-this.otcLastQuoteAt)/1000):null,
+      reconnectCount:this.otcReconnectCount,
+      rows
+    };
   }
 
   async ensureSocket(force = false) {
@@ -7710,34 +7731,25 @@ export class TickHub extends DurableObject {
               ? Number(last.t) + 30000
               : null,
           lastWsMessageAgeSeconds:
-            this.lastWsMessageAt
-              ? Math.max(
-                0,
-                (Date.now() - this.lastWsMessageAt) / 1000
-              )
+            this.otcLastEventAt
+              ? Math.max(0, (Date.now() - this.otcLastEventAt) / 1000)
               : null,
           lastWsQuoteAgeSeconds:
-            this.lastWsQuoteAt
-              ? Math.max(
-                0,
-                (Date.now() - this.lastWsQuoteAt) / 1000
-              )
+            this.otcLastQuoteAt
+              ? Math.max(0, (Date.now() - this.otcLastQuoteAt) / 1000)
               : null,
           lastPriceReceivedAgeSeconds:
-            this.lastPriceReceivedAt
-              ? Math.max(
-                0,
-                (Date.now() - this.lastPriceReceivedAt) / 1000
-              )
+            this.otcLastQuoteAt
+              ? Math.max(0, (Date.now() - this.otcLastQuoteAt) / 1000)
               : null,
           reconnectCount:
-            Number(this.reconnectCount || 0),
+            Number(this.otcReconnectCount || 0),
           websocketStatus:
-            this.lastStatus || null,
+            this.otcStreamStatus || null,
           subscribeStatus:
-            this.lastSubscribeStatus?.response?.message ||
-            this.lastSubscribeStatus?.status ||
-            null
+            String(this.env.POCKETOPTION_FEED_SECRET || "").trim()
+              ? "community library bridge configured"
+              : "missing POCKETOPTION_FEED_SECRET"
         });
       } catch (e) {
         return json({
