@@ -1,0 +1,2 @@
+git+https://github.com/chema-creator/PocketOptionApi.git@main
+requests>=2.31,<3
