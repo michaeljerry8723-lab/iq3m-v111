@@ -1,7 +1,7 @@
 // V13.9.7 — first live quote where SuperTrend and MACD states align
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.9.7-pocket-option-dual-indicator-alignment";
+export const VERSION = "13.9.8-pocket-option-v9-fresh-collection";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -15,7 +15,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
   "CAD/JPY"
 ]);
 export const SHORT_SHADOW_ID =
-  "pocketoption-30s-supertrend10x2-macd10-20-5-60-120-alignment-shadow-v8";
+  "pocketoption-30s-supertrend10x2-macd10-20-5-60-120-alignment-shadow-v9";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
 export const VIDEO_SUPERTREND_MULTIPLIER = 2;
@@ -3405,55 +3405,56 @@ export class TickHub extends DurableObject {
 
     this.ctx.blockConcurrencyWhile(async () => {
 
+      // Keep short-expiry collections independent from blocker-stat schema.
+      // A strategy-ID change archives the prior collection and starts a fresh one.
+      const storedShortShadow =
+        await this.ctx.storage.get("shortShadowState");
+
+      if (
+        storedShortShadow?.strategyId === SHORT_SHADOW_ID
+      ) {
+        this.shortShadowState = {
+          strategyId: SHORT_SHADOW_ID,
+          startedAt:
+            Number(storedShortShadow.startedAt) || Date.now(),
+          pending: Array.isArray(storedShortShadow.pending)
+            ? storedShortShadow.pending
+            : [],
+          history: Array.isArray(storedShortShadow.history)
+            ? storedShortShadow.history
+            : []
+        };
+      } else {
+        if (
+          storedShortShadow?.strategyId &&
+          Array.isArray(storedShortShadow.pending) &&
+          Array.isArray(storedShortShadow.history)
+        ) {
+          await this.ctx.storage.put(
+            `shortShadowArchive:${storedShortShadow.strategyId}`,
+            storedShortShadow
+          );
+        }
+
+        this.shortShadowState = {
+          strategyId: SHORT_SHADOW_ID,
+          startedAt: Date.now(),
+          pending: [],
+          history: []
+        };
+
+        await this.ctx.storage.put(
+          "shortShadowState",
+          this.shortShadowState
+        );
+      }
+
       const storedBlockers = await this.ctx.storage.get("blockerStats");
 
       if (
         storedBlockers?.strategyId === STRATEGY_ID &&
         storedBlockers?.classifierVersion === BLOCKER_CLASSIFIER_VERSION
       ) {
-        const storedShortShadow =
-          await this.ctx.storage.get("shortShadowState");
-
-        if (
-          storedShortShadow?.strategyId === SHORT_SHADOW_ID
-        ) {
-          this.shortShadowState = {
-            strategyId: SHORT_SHADOW_ID,
-            startedAt:
-              Number(storedShortShadow.startedAt) || Date.now(),
-
-            pending: Array.isArray(storedShortShadow.pending)
-              ? storedShortShadow.pending
-              : [],
-
-            history: Array.isArray(storedShortShadow.history)
-              ? storedShortShadow.history
-              : []
-          };
-        } else {
-          if (
-            storedShortShadow?.strategyId &&
-            Array.isArray(storedShortShadow.pending) &&
-            Array.isArray(storedShortShadow.history)
-          ) {
-            await this.ctx.storage.put(
-              `shortShadowArchive:${storedShortShadow.strategyId}`,
-              storedShortShadow
-            );
-          }
-
-          this.shortShadowState = {
-            strategyId: SHORT_SHADOW_ID,
-            startedAt: Date.now(),
-            pending: [],
-            history: []
-          };
-
-          await this.ctx.storage.put(
-            "shortShadowState",
-            this.shortShadowState
-          );
-        }
         this.blockerStats = {
           ...storedBlockers,
           total: Number(
