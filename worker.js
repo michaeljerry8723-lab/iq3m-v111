@@ -1,7 +1,7 @@
 // V13.11.0 — UTC Ichimoku/RSI shadow from the supplied video transcript
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.11.1-utc-ichimoku-rsi-shadow-v2";
+export const VERSION = "13.11.2-utc-ichimoku-rsi-shadow-diagnostics";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -7601,13 +7601,40 @@ export class TickHub extends DurableObject {
       const ticks = this.ticks.get(checkSymbol) || [];
       const bars15 = buildBars(ticks, 15), bars60 = buildBars(ticks, 60);
       const latest = ticks.at(-1);
+      const checkEntry = (bars, timeframe) => {
+        const score = scorePocketOptionIchimokuRsi(bars, timeframe);
+        const cross = score.crossUp ? "up" : score.crossDown ? "down" : "none";
+        const callGates = {
+          crossover: Boolean(score.crossUp),
+          rsiAbove50: Number.isFinite(Number(score.rsi)) && Number(score.rsi) > 50,
+          engulfSequence: Boolean(score.bullishCandles)
+        };
+        const putGates = {
+          crossover: Boolean(score.crossDown),
+          rsiBelow50: Number.isFinite(Number(score.rsi)) && Number(score.rsi) < 50,
+          engulfSequence: Boolean(score.bearishCandles)
+        };
+        return {
+          ready: bars.length >= 53,
+          qualifies: Boolean(score.ok && score.direction),
+          direction: score.direction || null,
+          reason: score.reason || null,
+          rsi: Number.isFinite(Number(score.rsi)) ? Number(score.rsi) : null,
+          cross,
+          callGates,
+          putGates
+        };
+      };
+      const evaluation15s = checkEntry(bars15, "15s");
+      const evaluation1m = checkEntry(bars60, "1m");
       return json({
         ok: true, symbol: checkSymbol, dataSource: "tiingo-utc-fx",
         websocketConnected: Boolean(this.ws && this.ws.readyState === 1),
         quoteAgeSeconds: latest ? Math.max(0, (Date.now() - Number(latest.r || latest.t)) / 1000) : null,
         bars15: bars15.length, bars1m: bars60.length, requiredBars: 53,
         ready15s: bars15.length >= 53, ready1m: bars60.length >= 53,
-        strategyId: SHORT_SHADOW_ID
+        evaluation15s, evaluation1m,
+        workerVersion: VERSION, strategyId: SHORT_SHADOW_ID
       });
     }
 
@@ -8866,10 +8893,19 @@ export default {
             for (const pair of SHORT_SHADOW_UNIVERSE) {
               try {
                 const r = await hub(env, "/ichimoku-check?symbol=" + encodeURIComponent(pair));
-                rows.push(pair + " — 15s " + (r.ready15s ? "ready" : r.bars15 + "/53 bars") + ", 1m " + (r.ready1m ? "ready" : r.bars1m + "/53 bars") + ", quote " + (r.quoteAgeSeconds == null ? "n/a" : r.quoteAgeSeconds.toFixed(1) + "s"));
+                const fmt = (label, bars, check) => {
+                  if (!check?.ready) return label + " " + bars + "/53 warm";
+                  const gates = check.direction ? check.direction : "no signal";
+                  return label + " " + gates + " RSI=" + (check.rsi == null ? "n/a" : check.rsi.toFixed(1)) +
+                    " X=" + (check.cross || "none") +
+                    " C=" + (check.callGates?.engulfSequence ? "CALL" : check.putGates?.engulfSequence ? "PUT" : "none");
+                };
+                rows.push(pair + " — " + fmt("15s", r.bars15, r.evaluation15s) +
+                  " | " + fmt("1m", r.bars1m, r.evaluation1m) +
+                  " | quote " + (r.quoteAgeSeconds == null ? "n/a" : r.quoteAgeSeconds.toFixed(1) + "s"));
               } catch (_) { rows.push(pair + " — diagnostics unavailable"); }
             }
-            await tgSend(env, chatId, "UTC ICHIMOKU/RSI SHADOW DIAGNOSTICS\n\nSource: Tiingo UTC FX\n" + rows.join("\n"));
+            await tgSend(env, chatId, "UTC ICHIMOKU/RSI SHADOW DIAGNOSTICS\n" + VERSION + " | " + SHORT_SHADOW_ID + "\n\nSource: Tiingo UTC FX\n" + rows.join("\n"));
           } catch (e) {
             await tgSend(env, chatId, "UTC ICHIMOKU/RSI DIAGNOSTICS ERROR\n" + String(e?.message || e).slice(0, 500));
           }
