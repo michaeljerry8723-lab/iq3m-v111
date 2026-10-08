@@ -1,7 +1,7 @@
 // V13.11.0 — UTC Ichimoku/RSI shadow from the supplied video transcript
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.11.2-utc-ichimoku-rsi-shadow-diagnostics";
+export const VERSION = "13.11.3-utc-do-quota-fix";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -7594,46 +7594,58 @@ export class TickHub extends DurableObject {
 
     // CRUZ V2 — 30s Aroon(10) + OsMA(10,20,10)
     if (u.pathname === "/ichimoku-check") {
-      const checkSymbol = normalizeSymbol(u.searchParams.get("symbol") || "EUR/USD");
-      if (!checkSymbol || !SHORT_SHADOW_UNIVERSE.includes(checkSymbol)) return json({ ok: false, error: "invalid UTC FX symbol" }, 400);
+      const requestedSymbol = u.searchParams.get("symbol");
+      const symbols = requestedSymbol
+        ? [normalizeSymbol(requestedSymbol)]
+        : SHORT_SHADOW_UNIVERSE;
+      if (symbols.some(symbol => !symbol || !SHORT_SHADOW_UNIVERSE.includes(symbol))) {
+        return json({ ok: false, error: "invalid UTC FX symbol" }, 400);
+      }
       await this.ensureSocket();
-      await this.subscribe(checkSymbol);
-      const ticks = this.ticks.get(checkSymbol) || [];
-      const bars15 = buildBars(ticks, 15), bars60 = buildBars(ticks, 60);
-      const latest = ticks.at(-1);
-      const checkEntry = (bars, timeframe) => {
-        const score = scorePocketOptionIchimokuRsi(bars, timeframe);
-        const cross = score.crossUp ? "up" : score.crossDown ? "down" : "none";
-        const callGates = {
-          crossover: Boolean(score.crossUp),
-          rsiAbove50: Number.isFinite(Number(score.rsi)) && Number(score.rsi) > 50,
-          engulfSequence: Boolean(score.bullishCandles)
+      const rows = [];
+      for (const checkSymbol of symbols) {
+        await this.subscribe(checkSymbol);
+        const ticks = this.ticks.get(checkSymbol) || [];
+        const bars15 = buildBars(ticks, 15), bars60 = buildBars(ticks, 60);
+        const latest = ticks.at(-1);
+        const checkEntry = (bars, timeframe) => {
+          const score = scorePocketOptionIchimokuRsi(bars, timeframe);
+          const cross = score.crossUp ? "up" : score.crossDown ? "down" : "none";
+          const callGates = {
+            crossover: Boolean(score.crossUp),
+            rsiAbove50: Number.isFinite(Number(score.rsi)) && Number(score.rsi) > 50,
+            engulfSequence: Boolean(score.bullishCandles)
+          };
+          const putGates = {
+            crossover: Boolean(score.crossDown),
+            rsiBelow50: Number.isFinite(Number(score.rsi)) && Number(score.rsi) < 50,
+            engulfSequence: Boolean(score.bearishCandles)
+          };
+          return {
+            ready: bars.length >= 53,
+            qualifies: Boolean(score.ok && score.direction),
+            direction: score.direction || null,
+            reason: score.reason || null,
+            rsi: Number.isFinite(Number(score.rsi)) ? Number(score.rsi) : null,
+            cross,
+            callGates,
+            putGates
+          };
         };
-        const putGates = {
-          crossover: Boolean(score.crossDown),
-          rsiBelow50: Number.isFinite(Number(score.rsi)) && Number(score.rsi) < 50,
-          engulfSequence: Boolean(score.bearishCandles)
-        };
-        return {
-          ready: bars.length >= 53,
-          qualifies: Boolean(score.ok && score.direction),
-          direction: score.direction || null,
-          reason: score.reason || null,
-          rsi: Number.isFinite(Number(score.rsi)) ? Number(score.rsi) : null,
-          cross,
-          callGates,
-          putGates
-        };
-      };
-      const evaluation15s = checkEntry(bars15, "15s");
-      const evaluation1m = checkEntry(bars60, "1m");
-      return json({
-        ok: true, symbol: checkSymbol, dataSource: "tiingo-utc-fx",
-        websocketConnected: Boolean(this.ws && this.ws.readyState === 1),
-        quoteAgeSeconds: latest ? Math.max(0, (Date.now() - Number(latest.r || latest.t)) / 1000) : null,
-        bars15: bars15.length, bars1m: bars60.length, requiredBars: 53,
-        ready15s: bars15.length >= 53, ready1m: bars60.length >= 53,
-        evaluation15s, evaluation1m,
+        const evaluation15s = checkEntry(bars15, "15s");
+        const evaluation1m = checkEntry(bars60, "1m");
+        rows.push({
+          ok: true, symbol: checkSymbol, dataSource: "tiingo-utc-fx",
+          websocketConnected: Boolean(this.ws && this.ws.readyState === 1),
+          quoteAgeSeconds: latest ? Math.max(0, (Date.now() - Number(latest.r || latest.t)) / 1000) : null,
+          bars15: bars15.length, bars1m: bars60.length, requiredBars: 53,
+          ready15s: bars15.length >= 53, ready1m: bars60.length >= 53,
+          evaluation15s, evaluation1m,
+          workerVersion: VERSION, strategyId: SHORT_SHADOW_ID
+        });
+      }
+      return requestedSymbol ? json(rows[0]) : json({
+        ok: true, dataSource: "tiingo-utc-fx", rows,
         workerVersion: VERSION, strategyId: SHORT_SHADOW_ID
       });
     }
@@ -8089,135 +8101,13 @@ async function issueAgradeSignal(env, chatIds, candidate, sourceUpdateId = "auto
   return { ok: true, symbol, direction: result.direction, quality: result.quality };
 }
 
-async function scanShortShadowUniverse(env) {
-  const checked = [];
-  const captured = [];
-
-  for (const symbol of SHORT_SHADOW_UNIVERSE) {
-    try {
-      const result = await hub(
-        env,
-        `/short-shadow?symbol=${encodeURIComponent(symbol)}`
-      );
-
-      const row = {
-        ...result,
-        symbol
-      };
-
-      checked.push(row);
-
-      if (row?.captured) {
-        captured.push(row);
-      }
-
-      // Tiingo quota is global, so do not keep hammering
-      // the remaining pairs once the quota is blocked.
-      if (row?.quotaExceeded) {
-        break;
-      }
-    } catch (e) {
-      checked.push({
-        ok: false,
-        symbol,
-        captured: false,
-        reason: String(e?.message || e)
-      });
-    }
-  }
-
-  return {
-    ok: true,
-    checked: checked.length,
-    captured: captured.length,
-    symbols: captured.map(x => x.symbol),
-    rows: checked
-  };
-}
-
-async function autoScanShortShadow(env) {
-  try {
-    // Settle any due short-expiry records first.
-    await hub(
-      env,
-      "/settle-short-shadow"
-    );
-
-    // Keep the Tiingo UTC FX quote stream active before scanning.
-    await hub(env, "/prime-live?ms=5000");
-
-    const shortShadow =
-      await scanShortShadowUniverse(
-        env
-      );
-
-    return {
-      ok: true,
-
-      shortShadowChecked:
-        Number(
-          shortShadow?.checked || 0
-        ),
-
-      shortShadowCaptured:
-        Number(
-          shortShadow?.captured || 0
-        ),
-
-      shortShadowSymbols:
-        Array.isArray(
-          shortShadow?.symbols
-        )
-          ? shortShadow.symbols
-          : []
-    };
-  } finally {
-    try {
-      await hub(
-        env,
-        "/sleep"
-      );
-    } catch (_) { }
-  }
-}
-
 async function autoScanAndAlert(env) {
-  try {
     // Prime the live WebSocket first so both engines
     // work from the same fresh market sample.
-    // Guaranteed short-expiry settlement pass.
-    // The one-minute AutoScheduler is already proven
-    // to be running continuously in production.
-    await hub(
-      env,
-      "/settle-short-shadow"
-    );
     await hub(env, "/prime-live?ms=5000");
 
-    // -------------------------------------------------
-    // SHORT-EXPIRY SHADOW
-    // Runs independently of the 5-minute risk gate.
-    // It records experimental 60s/120s entries only.
-    // It NEVER sends a short-expiry Telegram trade.
-    // -------------------------------------------------
-    const shortShadow =
-      await scanShortShadowUniverse(env);
-
-    const shortSummary = {
-      shortShadowChecked:
-        Number(shortShadow?.checked || 0),
-
-      shortShadowCaptured:
-        Number(shortShadow?.captured || 0),
-
-      shortShadowSymbols:
-        Array.isArray(shortShadow?.symbols)
-          ? shortShadow.symbols
-          : []
-    };
-    // -------------------------------------------------
-    // EXISTING 5-MINUTE LIVE ENGINE
-    // -------------------------------------------------
+    // Short-expiry entries and settlements are driven by live quote events and TickHub alarms.
+    // Avoid per-pair polling here; it duplicates the quote-driven evaluator.
     const chatState =
       await hub(env, "/chats");
 
@@ -8232,7 +8122,6 @@ async function autoScanAndAlert(env) {
         reason: "no registered chat",
         readyAlertsSent: 0,
 
-        ...shortSummary
       };
     }
 
@@ -8245,7 +8134,6 @@ async function autoScanAndAlert(env) {
         reason:
           risk.reason || "risk gate",
         readyAlertsSent: 0,
-        ...shortSummary
       };
     }
 
@@ -8269,7 +8157,6 @@ async function autoScanAndAlert(env) {
       return {
         ...signal,
         readyAlertsSent: 0,
-        ...shortSummary
       };
     }
 
@@ -8280,14 +8167,8 @@ async function autoScanAndAlert(env) {
         "no fully qualified setup",
 
       readyAlertsSent: 0,
-      ...shortSummary
     };
 
-  } finally {
-    try {
-      await hub(env, "/sleep");
-    } catch (_) { }
-  }
 }
 
 async function checkAllFeeds(env) {
@@ -8307,8 +8188,6 @@ async function checkAllFeeds(env) {
       status: msg,
       source: "tiingo-rest-top"
     }));
-  } finally {
-    try { await hub(env, "/sleep"); } catch (_) { }
   }
 }
 
@@ -8361,13 +8240,6 @@ export default {
       const supplied = String(request.headers.get("X-IQ3M-Cron-Secret") || "");
       if (!expected || supplied !== expected) return new Response("forbidden", { status: 403 });
       try {
-        const shortClaim =
-          await hubPost(
-            env,
-            "/claim-short-cron",
-            {}
-          );
-
         const minuteClaim =
           await hubPost(
             env,
@@ -8379,9 +8251,8 @@ export default {
         // -------------------------------------------------
         // NORMAL MINUTE SCAN
         //
-        // Existing autoScanAndAlert already performs:
-        // - short-shadow scan
-        // - 5-minute scan
+        // Quote callbacks and TickHub alarms handle short-shadow collection.
+        // The minute slot below only runs the existing 5-minute scan.
         //
         // So when the minute slot is available,
         // use the existing full workflow.
@@ -8404,29 +8275,6 @@ export default {
             ok: true,
             claimed: true,
             minuteClaimed: true,
-            shortClaimed:
-              Boolean(shortClaim?.claimed),
-            result
-          });
-        }
-
-
-        // -------------------------------------------------
-        // SECOND 30-SECOND SLOT
-        //
-        // The 5-minute engine already ran this minute,
-        // but Cruz V2 is allowed another short-only scan.
-        // -------------------------------------------------
-
-        if (shortClaim?.claimed) {
-          const result =
-            await autoScanShortShadow(env);
-
-          return json({
-            ok: true,
-            claimed: true,
-            minuteClaimed: false,
-            shortClaimed: true,
             result
           });
         }
@@ -8437,7 +8285,6 @@ export default {
           ok: true,
           skipped: true,
           minuteClaimed: false,
-          shortClaimed: false,
           reason:
             "current scheduler slots already claimed"
         });
@@ -8888,23 +8735,19 @@ export default {
         }
         if (/^\/shortdiag$/i.test(text)) {
           try {
-            await hub(env, "/prime-live?ms=5000");
-            const rows = [];
-            for (const pair of SHORT_SHADOW_UNIVERSE) {
-              try {
-                const r = await hub(env, "/ichimoku-check?symbol=" + encodeURIComponent(pair));
-                const fmt = (label, bars, check) => {
-                  if (!check?.ready) return label + " " + bars + "/53 warm";
-                  const gates = check.direction ? check.direction : "no signal";
-                  return label + " " + gates + " RSI=" + (check.rsi == null ? "n/a" : check.rsi.toFixed(1)) +
-                    " X=" + (check.cross || "none") +
-                    " C=" + (check.callGates?.engulfSequence ? "CALL" : check.putGates?.engulfSequence ? "PUT" : "none");
-                };
-                rows.push(pair + " — " + fmt("15s", r.bars15, r.evaluation15s) +
-                  " | " + fmt("1m", r.bars1m, r.evaluation1m) +
-                  " | quote " + (r.quoteAgeSeconds == null ? "n/a" : r.quoteAgeSeconds.toFixed(1) + "s"));
-              } catch (_) { rows.push(pair + " — diagnostics unavailable"); }
-            }
+            const result = await hub(env, "/ichimoku-check");
+            const rows = (Array.isArray(result?.rows) ? result.rows : []).map(r => {
+              const fmt = (label, bars, check) => {
+                if (!check?.ready) return label + " " + bars + "/53 warm";
+                const gates = check.direction ? check.direction : "no signal";
+                return label + " " + gates + " RSI=" + (check.rsi == null ? "n/a" : check.rsi.toFixed(1)) +
+                  " X=" + (check.cross || "none") +
+                  " C=" + (check.callGates?.engulfSequence ? "CALL" : check.putGates?.engulfSequence ? "PUT" : "none");
+              };
+              return r.symbol + " — " + fmt("15s", r.bars15, r.evaluation15s) +
+                " | " + fmt("1m", r.bars1m, r.evaluation1m) +
+                " | quote " + (r.quoteAgeSeconds == null ? "n/a" : r.quoteAgeSeconds.toFixed(1) + "s");
+            });
             await tgSend(env, chatId, "UTC ICHIMOKU/RSI SHADOW DIAGNOSTICS\n" + VERSION + " | " + SHORT_SHADOW_ID + "\n\nSource: Tiingo UTC FX\n" + rows.join("\n"));
           } catch (e) {
             await tgSend(env, chatId, "UTC ICHIMOKU/RSI DIAGNOSTICS ERROR\n" + String(e?.message || e).slice(0, 500));
@@ -8937,13 +8780,8 @@ export default {
             `Tiingo REST quota: ${quota}\n\n` +
 
             `SHORT-EXPIRY SHADOW\n` +
-            `OTC pairs checked last scan: ${Number(r.shortShadowChecked || 0)}/${OTC_SHADOW_UNIVERSE.length}\n` +
-            `Setups captured last scan: ${Number(r.shortShadowCaptured || 0)}\n` +
-            `Captured pairs: ${Array.isArray(r.shortShadowSymbols) &&
-              r.shortShadowSymbols.length
-              ? r.shortShadowSymbols.join(", ")
-              : "none"
-            }\n\n` +
+            `Collection: live Tiingo quote events\n` +
+            `Settlement: TickHub alarm\n\n` +
 
             `5-MINUTE ENGINE\n` +
             `Last result: ${r.ok
@@ -9047,8 +8885,6 @@ export default {
         try {
           await tgSend(env, chatId, `BOT RUNTIME ERROR\n${String(e?.message || e).slice(0, 350)}\n\nThe webhook itself acknowledged this update, so Telegram will not remain blocked.`);
         } catch (_) { }
-      } finally {
-        try { await hub(env, "/sleep"); } catch (_) { }
       }
     })());
     return new Response("ok");
