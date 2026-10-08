@@ -1,7 +1,7 @@
 // V13.11.0 — UTC Ichimoku/RSI shadow from the supplied video transcript
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.11.0-utc-ichimoku-rsi-shadow-v1";
+export const VERSION = "13.11.1-utc-ichimoku-rsi-shadow-v2";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -16,7 +16,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
 ]);
 export const OTC_SHADOW_UNIVERSE = Object.freeze(["EUR/USD","GBP/USD","USD/JPY","AUD/USD","USD/CAD"]);
 export const OTC_SHADOW_VENDOR_SYMBOLS = Object.freeze({"EUR/USD":"EURUSD_otc","GBP/USD":"GBPUSD_otc","USD/JPY":"USDJPY_otc","AUD/USD":"AUDUSD_otc","USD/CAD":"USDCAD_otc"});
-export const SHORT_SHADOW_ID = "utc-15s-1m-ichimoku9-26-52-rsi14-engulf-shadow-v1";
+export const SHORT_SHADOW_ID = "utc-15s-1m-ichimoku9-26-52-rsi14-engulf-shadow-v2";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
 export const VIDEO_SUPERTREND_MULTIPLIER = 2;
@@ -1075,12 +1075,22 @@ function scorePocketOptionIchimokuRsi(bars, timeframe) {
   const senkouA = (midpointRange(bars, sourceIndex, VIDEO_ICHIMOKU_TENKAN) + midpointRange(bars, sourceIndex, VIDEO_ICHIMOKU_KIJUN)) / 2;
   const previousSenkouA = (midpointRange(bars, sourceIndex - 1, VIDEO_ICHIMOKU_TENKAN) + midpointRange(bars, sourceIndex - 1, VIDEO_ICHIMOKU_KIJUN)) / 2;
   if (![tenkan, previousTenkan, senkouA, previousSenkouA, currentRsi].every(Number.isFinite)) return { ok: false, reason: "indicator values are warming up", timeframe };
-  const engulf = (a, b, dir) => {
-    const ao = Number(a?.o), ac = Number(a?.c), bo = Number(b?.o), bc = Number(b?.c);
-    return [ao, ac, bo, bc].every(Number.isFinite) && (dir === "CALL" ? ac > ao && bc < bo : ac < ao && bc > bo) && Math.min(ao, ac) <= Math.min(bo, bc) && Math.max(ao, ac) >= Math.max(bo, bc);
+  const isDirectional = (bar, dir) => {
+    const o = Number(bar?.o), c = Number(bar?.c);
+    return Number.isFinite(o) && Number.isFinite(c) && (dir === "CALL" ? c > o : c < o);
   };
-  const bullishCandles = engulf(bars[i], bars[i-1], "CALL") && engulf(bars[i-1], bars[i-2], "CALL");
-  const bearishCandles = engulf(bars[i], bars[i-1], "PUT") && engulf(bars[i-1], bars[i-2], "PUT");
+  const bodyEngulfs = (a, b) => {
+    const ao = Number(a?.o), ac = Number(a?.c), bo = Number(b?.o), bc = Number(b?.c);
+    return [ao, ac, bo, bc].every(Number.isFinite) &&
+      Math.min(ao, ac) <= Math.min(bo, bc) &&
+      Math.max(ao, ac) >= Math.max(bo, bc);
+  };
+  // Interpret "a series of directional candles engulfing each other" as two
+  // consecutive same-direction candles, each body covering the previous body.
+  const bullishCandles = isDirectional(bars[i], "CALL") && isDirectional(bars[i-1], "CALL") &&
+    bodyEngulfs(bars[i], bars[i-1]) && bodyEngulfs(bars[i-1], bars[i-2]);
+  const bearishCandles = isDirectional(bars[i], "PUT") && isDirectional(bars[i-1], "PUT") &&
+    bodyEngulfs(bars[i], bars[i-1]) && bodyEngulfs(bars[i-1], bars[i-2]);
   const crossUp = previousTenkan <= previousSenkouA && tenkan > senkouA;
   const crossDown = previousTenkan >= previousSenkouA && tenkan < senkouA;
   const direction = crossUp && currentRsi > 50 && bullishCandles ? "CALL" : crossDown && currentRsi < 50 && bearishCandles ? "PUT" : null;
