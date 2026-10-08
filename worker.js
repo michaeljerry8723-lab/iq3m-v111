@@ -1,7 +1,7 @@
 // V13.9.7 — first live quote where SuperTrend and MACD states align
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.10.0-pocket-option-otc-shadow-v10";
+export const VERSION = "13.11.0-ichimoku-rsi-utc-shadow-v1";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -16,7 +16,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
 ]);
 export const OTC_SHADOW_UNIVERSE = Object.freeze(["EUR/USD","GBP/USD","USD/JPY","AUD/USD","USD/CAD"]);
 export const OTC_SHADOW_VENDOR_SYMBOLS = Object.freeze({"EUR/USD":"EURUSD_otc","GBP/USD":"GBPUSD_otc","USD/JPY":"USDJPY_otc","AUD/USD":"AUDUSD_otc","USD/CAD":"USDCAD_otc"});
-export const SHORT_SHADOW_ID = "pocketoption-30s-supertrend10x2-macd10-20-5-60-120-otc-shadow-v10";
+export const SHORT_SHADOW_ID = "ichimoku-tenkan9-kijun26-senkouA-rsi14-dualtimeframe-60-120-utc-shadow-v1";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
 export const VIDEO_SUPERTREND_MULTIPLIER = 2;
@@ -1743,6 +1743,105 @@ function rsiSnapshot(bars, p = 7) {
   const rs = avgGain / avgLoss;
   return { ready: true, rsi: 100 - (100 / (1 + rs)) };
 }
+
+export const ICHIMOKU_TENKAN_PERIOD = 9;
+export const ICHIMOKU_KIJUN_PERIOD = 26;
+export const ICHIMOKU_SENKOU_B_PERIOD = 52;
+export const ICHIMOKU_DISPLACEMENT = 26;
+export const ICHIMOKU_RSI_PERIOD = 14;
+export const ICHIMOKU_SIGNAL_TIMEFRAMES = Object.freeze([15, 60]);
+
+function ichimokuMidpointAt(bars, endIndex, period) {
+  const start = endIndex - period + 1;
+  if (start < 0 || endIndex >= bars.length) return NaN;
+  let highest = -Infinity, lowest = Infinity;
+  for (let i = start; i <= endIndex; i++) {
+    const high = Number(bars[i]?.h), low = Number(bars[i]?.l);
+    if (!Number.isFinite(high) || !Number.isFinite(low)) return NaN;
+    highest = Math.max(highest, high);
+    lowest = Math.min(lowest, low);
+  }
+  return (highest + lowest) / 2;
+}
+
+function ichimokuWilderRsi(bars, period = ICHIMOKU_RSI_PERIOD) {
+  if (!Array.isArray(bars) || bars.length < period + 1) return null;
+  const closes = bars.map(b => Number(b?.c));
+  if (!closes.every(Number.isFinite)) return null;
+  let gain = 0, loss = 0;
+  for (let i = 1; i <= period; i++) {
+    const delta = closes[i] - closes[i - 1];
+    if (delta > 0) gain += delta;
+    else loss -= delta;
+  }
+  let averageGain = gain / period, averageLoss = loss / period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const delta = closes[i] - closes[i - 1];
+    averageGain = (averageGain * (period - 1) + Math.max(0, delta)) / period;
+    averageLoss = (averageLoss * (period - 1) + Math.max(0, -delta)) / period;
+  }
+  if (averageLoss === 0) return averageGain === 0 ? 50 : 100;
+  const rs = averageGain / averageLoss;
+  return 100 - (100 / (1 + rs));
+}
+
+export function ichimokuRsiSnapshot(bars) {
+  const shift = ICHIMOKU_DISPLACEMENT;
+  if (!Array.isArray(bars) || bars.length < shift + ICHIMOKU_KIJUN_PERIOD + 2) {
+    return { ready: false, reason: "Ichimoku history warming up" };
+  }
+
+  const i = bars.length - 1;
+  const tenkan = ichimokuMidpointAt(bars, i, ICHIMOKU_TENKAN_PERIOD);
+  const previousTenkan = ichimokuMidpointAt(bars, i - 1, ICHIMOKU_TENKAN_PERIOD);
+  const senkouA = (
+    ichimokuMidpointAt(bars, i - shift, ICHIMOKU_TENKAN_PERIOD) +
+    ichimokuMidpointAt(bars, i - shift, ICHIMOKU_KIJUN_PERIOD)
+  ) / 2;
+  const previousSenkouA = (
+    ichimokuMidpointAt(bars, i - 1 - shift, ICHIMOKU_TENKAN_PERIOD) +
+    ichimokuMidpointAt(bars, i - 1 - shift, ICHIMOKU_KIJUN_PERIOD)
+  ) / 2;
+  const rsi = ichimokuWilderRsi(bars, ICHIMOKU_RSI_PERIOD);
+  if (![tenkan, previousTenkan, senkouA, previousSenkouA, rsi].every(Number.isFinite)) {
+    return { ready: false, reason: "Ichimoku/RSI values unavailable" };
+  }
+
+  return {
+    ready: true,
+    tenkan,
+    previousTenkan,
+    senkouA,
+    previousSenkouA,
+    rsi,
+    crossUp: previousTenkan <= previousSenkouA && tenkan > senkouA,
+    crossDown: previousTenkan >= previousSenkouA && tenkan < senkouA
+  };
+}
+
+function engulfingCandleSnapshot(bars, direction) {
+  if (!Array.isArray(bars) || bars.length < 2) return { ready: false, qualifies: false };
+  const previous = bars.at(-2), current = bars.at(-1);
+  const po = Number(previous?.o), pc = Number(previous?.c);
+  const co = Number(current?.o), cc = Number(current?.c);
+  if (![po, pc, co, cc].every(Number.isFinite) || po === pc || co === cc) {
+    return { ready: true, qualifies: false, pattern: "doji_or_invalid" };
+  }
+  const bullish = direction === "CALL";
+  const qualifies = bullish
+    ? pc < po && cc > co && co <= pc && cc >= po
+    : pc > po && cc < co && co >= pc && cc <= po;
+  return {
+    ready: true,
+    qualifies,
+    pattern: qualifies ? (bullish ? "bullish_body_engulfing" : "bearish_body_engulfing") : "no_directional_engulfing",
+    previousOpen: po,
+    previousClose: pc,
+    currentOpen: co,
+    currentClose: cc
+  };
+}
+
 function dmiAdxSnapshot(bars, p = 7) {
   if (!bars || bars.length < (p * 2 + 2)) return { ready: false };
   const trs = [], plus = [], minus = [];
@@ -3386,6 +3485,8 @@ export class TickHub extends DurableObject {
     this.lastWsMessageAt = 0; this.lastWsQuoteAt = 0; this.lastPriceReceivedAt = 0; this.lastConnectAt = 0; this.reconnectCount = 0; this.oneMinuteCache = new Map(); this.oneMinuteCacheDirty = false; this.quotaBlockedUntil = 0; this.pendingSignals = []; this.signalStats = { total: 0, wins: 0, losses: 0, draws: 0, voids: 0 }; this.signalHistory = []; this.forwardStats = null; this.alertChats = []; this.setupStates = {}; this.readyAlertClaims = {}; this.readyAudit = [];
     this.current30sBars = new Map(); this.completed30sBars = new Map(); this.completedFiveMinuteBars = new Map(); this.lastFinalized30sBucket = new Map(); this.s30Dirty = false;
     this.videoAlignedDirection = new Map();
+    this.shortShadowEvalInFlight = new Set();
+    this.shortShadowWarmupInFlight = new Set();
     this.otcTicks = new Map(); this.otcCurrent30sBars = new Map(); this.otcCompleted30sBars = new Map();
     this.otcLastFinalized30sBucket = new Map(); this.otcS30Dirty = false;
     this.otcConnecting = false; this.otcStreamActive = false; this.otcAbortController = null; this.otcStreamStatus = "not_started";
@@ -4406,28 +4507,23 @@ export class TickHub extends DurableObject {
       this.lastWsQuoteAt = Date.now();
       this.lastStatus = "ok";
       this.pushTick(symbol, t, p, bid, ask);
-      let previousLiveMacd = null;
-      try {
-        const previousBars30 = this.getTiingo30SecondBars(symbol, 80, true);
-        previousLiveMacd = videoMacdSnapshot(previousBars30);
-      } catch (_) { }
-      const candleUpdated =
-        this.updateTiingo30SecondCandle(symbol, t, p);
+      this.updateTiingo30SecondCandle(symbol, t, p);
 
-      // Run the video-derived entry check directly from live quote events;
-      // do not wait for the 30-second candle to finalize.
-      if (
-        candleUpdated &&
-        (this.completed30sBars.get(symbol) || []).length >= 32
-      ) {
+      // Evaluate the UTC shadow setup from each fresh quote. The two chart
+      // intervals are checked independently; entries are captured intrabar
+      // when all reconstructed conditions first align.
+      if (!this.shortShadowEvalInFlight.has(symbol)) {
+        this.shortShadowEvalInFlight.add(symbol);
         this.ctx.waitUntil(
-          this.evaluateShortShadowV2(symbol, previousLiveMacd).catch(e => {
-            console.error(
-              "intrabar short-shadow evaluation failed",
-              symbol,
-              String(e?.stack || e?.message || e)
-            );
-          })
+          this.evaluateShortShadowV2(symbol)
+            .catch(e => {
+              console.error(
+                "Ichimoku/RSI short-shadow evaluation failed",
+                symbol,
+                String(e?.stack || e?.message || e)
+              );
+            })
+            .finally(() => this.shortShadowEvalInFlight.delete(symbol))
         );
       }
     } catch (e) {
@@ -7106,7 +7202,7 @@ export class TickHub extends DurableObject {
 
     for (const original of state.pending) {
       const rec = { ...original };
-      const ticks = this.otcTicks.get(normalizeSymbol(rec.symbol)) || [];
+      const ticks = this.ticks.get(normalizeSymbol(rec.symbol)) || [];
 
       for (const seconds of SHORT_SHADOW_EXPIRIES) {
         const resultKey = `result${seconds}`;
@@ -7119,7 +7215,7 @@ export class TickHub extends DurableObject {
 
         // Intrabar entries occur at arbitrary millisecond times, so their
         // 60s/120s expiries do not generally land on an S30 candle boundary.
-        // Settle against the first fresh Pocket Option OTC quote received at/after the
+        // Settle against the first fresh Tiingo UTC quote received at/after the
         // exact expiry instant, matching the entry's receive-time clock.
         const exitTick = ticks.find(t => Number(t.r || t.t) >= expiryAt);
 
@@ -7133,7 +7229,7 @@ export class TickHub extends DurableObject {
           rec[resultKey] = "VOID";
           rec[exitPriceKey] = null;
           rec[exitAtKey] = null;
-          rec[`voidReason${seconds}`] = "no Pocket Option OTC quote received at/after expiry within 15s";
+          rec[`voidReason${seconds}`] = "no fresh Tiingo UTC quote received at/after expiry within 15s";
           settled[seconds]++;
           changed = true;
         }
@@ -7157,146 +7253,145 @@ export class TickHub extends DurableObject {
 
     return {
       ok: true,
-      settlementSource: "otcharts-pocket-option-otc-live-quotes",
+      settlementSource: "tiingo-utc-live-quotes",
       settled60: settled[60],
       settled120: settled[120],
       settled300: settled[300],
       completed
     };
   }
-  async evaluateShortShadowV2(symbol, previousLiveMacd = null) {
+  async evaluateShortShadowV2(symbol) {
     symbol = normalizeSymbol(symbol);
-
     if (!symbol || !SHORT_SHADOW_UNIVERSE.includes(symbol)) {
-      return {
-        ok: false,
-        error: "invalid video-strategy short-shadow symbol"
-      };
+      return { ok: false, error: "invalid UTC Ichimoku/RSI shadow symbol" };
     }
 
-    if (!OTC_SHADOW_UNIVERSE.includes(symbol)) return {ok:false,error:"symbol is not enabled in Pocket Option OTC shadow universe"};
-    const ticks = this.otcTicks.get(symbol) || [];
+    const ticks = this.ticks.get(symbol) || [];
     const quote = ticks.at(-1);
     const quoteReceivedAt = Number(quote?.r || 0);
     const now = Date.now();
-
-    if (
-      !quote ||
-      !Number.isFinite(quoteReceivedAt) ||
-      now - quoteReceivedAt > 10000
-    ) {
-      return {
-        ok: false,
-        symbol,
-        captured: false,
-        reason: "waiting for a fresh live quote for intrabar entry"
-      };
+    if (!quote || !Number.isFinite(quoteReceivedAt) || now - quoteReceivedAt > 10000) {
+      return { ok: false, symbol, captured: false, reason: "waiting for a fresh Tiingo UTC quote" };
     }
 
-    let bars30;
-    try {
-      bars30 = this.getOtc30SecondBars(symbol, 80, true);
-    } catch (e) {
-      return {
-        ok: false,
-        symbol,
-        captured: false,
-        reason: `Video strategy Pocket Option OTC S30 context unavailable: ${String(e?.message || e)}`
-      };
-    }
-
-    const signalBar = bars30.at(-1);
-    const activeBar = this.otcCurrent30sBars.get(symbol);
-    const quoteBucket = Math.floor(Number(quote.t) / 30000) * 30000;
-
-    if (
-      !signalBar ||
-      !activeBar ||
-      Number(activeBar.t) !== Number(signalBar.t) ||
-      Number(activeBar.t) !== quoteBucket
-    ) {
-      return {
-        ok: false,
-        symbol,
-        captured: false,
-        reason: "waiting for the active 30-second candle"
-      };
-    }
-
-    const candidate = scorePocketOption30sSuperTrendMacd(bars30, previousLiveMacd);
-    if (!candidate.ok) {
-      this.videoAlignedDirection.set(symbol, null);
-      return { ...candidate, symbol, captured: false };
-    }
-
-    const priorAlignedDirection = this.videoAlignedDirection.get(symbol) || null;
-    this.videoAlignedDirection.set(symbol, candidate.direction);
-    if (priorAlignedDirection === candidate.direction) {
-      return {
-        ...candidate,
-        symbol,
-        captured: false,
-        reason: "both indicators remain aligned; this alignment was already recorded"
-      };
-    }
-
-    // The current candle is still forming. Use the live quote that caused
-    // the indicator alignment as the entry price and receive time.
-    const entryPrice = Number(quote.p);
-    const entryAt = quoteReceivedAt;
-    const signalBarOpenAt = Number(signalBar.t);
-
-    if (
-      !Number.isFinite(entryPrice) ||
-      !Number.isFinite(entryAt) ||
-      !Number.isFinite(signalBarOpenAt)
-    ) {
-      this.videoAlignedDirection.set(symbol, null);
-      return {
-        ok: false,
-        symbol,
-        captured: false,
-        reason: "video strategy intrabar entry quote is invalid"
-      };
-    }
-
-    const sourceKey =
-      `${SHORT_SHADOW_ID}|${symbol}|${candidate.direction}|${signalBarOpenAt}`;
-
-    const capture = await this.captureShortShadow({
-      symbol,
-      direction: candidate.direction,
-      entryPrice,
-      entryAt,
-      sourceKey,
-      features: {
-        model: "video-30s-supertrend10x2-macd10-20-5-intrabar",
-        dataSource: "otcharts-pocket-option-otc-s30",
-        timeframe: "30s",
-        entryMode: "intrabar-indicator-confirmation",
-        signalBarOpenAt,
-        signalBarExpectedCloseAt: signalBarOpenAt + 30000,
-        primaryExpirySeconds: 60,
-        expiryCandidates: candidate.expiryCandidates,
-        supertrend: candidate.supertrend,
-        macd: candidate.macd,
-        candleDirection: candidate.candleDirection,
-        trigger: candidate.trigger,
-        reasons: candidate.reasons
+    const cache = this.oneMinuteCache.get(symbol);
+    const minimumOneMinuteBars = ICHIMOKU_DISPLACEMENT + ICHIMOKU_KIJUN_PERIOD + 2;
+    if (!cache || !Array.isArray(cache.bars) || cache.bars.length < minimumOneMinuteBars) {
+      if (!this.shortShadowWarmupInFlight.has(symbol)) {
+        this.shortShadowWarmupInFlight.add(symbol);
+        this.ctx.waitUntil(
+          this.fetchOneMinuteBars(symbol)
+            .catch(e => console.error("Ichimoku 1m history warm-up failed", symbol, String(e?.message || e)))
+            .finally(() => this.shortShadowWarmupInFlight.delete(symbol))
+        );
       }
-    });
+    }
+
+    const live15sBars = buildBars(ticks, 15).slice(-240);
+    const currentMinuteOpen = Math.floor(Number(quote.t) / 60000) * 60000;
+    const oneMinuteBars = this.mergeOneMinuteContext(symbol, cache?.bars || [])
+      .filter(bar => Number(bar.t) < currentMinuteOpen);
+    const activeMinute = buildBars(ticks, 60)
+      .find(bar => Number(bar.t) === currentMinuteOpen);
+    if (activeMinute) oneMinuteBars.push(activeMinute);
+
+    const frames = [
+      { signalTimeframe: "15s", bars: live15sBars },
+      { signalTimeframe: "1m", bars: oneMinuteBars.slice(-480) }
+    ];
+    const captured = [];
+    const blockers = [];
+
+    for (const frame of frames) {
+      const bars = frame.bars;
+      if (bars.length < minimumOneMinuteBars) {
+        blockers.push(`${frame.signalTimeframe}: history warming up (${bars.length} bars)`);
+        continue;
+      }
+
+      const snapshot = ichimokuRsiSnapshot(bars);
+      if (!snapshot.ready) {
+        blockers.push(`${frame.signalTimeframe}: ${snapshot.reason}`);
+        continue;
+      }
+
+      const signalBar = bars.at(-1);
+      const signalBarOpenAt = Number(signalBar?.t);
+      if (!Number.isFinite(signalBarOpenAt)) continue;
+
+      for (const direction of ["CALL", "PUT"]) {
+        const crossed = direction === "CALL" ? snapshot.crossUp : snapshot.crossDown;
+        const rsiConfirmed = direction === "CALL" ? snapshot.rsi > 50 : snapshot.rsi < 50;
+        const candle = engulfingCandleSnapshot(bars, direction);
+        if (!crossed || !rsiConfirmed || !candle.qualifies) continue;
+
+        // The transcript describes strong, consistent engulfing candles but
+        // gives no numeric strength threshold. One classic real-body engulfing
+        // pair is the explicit screenshot/transcript-derived proxy used here.
+        const entryPrice = Number(quote.p);
+        const entryAt = quoteReceivedAt;
+        const sourceKey = `${SHORT_SHADOW_ID}|${symbol}|${frame.signalTimeframe}|${direction}|${signalBarOpenAt}`;
+        const capture = await this.captureShortShadow({
+          symbol,
+          direction,
+          entryPrice,
+          entryAt,
+          sourceKey,
+          features: {
+            model: "transcript-derived-ichimoku-tenkan-senkouA-rsi14",
+            dataSource: "tiingo-utc-fx-live-quotes",
+            signalTimeframe: frame.signalTimeframe,
+            entryMode: "first-live-quote-when-rules-align",
+            signalBarOpenAt,
+            primaryExpirySeconds: 60,
+            expiryCandidates: [60, 120],
+            ichimoku: {
+              tenkanPeriod: ICHIMOKU_TENKAN_PERIOD,
+              kijunPeriod: ICHIMOKU_KIJUN_PERIOD,
+              senkouBPeriod: ICHIMOKU_SENKOU_B_PERIOD,
+              senkouADisplacement: ICHIMOKU_DISPLACEMENT,
+              visibleLines: ["Tenkan-sen", "Senkou Span A"],
+              tenkan: snapshot.tenkan,
+              previousTenkan: snapshot.previousTenkan,
+              senkouA: snapshot.senkouA,
+              previousSenkouA: snapshot.previousSenkouA,
+              crossed
+            },
+            rsi: {
+              period: ICHIMOKU_RSI_PERIOD,
+              value: snapshot.rsi,
+              confirmationLevel: 50
+            },
+            candle: {
+              rule: "current directional candle real body engulfs prior opposite candle real body",
+              ...candle
+            },
+            reconstructionNotes: [
+              "15s and 1m are scored as separate signal timeframes because the transcript does not define a combined multi-timeframe rule.",
+              "The video does not quantify candle strength; a classic real-body engulfing pair is used as a mechanical proxy.",
+              "Entry is recorded on the first live quote where the intrabar conditions align; the transcript does not explicitly state candle-close timing."
+            ]
+          }
+        });
+        if (capture?.ok && !capture?.duplicate) {
+          captured.push({
+            signalTimeframe: frame.signalTimeframe,
+            direction,
+            shadowId: capture.id,
+            entryPrice,
+            entryAt,
+            signalBarOpenAt
+          });
+        }
+      }
+    }
 
     return {
-      ...candidate,
+      ok: true,
       symbol,
-      captured: Boolean(capture?.ok && !capture?.duplicate),
-      duplicate: Boolean(capture?.duplicate),
-      shadowId: capture?.id || null,
-      entryPrice,
-      entryAt,
-      signalBarOpenAt,
-      entryMode: "intrabar-indicator-confirmation",
-      dataSource: "otcharts-pocket-option-otc-s30"
+      captured: captured.length > 0,
+      capturedSignals: captured,
+      blockers
     };
   }
 
@@ -7646,7 +7741,7 @@ export class TickHub extends DurableObject {
 
     // CRUZ V2 — 30s Aroon(10) + OsMA(10,20,10)
     if (u.pathname === "/short-shadow") {
-      if (!symbol || !OTC_SHADOW_UNIVERSE.includes(symbol)) {
+      if (!symbol || !SHORT_SHADOW_UNIVERSE.includes(symbol)) {
         return json(
           {
             ok: false,
@@ -8100,7 +8195,7 @@ async function scanShortShadowUniverse(env) {
   const checked = [];
   const captured = [];
 
-  for (const symbol of OTC_SHADOW_UNIVERSE) {
+  for (const symbol of SHORT_SHADOW_UNIVERSE) {
     try {
       const result = await hub(
         env,
@@ -8150,8 +8245,8 @@ async function autoScanShortShadow(env) {
       "/settle-short-shadow"
     );
 
-    // Start the Pocket Option OTC quote stream before scanning.
-    await hub(env, "/prime-otc?ms=5000");
+    // Start the live Tiingo UTC FX stream before scanning.
+    await hub(env, "/prime-live?ms=5000");
 
     const shortShadow =
       await scanShortShadowUniverse(
@@ -8200,7 +8295,6 @@ async function autoScanAndAlert(env) {
       "/settle-short-shadow"
     );
     await hub(env, "/prime-live?ms=5000");
-    await hub(env, "/prime-otc?ms=5000");
 
     // -------------------------------------------------
     // SHORT-EXPIRY SHADOW
@@ -8701,8 +8795,8 @@ export default {
 
               `SHORT-EXPIRY SHADOW\n` +
               `Strategy: ${st.strategyId}\n` +
-              `Market data: Pocket Option OTC (OTCharts)\n` +
-              `Pairs: ${OTC_SHADOW_UNIVERSE.join(", ")}\n` +
+              `Market data: Tiingo UTC FX live quotes\n` +
+              `Pairs: ${SHORT_SHADOW_UNIVERSE.join(", ")}\n` +
               `Pending setups: ${st.pending || 0}\n\n` +
 
               `PENDING HEALTH\n` +
@@ -9065,7 +9159,7 @@ export default {
             `Tiingo REST quota: ${quota}\n\n` +
 
             `SHORT-EXPIRY SHADOW\n` +
-            `OTC pairs checked last scan: ${Number(r.shortShadowChecked || 0)}/${OTC_SHADOW_UNIVERSE.length}\n` +
+            `UTC pairs checked last scan: ${Number(r.shortShadowChecked || 0)}/${SHORT_SHADOW_UNIVERSE.length}\n` +
             `Setups captured last scan: ${Number(r.shortShadowCaptured || 0)}\n` +
             `Captured pairs: ${Array.isArray(r.shortShadowSymbols) &&
               r.shortShadowSymbols.length
