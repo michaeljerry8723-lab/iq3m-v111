@@ -6318,6 +6318,20 @@ export class TickHub extends DurableObject {
         key
       );
 
+    const bySignalTimeframe = {};
+    for (const signalTimeframe of ["15s", "1m"]) {
+      const frameRecords = records.filter(
+        item => item?.features?.signalTimeframe === signalTimeframe
+      );
+      bySignalTimeframe[signalTimeframe] = {
+        expiry60: summarizeSubset(frameRecords, "result60"),
+        expiry120: summarizeSubset(frameRecords, "result120"),
+        pending: pending.filter(
+          item => item?.features?.signalTimeframe === signalTimeframe
+        ).length
+      };
+    }
+
 
     // -------------------------------------------------
     // PERFORMANCE BY PAIR
@@ -6918,6 +6932,8 @@ export class TickHub extends DurableObject {
         summarize(
           "result300"
         ),
+
+      bySignalTimeframe,
 
       byPair,
 
@@ -7739,7 +7755,7 @@ export class TickHub extends DurableObject {
       return json(result);
     }
 
-    // CRUZ V2 — 30s Aroon(10) + OsMA(10,20,10)
+    // Screenshot/transcript-derived Ichimoku + RSI UTC shadow strategy
     if (u.pathname === "/short-shadow") {
       if (!symbol || !SHORT_SHADOW_UNIVERSE.includes(symbol)) {
         return json(
@@ -8822,6 +8838,14 @@ export default {
               `Voids: ${st.expiry120?.voids || 0}\n` +
               `W/L win rate: ${wr120}\n\n` +
 
+              `BY SIGNAL TIMEFRAME\n` +
+              `15s — 60s ${formatBucket(st.bySignalTimeframe?.["15s"]?.expiry60)} | ` +
+              `120s ${formatBucket(st.bySignalTimeframe?.["15s"]?.expiry120)} | ` +
+              `Pending: ${st.bySignalTimeframe?.["15s"]?.pending || 0}\n` +
+              `1m — 60s ${formatBucket(st.bySignalTimeframe?.["1m"]?.expiry60)} | ` +
+              `120s ${formatBucket(st.bySignalTimeframe?.["1m"]?.expiry120)} | ` +
+              `Pending: ${st.bySignalTimeframe?.["1m"]?.pending || 0}\n\n` +
+
               `BY DIRECTION\n` +
               `CALL — 60s ${formatBucket(callStats.expiry60)} | ` +
               `120s ${formatBucket(callStats.expiry120)} | ` +
@@ -8987,150 +9011,36 @@ export default {
         }
         if (/^\/shortdiag$/i.test(text)) {
           try {
-            await hub(env, "/prime-otc?ms=5000");
+            await hub(env, "/prime-live?ms=5000");
             const rows = [];
-            let websocketConnected = null;
-            let source = "otcharts-pocket-option-otc-s30";
-            let readyCount = 0;
-            let lastWsMessageAge = null;
-            let lastWsQuoteAge = null;
-            let lastPriceReceivedAge = null;
-            let reconnectCount = null;
-            let websocketStatus = null;
-            let subscribeStatus = null;
-
-            for (const pair of OTC_SHADOW_UNIVERSE) {
+            for (const pair of SHORT_SHADOW_UNIVERSE) {
               try {
-                const r =
-                  await hub(
-                    env,
-                    `/s30-check?symbol=${encodeURIComponent(pair)}`
-                  );
-
-                websocketConnected =
-                  websocketConnected === null
-                    ? Boolean(r?.websocketConnected)
-                    : (websocketConnected && Boolean(r?.websocketConnected));
-
-                if (lastWsMessageAge === null) {
-                  lastWsMessageAge =
-                    Number.isFinite(Number(r?.lastWsMessageAgeSeconds))
-                      ? Number(r.lastWsMessageAgeSeconds)
-                      : null;
-                }
-
-                if (lastWsQuoteAge === null) {
-                  lastWsQuoteAge =
-                    Number.isFinite(Number(r?.lastWsQuoteAgeSeconds))
-                      ? Number(r.lastWsQuoteAgeSeconds)
-                      : null;
-                }
-
-                if (lastPriceReceivedAge === null) {
-                  lastPriceReceivedAge =
-                    Number.isFinite(Number(r?.lastPriceReceivedAgeSeconds))
-                      ? Number(r.lastPriceReceivedAgeSeconds)
-                      : null;
-                }
-
-                if (reconnectCount === null) {
-                  reconnectCount =
-                    Number.isFinite(Number(r?.reconnectCount))
-                      ? Number(r.reconnectCount)
-                      : null;
-                }
-
-                if (!websocketStatus) {
-                  websocketStatus =
-                    r?.websocketStatus ||
-                    null;
-                }
-
-                if (!subscribeStatus) {
-                  subscribeStatus =
-                    r?.subscribeStatus ||
-                    null;
-                }
-
-                source =
-                  r?.dataSource ||
-                  source;
-
-                const completed =
-                  Number(r?.completedBars || 0);
-
-                const required =
-                  Number(r?.requiredBars || 32);
-
-                const ticks =
-                  Number(r?.currentBarTicks || 0);
-
-                const ready =
-                  r?.ready === true;
-
-                if (ready) {
-                  readyCount++;
-                }
-
-                const state =
-                  r?.error
-                    ? "ERROR"
-                    : ready
-                      ? "READY"
-                      : "WARMING";
-
+                const r = await hub(env, `/status?symbol=${encodeURIComponent(pair)}`);
+                const age = Number.isFinite(Number(r?.lastTickAgeSeconds))
+                  ? `${Number(r.lastTickAgeSeconds).toFixed(1)}s`
+                  : "n/a";
                 rows.push(
-                  `${pair} - ${state} - ${completed}/${required} bars - ${ticks} ticks` +
-                  (r?.error
-                    ? ` - ${String(r.error).slice(0, 120)}`
-                    : "")
+                  `${pair}: ${r?.connected ? "LIVE" : (r?.status || "WAITING")} — ` +
+                  `${Number(r?.ticks || 0)} quotes, latest ${age}, ` +
+                  `${Number(r?.bars60 || 0)} live 1m bars`
                 );
               } catch (e) {
-                rows.push(
-                  `${pair} - ERROR - ${String(e?.message || e).slice(0, 120)}`
-                );
-                websocketConnected = false;
+                rows.push(`${pair}: ERROR — ${String(e?.message || e).slice(0, 90)}`);
               }
             }
-
-            const totalPairs =
-              OTC_SHADOW_UNIVERSE.length;
-
-            const readyAll =
-              readyCount === totalPairs;
-
             await tgSend(
               env,
               chatId,
-              `POCKET OPTION OTC S30 DATA CHECK\n` +
-              `Strategy: ${SHORT_SHADOW_ID}\n` +
-              `Pairs: ${totalPairs}\n` +
-              `Ready: ${readyCount}/${totalPairs}\n` +
-              `OTC stream: ${websocketConnected ? "CONNECTED" : "RECONNECTING"}\n` +
-              `Last OTC event: ${lastWsMessageAge == null ? "n/a" : lastWsMessageAge.toFixed(1) + "s ago"}\n` +
-              `Last OTC quote: ${lastWsQuoteAge == null ? "n/a" : lastWsQuoteAge.toFixed(1) + "s ago"}\n` +
-              `Last received OTC price: ${lastPriceReceivedAge == null ? "n/a" : lastPriceReceivedAge.toFixed(1) + "s ago"}\n` +
-              `Reconnects: ${reconnectCount == null ? "n/a" : reconnectCount}\n` +
-              `SSE status: ${websocketStatus || "n/a"}\n` +
-              `Feed subscription: ${subscribeStatus || "n/a"}\n` +
-              `Source: ${source}\n\n` +
-              rows.join("\n") +
-              `\n\n` +
-              (readyAll
-                ? "All monitored pairs have sufficient 30-second history for Cruz V2."
-                : "Pairs still warming need live quote flow; from an empty cache, 32 completed S30 candles takes about 16 minutes.")
+              `ICHIMOKU + RSI UTC SHADOW DIAGNOSTIC\\n` +
+              `Strategy: ${SHORT_SHADOW_ID}\\n` +
+              `Source: Tiingo UTC FX\\n` +
+              `Signal intervals: 15s and 1m, evaluated separately\\n` +
+              `Each interval needs 54 bars for the displayed Senkou A displacement and RSI warm-up.\\n\\n` +
+              rows.join("\\n")
             );
           } catch (e) {
-            await tgSend(
-              env,
-              chatId,
-              `CRUZ V2 DATA CHECK ERROR\n` +
-              String(
-                e?.message || e
-              ).slice(0, 500)
-            );
+            await tgSend(env, chatId, `UTC SHADOW DIAGNOSTIC ERROR\\n${String(e?.message || e).slice(0, 300)}`);
           }
-
           return new Response("ok");
         }
         if (/^\/cronstatus$/i.test(text)) {
