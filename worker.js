@@ -1,7 +1,7 @@
 // V13.11.0 — UTC Ichimoku/RSI shadow from the supplied video transcript
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.11.8-utc-ichimoku-line-alignment-shadow";
+export const VERSION = "13.11.9-utc-ichimoku-fresh-cross-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -16,7 +16,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
 ]);
 export const OTC_SHADOW_UNIVERSE = Object.freeze(["EUR/USD","GBP/USD","USD/JPY","AUD/USD","USD/CAD"]);
 export const OTC_SHADOW_VENDOR_SYMBOLS = Object.freeze({"EUR/USD":"EURUSD_otc","GBP/USD":"GBPUSD_otc","USD/JPY":"USDJPY_otc","AUD/USD":"AUDUSD_otc","USD/CAD":"USDCAD_otc"});
-export const SHORT_SHADOW_ID = "utc-15s-1m-ichimoku9-26-52-rsi14-engulf-alignment-shadow-v6";
+export const SHORT_SHADOW_ID = "utc-15s-1m-ichimoku9-26-52-rsi14-engulf-fresh-cross-shadow-v7";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
 export const VIDEO_SUPERTREND_MULTIPLIER = 2;
@@ -1108,8 +1108,8 @@ function scorePocketOptionIchimokuRsi(bars, timeframe) {
   const crossDown = previousTenkan >= previousSenkouA && tenkan < senkouA;
   const bullishLineAlignment = tenkan > senkouA;
   const bearishLineAlignment = tenkan < senkouA;
-  const direction = bullishLineAlignment && currentRsi > 50 && bullishCandles ? "CALL" : bearishLineAlignment && currentRsi < 50 && bearishCandles ? "PUT" : null;
-  return { ok: Boolean(direction), direction, timeframe, bars: bars.length, requiredBars: required, settings: { tenkan: 9, kijun: 26, senkouB: 52, rsi: 14, rsiLevels: [30,50,70] }, tenkan, previousTenkan, senkouA, previousSenkouA, rsi: currentRsi, crossUp, crossDown, bullishCandles, bearishCandles, bullishRunBars: bullishRun.runBars, bearishRunBars: bearishRun.runBars, trigger: direction ? "Ichimoku Tenkan/Senkou-A aligned state after crossover + RSI(14) 50-side confirmation + active directional run containing an engulfing pair" : null, usesFormingCurrentCandle: true, notes: ["15s and 1m are evaluated as separate variants; transcript does not require confluence", "the engulfing pair remains active only while subsequent candles stay directional; a doji or opposite candle resets it", "RSI 30/70 levels are displayed but do not gate entry", "crossing arms the direction; RSI and engulfing confirmation may follow while Tenkan remains on the corresponding side of Senkou A"] };
+  const direction = crossUp && currentRsi > 50 && bullishCandles ? "CALL" : crossDown && currentRsi < 50 && bearishCandles ? "PUT" : null;
+  return { ok: Boolean(direction), direction, timeframe, bars: bars.length, requiredBars: required, settings: { tenkan: 9, kijun: 26, senkouB: 52, rsi: 14, rsiLevels: [30,50,70] }, tenkan, previousTenkan, senkouA, previousSenkouA, rsi: currentRsi, crossUp, crossDown, bullishCandles, bearishCandles, bullishRunBars: bullishRun.runBars, bearishRunBars: bearishRun.runBars, trigger: direction ? "fresh Ichimoku Tenkan/Senkou-A crossover + RSI(14) 50-side confirmation + active directional run containing an engulfing pair" : null, usesFormingCurrentCandle: true, notes: ["15s and 1m are evaluated as separate variants; transcript does not require confluence", "the engulfing pair remains active only while subsequent candles stay directional; a doji or opposite candle resets it", "RSI 30/70 levels are displayed but do not gate entry", "the Tenkan/Senkou-A crossover must occur on the evaluated candle; RSI 50-side and engulfing-run conditions must also qualify on that evaluation"] };
 }
 
 export function scorePocketOption30sSuperTrendMacd(bars30, previousLiveMacd = null) {
