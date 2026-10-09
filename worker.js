@@ -1,7 +1,7 @@
 // V13.11.0 — UTC Ichimoku/RSI shadow from the supplied video transcript
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.11.3-utc-do-quota-fix";
+export const VERSION = "13.11.4-utc-ichimoku-engulf-pair";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -16,7 +16,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
 ]);
 export const OTC_SHADOW_UNIVERSE = Object.freeze(["EUR/USD","GBP/USD","USD/JPY","AUD/USD","USD/CAD"]);
 export const OTC_SHADOW_VENDOR_SYMBOLS = Object.freeze({"EUR/USD":"EURUSD_otc","GBP/USD":"GBPUSD_otc","USD/JPY":"USDJPY_otc","AUD/USD":"AUDUSD_otc","USD/CAD":"USDCAD_otc"});
-export const SHORT_SHADOW_ID = "utc-15s-1m-ichimoku9-26-52-rsi14-engulf-shadow-v2";
+export const SHORT_SHADOW_ID = "utc-15s-1m-ichimoku9-26-52-rsi14-engulf-shadow-v3";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
 export const VIDEO_SUPERTREND_MULTIPLIER = 2;
@@ -1085,16 +1085,16 @@ function scorePocketOptionIchimokuRsi(bars, timeframe) {
       Math.min(ao, ac) <= Math.min(bo, bc) &&
       Math.max(ao, ac) >= Math.max(bo, bc);
   };
-  // Interpret "a series of directional candles engulfing each other" as two
-  // consecutive same-direction candles, each body covering the previous body.
+  // Require a two-candle directional engulfing formation. The crossover
+  // and RSI confirmation still have to be present on the current forming bar.
   const bullishCandles = isDirectional(bars[i], "CALL") && isDirectional(bars[i-1], "CALL") &&
-    bodyEngulfs(bars[i], bars[i-1]) && bodyEngulfs(bars[i-1], bars[i-2]);
+    bodyEngulfs(bars[i], bars[i-1]);
   const bearishCandles = isDirectional(bars[i], "PUT") && isDirectional(bars[i-1], "PUT") &&
-    bodyEngulfs(bars[i], bars[i-1]) && bodyEngulfs(bars[i-1], bars[i-2]);
+    bodyEngulfs(bars[i], bars[i-1]);
   const crossUp = previousTenkan <= previousSenkouA && tenkan > senkouA;
   const crossDown = previousTenkan >= previousSenkouA && tenkan < senkouA;
   const direction = crossUp && currentRsi > 50 && bullishCandles ? "CALL" : crossDown && currentRsi < 50 && bearishCandles ? "PUT" : null;
-  return { ok: Boolean(direction), direction, timeframe, bars: bars.length, requiredBars: required, settings: { tenkan: 9, kijun: 26, senkouB: 52, rsi: 14, rsiLevels: [30,50,70] }, tenkan, previousTenkan, senkouA, previousSenkouA, rsi: currentRsi, crossUp, crossDown, bullishCandles, bearishCandles, trigger: direction ? "Ichimoku Tenkan/Senkou-A cross + RSI(14) 50-side confirmation + two directional body engulfings" : null, usesFormingCurrentCandle: true, notes: ["15s and 1m are evaluated as separate variants; transcript does not require confluence", "standard Senkou A chart displacement and two body-engulf candles operationalize unspecified video details", "RSI 30/70 levels are displayed but do not gate entry"] };
+  return { ok: Boolean(direction), direction, timeframe, bars: bars.length, requiredBars: required, settings: { tenkan: 9, kijun: 26, senkouB: 52, rsi: 14, rsiLevels: [30,50,70] }, tenkan, previousTenkan, senkouA, previousSenkouA, rsi: currentRsi, crossUp, crossDown, bullishCandles, bearishCandles, trigger: direction ? "Ichimoku Tenkan/Senkou-A cross + RSI(14) 50-side confirmation + one two-candle directional body engulfing" : null, usesFormingCurrentCandle: true, notes: ["15s and 1m are evaluated as separate variants; transcript does not require confluence", "standard Senkou A chart displacement and one two-candle body-engulf formation operationalizes the video candle sequence", "RSI 30/70 levels are displayed but do not gate entry"] };
 }
 
 export function scorePocketOption30sSuperTrendMacd(bars30, previousLiveMacd = null) {
@@ -7628,6 +7628,9 @@ export class TickHub extends DurableObject {
             reason: score.reason || null,
             rsi: Number.isFinite(Number(score.rsi)) ? Number(score.rsi) : null,
             cross,
+            lineRelation: Number.isFinite(Number(score.tenkan)) && Number.isFinite(Number(score.senkouA))
+              ? (score.tenkan > score.senkouA ? "Tenkan above Senkou A" : score.tenkan < score.senkouA ? "Tenkan below Senkou A" : "lines equal")
+              : "unavailable",
             callGates,
             putGates
           };
@@ -8742,6 +8745,7 @@ export default {
                 const gates = check.direction ? check.direction : "no signal";
                 return label + " " + gates + " RSI=" + (check.rsi == null ? "n/a" : check.rsi.toFixed(1)) +
                   " X=" + (check.cross || "none") +
+                  " (" + (check.lineRelation || "line relation unavailable") + ")" +
                   " C=" + (check.callGates?.engulfSequence ? "CALL" : check.putGates?.engulfSequence ? "PUT" : "none");
               };
               return r.symbol + " — " + fmt("15s", r.bars15, r.evaluation15s) +
