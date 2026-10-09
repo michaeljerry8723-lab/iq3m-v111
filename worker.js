@@ -1,7 +1,7 @@
 // V13.11.0 — UTC Ichimoku/RSI shadow from the supplied video transcript
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.11.6-utc-ichimoku-sequence-confirmation";
+export const VERSION = "13.11.7-utc-ichimoku-fresh-collection";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -16,7 +16,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
 ]);
 export const OTC_SHADOW_UNIVERSE = Object.freeze(["EUR/USD","GBP/USD","USD/JPY","AUD/USD","USD/CAD"]);
 export const OTC_SHADOW_VENDOR_SYMBOLS = Object.freeze({"EUR/USD":"EURUSD_otc","GBP/USD":"GBPUSD_otc","USD/JPY":"USDJPY_otc","AUD/USD":"AUDUSD_otc","USD/CAD":"USDCAD_otc"});
-export const SHORT_SHADOW_ID = "utc-15s-1m-ichimoku9-26-52-rsi14-engulf-shadow-v4";
+export const SHORT_SHADOW_ID = "utc-15s-1m-ichimoku9-26-52-rsi14-engulf-shadow-v5";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
 export const VIDEO_SUPERTREND_MULTIPLIER = 2;
@@ -8811,7 +8811,7 @@ export default {
                 " | " + fmt("1m", r.bars1m, r.evaluation1m) +
                 " | quote " + (r.quoteAgeSeconds == null ? "n/a" : r.quoteAgeSeconds.toFixed(1) + "s");
             });
-            await tgSend(env, chatId, "UTC ICHIMOKU/RSI SHADOW DIAGNOSTICS\n" + VERSION + " | " + SHORT_SHADOW_ID + "\n\nSource: Tiingo UTC FX\n" + rows.join("\n"));
+            await tgSend(env, chatId, "UTC ICHIMOKU/RSI SHADOW DIAGNOSTICS\n" + VERSION + " | " + SHORT_SHADOW_ID + "\nTickHub code: " + (result?.workerVersion || result?.rows?.[0]?.workerVersion || "unknown") + "\n\nSource: Tiingo UTC FX\n" + rows.join("\n"));
           } catch (e) {
             await tgSend(env, chatId, "UTC ICHIMOKU/RSI DIAGNOSTICS ERROR\n" + String(e?.message || e).slice(0, 500));
           }
