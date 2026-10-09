@@ -1,7 +1,7 @@
 // V13.11.0 — UTC Ichimoku/RSI shadow from the supplied video transcript
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.11.4-utc-ichimoku-engulf-pair";
+export const VERSION = "13.11.5-utc-ichimoku-line-diagnostics";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -7611,6 +7611,34 @@ export class TickHub extends DurableObject {
         const checkEntry = (bars, timeframe) => {
           const score = scorePocketOptionIchimokuRsi(bars, timeframe);
           const cross = score.crossUp ? "up" : score.crossDown ? "down" : "none";
+          const i = bars.length - 1;
+          const tenkan = midpointRange(bars, i, VIDEO_ICHIMOKU_TENKAN);
+          const previousTenkan = midpointRange(bars, i - 1, VIDEO_ICHIMOKU_TENKAN);
+          const sourceIndex = i - VIDEO_ICHIMOKU_KIJUN;
+          const senkouA = (
+            midpointRange(bars, sourceIndex, VIDEO_ICHIMOKU_TENKAN) +
+            midpointRange(bars, sourceIndex, VIDEO_ICHIMOKU_KIJUN)
+          ) / 2;
+          const previousSenkouA = (
+            midpointRange(bars, sourceIndex - 1, VIDEO_ICHIMOKU_TENKAN) +
+            midpointRange(bars, sourceIndex - 1, VIDEO_ICHIMOKU_KIJUN)
+          ) / 2;
+          const linesReady = [tenkan, previousTenkan, senkouA, previousSenkouA].every(Number.isFinite);
+          const lineRelation = !linesReady
+            ? "warming"
+            : tenkan > senkouA
+              ? "Tenkan above Senkou A"
+              : tenkan < senkouA
+                ? "Tenkan below Senkou A"
+                : "lines equal";
+          const calculatedCross = !linesReady
+            ? "warming"
+            : previousTenkan <= previousSenkouA && tenkan > senkouA
+              ? "up"
+              : previousTenkan >= previousSenkouA && tenkan < senkouA
+                ? "down"
+                : "none";
+          const scoreLinesAvailable = Number.isFinite(Number(score.tenkan)) && Number.isFinite(Number(score.senkouA));
           const callGates = {
             crossover: Boolean(score.crossUp),
             rsiAbove50: Number.isFinite(Number(score.rsi)) && Number(score.rsi) > 50,
@@ -7627,10 +7655,16 @@ export class TickHub extends DurableObject {
             direction: score.direction || null,
             reason: score.reason || null,
             rsi: Number.isFinite(Number(score.rsi)) ? Number(score.rsi) : null,
-            cross,
-            lineRelation: Number.isFinite(Number(score.tenkan)) && Number.isFinite(Number(score.senkouA))
-              ? (score.tenkan > score.senkouA ? "Tenkan above Senkou A" : score.tenkan < score.senkouA ? "Tenkan below Senkou A" : "lines equal")
+            rsiSide: Number.isFinite(Number(score.rsi))
+              ? (score.rsi > 50 ? "above50" : score.rsi < 50 ? "below50" : "at50")
               : "unavailable",
+            cross,
+            calculatedCross,
+            lineRelation,
+            lineValues: linesReady ? {
+              tenkan, senkouA, previousTenkan, previousSenkouA
+            } : null,
+            scoreLinesAvailable,
             callGates,
             putGates
           };
@@ -8743,9 +8777,15 @@ export default {
               const fmt = (label, bars, check) => {
                 if (!check?.ready) return label + " " + bars + "/53 warm";
                 const gates = check.direction ? check.direction : "no signal";
+                const lines = check.lineValues
+                  ? " T=" + check.lineValues.tenkan.toPrecision(7) + " SA=" + check.lineValues.senkouA.toPrecision(7)
+                  : "";
                 return label + " " + gates + " RSI=" + (check.rsi == null ? "n/a" : check.rsi.toFixed(1)) +
+                  "(" + (check.rsiSide || "unknown") + ")" +
                   " X=" + (check.cross || "none") +
-                  " (" + (check.lineRelation || "line relation unavailable") + ")" +
+                  " calcX=" + (check.calculatedCross || "unknown") +
+                  " (" + (check.lineRelation || "line relation unavailable") + ")" + lines +
+                  " scorerLines=" + (check.scoreLinesAvailable ? "yes" : "no") +
                   " C=" + (check.callGates?.engulfSequence ? "CALL" : check.putGates?.engulfSequence ? "PUT" : "none");
               };
               return r.symbol + " — " + fmt("15s", r.bars15, r.evaluation15s) +
