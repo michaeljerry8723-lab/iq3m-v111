@@ -1,7 +1,7 @@
 // V13.11.0 — UTC Ichimoku/RSI shadow from the supplied video transcript
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.11.5-utc-ichimoku-line-diagnostics";
+export const VERSION = "13.11.6-utc-ichimoku-sequence-confirmation";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -16,7 +16,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
 ]);
 export const OTC_SHADOW_UNIVERSE = Object.freeze(["EUR/USD","GBP/USD","USD/JPY","AUD/USD","USD/CAD"]);
 export const OTC_SHADOW_VENDOR_SYMBOLS = Object.freeze({"EUR/USD":"EURUSD_otc","GBP/USD":"GBPUSD_otc","USD/JPY":"USDJPY_otc","AUD/USD":"AUDUSD_otc","USD/CAD":"USDCAD_otc"});
-export const SHORT_SHADOW_ID = "utc-15s-1m-ichimoku9-26-52-rsi14-engulf-shadow-v3";
+export const SHORT_SHADOW_ID = "utc-15s-1m-ichimoku9-26-52-rsi14-engulf-shadow-v4";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
 export const VIDEO_SUPERTREND_MULTIPLIER = 2;
@@ -1085,16 +1085,29 @@ function scorePocketOptionIchimokuRsi(bars, timeframe) {
       Math.min(ao, ac) <= Math.min(bo, bc) &&
       Math.max(ao, ac) >= Math.max(bo, bc);
   };
-  // Require a two-candle directional engulfing formation. The crossover
-  // and RSI confirmation still have to be present on the current forming bar.
-  const bullishCandles = isDirectional(bars[i], "CALL") && isDirectional(bars[i-1], "CALL") &&
-    bodyEngulfs(bars[i], bars[i-1]);
-  const bearishCandles = isDirectional(bars[i], "PUT") && isDirectional(bars[i-1], "PUT") &&
-    bodyEngulfs(bars[i], bars[i-1]);
+  // The video first identifies a directional engulfing formation, then waits
+  // for the Ichimoku/RSI confirmation. Keep that formation active while the
+  // subsequent candles remain directional; a doji or opposite candle resets it.
+  const directionalEngulfRun = dir => {
+    let runBars = 0;
+    for (let j = i; j >= 0 && isDirectional(bars[j], dir); j--) runBars++;
+    let hasEngulfingPair = false;
+    for (let j = i; j > i - runBars + 1; j--) {
+      if (bodyEngulfs(bars[j], bars[j - 1])) {
+        hasEngulfingPair = true;
+        break;
+      }
+    }
+    return { runBars, qualifies: runBars >= 2 && hasEngulfingPair };
+  };
+  const bullishRun = directionalEngulfRun("CALL");
+  const bearishRun = directionalEngulfRun("PUT");
+  const bullishCandles = bullishRun.qualifies;
+  const bearishCandles = bearishRun.qualifies;
   const crossUp = previousTenkan <= previousSenkouA && tenkan > senkouA;
   const crossDown = previousTenkan >= previousSenkouA && tenkan < senkouA;
   const direction = crossUp && currentRsi > 50 && bullishCandles ? "CALL" : crossDown && currentRsi < 50 && bearishCandles ? "PUT" : null;
-  return { ok: Boolean(direction), direction, timeframe, bars: bars.length, requiredBars: required, settings: { tenkan: 9, kijun: 26, senkouB: 52, rsi: 14, rsiLevels: [30,50,70] }, tenkan, previousTenkan, senkouA, previousSenkouA, rsi: currentRsi, crossUp, crossDown, bullishCandles, bearishCandles, trigger: direction ? "Ichimoku Tenkan/Senkou-A cross + RSI(14) 50-side confirmation + one two-candle directional body engulfing" : null, usesFormingCurrentCandle: true, notes: ["15s and 1m are evaluated as separate variants; transcript does not require confluence", "standard Senkou A chart displacement and one two-candle body-engulf formation operationalizes the video candle sequence", "RSI 30/70 levels are displayed but do not gate entry"] };
+  return { ok: Boolean(direction), direction, timeframe, bars: bars.length, requiredBars: required, settings: { tenkan: 9, kijun: 26, senkouB: 52, rsi: 14, rsiLevels: [30,50,70] }, tenkan, previousTenkan, senkouA, previousSenkouA, rsi: currentRsi, crossUp, crossDown, bullishCandles, bearishCandles, bullishRunBars: bullishRun.runBars, bearishRunBars: bearishRun.runBars, trigger: direction ? "Ichimoku Tenkan/Senkou-A cross + RSI(14) 50-side confirmation + active directional run containing an engulfing pair" : null, usesFormingCurrentCandle: true, notes: ["15s and 1m are evaluated as separate variants; transcript does not require confluence", "the engulfing pair remains active only while subsequent candles stay directional; a doji or opposite candle resets it", "RSI 30/70 levels are displayed but do not gate entry"] };
 }
 
 export function scorePocketOption30sSuperTrendMacd(bars30, previousLiveMacd = null) {
@@ -7239,7 +7252,7 @@ export class TickHub extends DurableObject {
           primaryExpiriesSeconds: SHORT_SHADOW_EXPIRIES,
           indicators: candidate.settings,
           ichimoku: { tenkan: candidate.tenkan, previousTenkan: candidate.previousTenkan, senkouA: candidate.senkouA, previousSenkouA: candidate.previousSenkouA },
-          rsi: candidate.rsi, bullishCandles: candidate.bullishCandles, bearishCandles: candidate.bearishCandles,
+          rsi: candidate.rsi, bullishCandles: candidate.bullishCandles, bearishCandles: candidate.bearishCandles, bullishRunBars: candidate.bullishRunBars, bearishRunBars: candidate.bearishRunBars,
           trigger: candidate.trigger, reconstructionNotes: candidate.notes
         }
       });
@@ -7642,12 +7655,14 @@ export class TickHub extends DurableObject {
           const callGates = {
             crossover: Boolean(score.crossUp),
             rsiAbove50: Number.isFinite(Number(score.rsi)) && Number(score.rsi) > 50,
-            engulfSequence: Boolean(score.bullishCandles)
+            engulfSequence: Boolean(score.bullishCandles),
+            directionalRunBars: Number(score.bullishRunBars || 0)
           };
           const putGates = {
             crossover: Boolean(score.crossDown),
             rsiBelow50: Number.isFinite(Number(score.rsi)) && Number(score.rsi) < 50,
-            engulfSequence: Boolean(score.bearishCandles)
+            engulfSequence: Boolean(score.bearishCandles),
+            directionalRunBars: Number(score.bearishRunBars || 0)
           };
           return {
             ready: bars.length >= 53,
@@ -8786,7 +8801,11 @@ export default {
                   " calcX=" + (check.calculatedCross || "unknown") +
                   " (" + (check.lineRelation || "line relation unavailable") + ")" + lines +
                   " scorerLines=" + (check.scoreLinesAvailable ? "yes" : "no") +
-                  " C=" + (check.callGates?.engulfSequence ? "CALL" : check.putGates?.engulfSequence ? "PUT" : "none");
+                  " C=" + (check.callGates?.engulfSequence
+                    ? "CALL/run" + check.callGates.directionalRunBars
+                    : check.putGates?.engulfSequence
+                      ? "PUT/run" + check.putGates.directionalRunBars
+                      : "none");
               };
               return r.symbol + " — " + fmt("15s", r.bars15, r.evaluation15s) +
                 " | " + fmt("1m", r.bars1m, r.evaluation1m) +
