@@ -7282,7 +7282,7 @@ export class TickHub extends DurableObject {
       const candidate = scorePocketOptionIchimokuRsi(bars, variant.timeframe);
       checked.push({ timeframe: variant.timeframe, ok: candidate.ok, reason: candidate.reason || null });
       if (!candidate.ok || !candidate.direction) continue;
-      const entryPrice = Number(quote.p), entryAt = quoteAt, signalBar = bars.at(-1);
+      const entryPrice = Number(quote.p), entryAt = quoteAt, signalBar = bars.at(-2);
       if (!Number.isFinite(entryPrice) || !signalBar || !Number.isFinite(Number(signalBar.t))) continue;
       const sourceKey = SHORT_SHADOW_ID + "|" + symbol + "|" + variant.timeframe + "|" + candidate.direction + "|" + signalBar.t;
       const capture = await this.captureShortShadow({
@@ -7652,9 +7652,7 @@ export class TickHub extends DurableObject {
     // CRUZ V2 — 30s Aroon(10) + OsMA(10,20,10)
     if (u.pathname === "/ichimoku-check") {
       const requestedSymbol = u.searchParams.get("symbol");
-      const symbols = requestedSymbol
-        ? [normalizeSymbol(requestedSymbol)]
-        : SHORT_SHADOW_UNIVERSE;
+      const symbols = requestedSymbol ? [normalizeSymbol(requestedSymbol)] : SHORT_SHADOW_UNIVERSE;
       if (symbols.some(symbol => !symbol || !SHORT_SHADOW_UNIVERSE.includes(symbol))) {
         return json({ ok: false, error: "invalid UTC FX symbol" }, 400);
       }
@@ -7667,65 +7665,30 @@ export class TickHub extends DurableObject {
         const latest = ticks.at(-1);
         const checkEntry = (bars, timeframe) => {
           const score = scorePocketOptionIchimokuRsi(bars, timeframe);
-          const cross = score.crossUp ? "up" : score.crossDown ? "down" : "none";
-          const i = bars.length - 1;
-          const tenkan = midpointRange(bars, i, VIDEO_ICHIMOKU_TENKAN);
-          const previousTenkan = midpointRange(bars, i - 1, VIDEO_ICHIMOKU_TENKAN);
-          const sourceIndex = i - VIDEO_ICHIMOKU_KIJUN;
-          const senkouA = (
-            midpointRange(bars, sourceIndex, VIDEO_ICHIMOKU_TENKAN) +
-            midpointRange(bars, sourceIndex, VIDEO_ICHIMOKU_KIJUN)
-          ) / 2;
-          const previousSenkouA = (
-            midpointRange(bars, sourceIndex - 1, VIDEO_ICHIMOKU_TENKAN) +
-            midpointRange(bars, sourceIndex - 1, VIDEO_ICHIMOKU_KIJUN)
-          ) / 2;
-          const linesReady = [tenkan, previousTenkan, senkouA, previousSenkouA].every(Number.isFinite);
-          const lineRelation = !linesReady
-            ? "warming"
-            : tenkan > senkouA
-              ? "Tenkan above Senkou A"
-              : tenkan < senkouA
-                ? "Tenkan below Senkou A"
-                : "lines equal";
-          const calculatedCross = !linesReady
-            ? "warming"
-            : previousTenkan <= previousSenkouA && tenkan > senkouA
-              ? "up"
-              : previousTenkan >= previousSenkouA && tenkan < senkouA
-                ? "down"
-                : "none";
-          const scoreLinesAvailable = Number.isFinite(Number(score.tenkan)) && Number.isFinite(Number(score.senkouA));
-          const callGates = {
-            crossover: Boolean(score.crossUp),
-            rsiAbove50: Number.isFinite(Number(score.rsi)) && Number(score.rsi) > 50,
-            engulfSequence: Boolean(score.bullishCandles),
-            directionalRunBars: Number(score.bullishRunBars || 0)
-          };
-          const putGates = {
-            crossover: Boolean(score.crossDown),
-            rsiBelow50: Number.isFinite(Number(score.rsi)) && Number(score.rsi) < 50,
-            engulfSequence: Boolean(score.bearishCandles),
-            directionalRunBars: Number(score.bearishRunBars || 0)
-          };
+          const callGates = score.callGates || {};
+          const putGates = score.putGates || {};
           return {
-            ready: bars.length >= 53,
+            ready: Number(score.bars || 0) >= Number(score.requiredBars || 78),
+            bars: Number(score.bars || Math.max(0, bars.length - 1)),
+            requiredBars: Number(score.requiredBars || 78),
             qualifies: Boolean(score.ok && score.direction),
             direction: score.direction || null,
             reason: score.reason || null,
             rsi: Number.isFinite(Number(score.rsi)) ? Number(score.rsi) : null,
-            rsiSide: Number.isFinite(Number(score.rsi))
-              ? (score.rsi > 50 ? "above50" : score.rsi < 50 ? "below50" : "at50")
-              : "unavailable",
-            cross,
-            calculatedCross,
-            lineRelation,
-            lineValues: linesReady ? {
-              tenkan, senkouA, previousTenkan, previousSenkouA
-            } : null,
-            scoreLinesAvailable,
-            callGates,
-            putGates
+            rsiRising: Boolean(score.rsiRising),
+            rsiFalling: Boolean(score.rsiFalling),
+            cloudPosition: score.cloudPosition || "warming",
+            tenkanRising: Boolean(score.tenkanRising),
+            tenkanFalling: Boolean(score.tenkanFalling),
+            bullishPullback: Boolean(score.bullishPullback),
+            bearishPullback: Boolean(score.bearishPullback),
+            bullishRejection: Boolean(score.bullishRejection),
+            bearishRejection: Boolean(score.bearishRejection),
+            choppy: Boolean(score.choppy),
+            tenkanCrosses: Number(score.tenkanCrosses || 0),
+            rsiMidlineCrosses: Number(score.rsiMidlineCrosses || 0),
+            callGates, putGates,
+            reconstructionNotes: score.notes || []
           };
         };
         const evaluation15s = checkEntry(bars15, "15s");
@@ -7734,8 +7697,9 @@ export class TickHub extends DurableObject {
           ok: true, symbol: checkSymbol, dataSource: "tiingo-utc-fx",
           websocketConnected: Boolean(this.ws && this.ws.readyState === 1),
           quoteAgeSeconds: latest ? Math.max(0, (Date.now() - Number(latest.r || latest.t)) / 1000) : null,
-          bars15: bars15.length, bars1m: bars60.length, requiredBars: 53,
-          ready15s: bars15.length >= 53, ready1m: bars60.length >= 53,
+          bars15: bars15.length, bars1m: bars60.length,
+          requiredBars: 78,
+          ready15s: evaluation15s.ready, ready1m: evaluation1m.ready,
           evaluation15s, evaluation1m,
           workerVersion: VERSION, strategyId: SHORT_SHADOW_ID
         });
