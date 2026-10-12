@@ -1,7 +1,7 @@
 // V13.11.0 — UTC Ichimoku/RSI shadow from the supplied video transcript
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.12.0-utc-ichimoku-pullback-rejection-shadow";
+export const VERSION = "13.13.0-utc-ichimoku-parallel-shadow-validation";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -16,8 +16,13 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
 ]);
 export const OTC_SHADOW_UNIVERSE = Object.freeze(["EUR/USD","GBP/USD","USD/JPY","AUD/USD","USD/CAD"]);
 export const OTC_SHADOW_VENDOR_SYMBOLS = Object.freeze({"EUR/USD":"EURUSD_otc","GBP/USD":"GBPUSD_otc","USD/JPY":"USDJPY_otc","AUD/USD":"AUDUSD_otc","USD/CAD":"USDCAD_otc"});
-export const SHORT_SHADOW_ID = "utc-15s-1m-ichimoku9-26-52-rsi14-cloud-pullback-rsi14-shadow-v8";
+export const SHORT_SHADOW_ID = "utc-15s-1m-ichimoku9-26-52-cloud-pullback-parallel-shadow-v9";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
+export const SHORT_SHADOW_VARIANTS = Object.freeze([
+  { id: "v8-baseline", label: "v8 baseline (Tenkan or cloud touch)" },
+  { id: "tenkan-only-v9", label: "Tenkan touch only" },
+  { id: "cloud-edge-only-v9", label: "Cloud edge touch only" }
+]);
 export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
 export const VIDEO_SUPERTREND_MULTIPLIER = 2;
 export const VIDEO_MACD_FAST_PERIOD = 10;
@@ -1065,8 +1070,7 @@ function midpointRange(bars, end, period) {
 }
 function scorePocketOptionIchimokuRsi(inputBars, timeframe) {
   const seconds = timeframe === "15s" ? 15 : 60;
-  // The video-derived model enters after a confirmation candle has closed.
-  // buildBars includes the currently forming candle, so score only prior bars.
+  // The video-derived model evaluates only closed candles; the final built bar is forming.
   const bars = Array.isArray(inputBars) ? inputBars.slice(0, -1) : [];
   const required = VIDEO_ICHIMOKU_KIJUN + VIDEO_ICHIMOKU_SENKOU_B;
   if (bars.length < required) return { ok: false, reason: "Ichimoku cloud context is warming up", timeframe, bars: bars.length, requiredBars: required, timeframeSeconds: seconds };
@@ -1085,8 +1089,7 @@ function scorePocketOptionIchimokuRsi(inputBars, timeframe) {
       b: midpointRange(bars, source, VIDEO_ICHIMOKU_SENKOU_B)
     };
   };
-  const cloud = cloudAt(i), previousCloud = cloudAt(i - 1);
-  const current = bars[i];
+  const cloud = cloudAt(i), previousCloud = cloudAt(i - 1), current = bars[i];
   const open = Number(current?.o), high = Number(current?.h), low = Number(current?.l), close = Number(current?.c);
   if (![tenkan, previousTenkan, cloud.a, cloud.b, previousCloud.a, previousCloud.b, currentRsi, previousRsi, open, high, low, close].every(Number.isFinite) || high < low) {
     return { ok: false, reason: "indicator or candle values are warming up", timeframe, bars: bars.length, requiredBars: required, timeframeSeconds: seconds };
@@ -1097,13 +1100,13 @@ function scorePocketOptionIchimokuRsi(inputBars, timeframe) {
   const candleRange = high - low;
   const bullishRejection = candleRange > 0 && close > open && close >= low + candleRange * 0.5;
   const bearishRejection = candleRange > 0 && close < open && close <= low + candleRange * 0.5;
-  const touches = (level) => Number.isFinite(level) && low <= level && high >= level;
-  const bullishPullback = touches(tenkan) || touches(cloudTop);
-  const bearishPullback = touches(tenkan) || touches(cloudBottom);
+  const touches = level => Number.isFinite(level) && low <= level && high >= level;
+  const bullishTenkanTouch = touches(tenkan), bearishTenkanTouch = touches(tenkan);
+  const bullishCloudTouch = touches(cloudTop), bearishCloudTouch = touches(cloudBottom);
+  const bullishPullback = bullishTenkanTouch || bullishCloudTouch;
+  const bearishPullback = bearishTenkanTouch || bearishCloudTouch;
 
-  // Operational sideways-market veto: reject three or more flips across Tenkan
-  // or RSI 50 during the latest six completed candles. This is a measurable
-  // reconstruction of the video's "avoid bracket/choppy movement" guidance.
+  // Objective chop veto: 3+ flips across Tenkan or RSI 50 over six completed candles.
   const countFlips = values => {
     let flips = 0, prior = 0;
     for (const value of values) {
@@ -1113,8 +1116,7 @@ function scorePocketOptionIchimokuRsi(inputBars, timeframe) {
     }
     return flips;
   };
-  const start = Math.max(0, i - 5);
-  const recentTenkanSides = [], recentRsiSides = [];
+  const start = Math.max(0, i - 5), recentTenkanSides = [], recentRsiSides = [];
   for (let j = start; j <= i; j++) {
     const t = midpointRange(bars, j, VIDEO_ICHIMOKU_TENKAN);
     if (Number.isFinite(t)) recentTenkanSides.push(Number(bars[j].c) - t);
@@ -1125,29 +1127,36 @@ function scorePocketOptionIchimokuRsi(inputBars, timeframe) {
   const choppy = tenkanCrosses >= 3 || rsiMidlineCrosses >= 3;
   const rsiRising = currentRsi > previousRsi && currentRsi > 50;
   const rsiFalling = currentRsi < previousRsi && currentRsi < 50;
-  const callGates = { priceAboveCloud: aboveCloud, tenkanRising, pullbackToTenkanOrCloud: bullishPullback, bullishRejection, rsiRisingAbove50: rsiRising, chopVeto: choppy };
-  const putGates = { priceBelowCloud: belowCloud, tenkanFalling, pullbackToTenkanOrCloud: bearishPullback, bearishRejection, rsiFallingBelow50: rsiFalling, chopVeto: choppy };
-  const direction = !choppy && aboveCloud && tenkanRising && bullishPullback && bullishRejection && rsiRising ? "CALL"
-    : !choppy && belowCloud && tenkanFalling && bearishPullback && bearishRejection && rsiFalling ? "PUT" : null;
+  const callCore = !choppy && aboveCloud && tenkanRising && bullishRejection && rsiRising;
+  const putCore = !choppy && belowCloud && tenkanFalling && bearishRejection && rsiFalling;
+  const callGates = { priceAboveCloud: aboveCloud, tenkanRising, pullbackToTenkan: bullishTenkanTouch, pullbackToCloudEdge: bullishCloudTouch, bullishRejection, rsiRisingAbove50: rsiRising, chopVeto: choppy };
+  const putGates = { priceBelowCloud: belowCloud, tenkanFalling, pullbackToTenkan: bearishTenkanTouch, pullbackToCloudEdge: bearishCloudTouch, bearishRejection, rsiFallingBelow50: rsiFalling, chopVeto: choppy };
+  const candidateDirections = {
+    "v8-baseline": callCore && bullishPullback ? "CALL" : putCore && bearishPullback ? "PUT" : null,
+    "tenkan-only-v9": callCore && bullishTenkanTouch ? "CALL" : putCore && bearishTenkanTouch ? "PUT" : null,
+    "cloud-edge-only-v9": callCore && bullishCloudTouch ? "CALL" : putCore && bearishCloudTouch ? "PUT" : null
+  };
+  const direction = candidateDirections["v8-baseline"];
   return {
-    ok: Boolean(direction), direction, timeframe, bars: bars.length, requiredBars: required, timeframeSeconds: seconds,
+    ok: Boolean(direction), direction, candidateDirections, timeframe, bars: bars.length, requiredBars: required, timeframeSeconds: seconds,
     settings: { tenkan: 9, kijun: 26, senkouA: 26, senkouB: 52, rsi: 14, rsiLevels: [30,50,70] },
     tenkan, previousTenkan, senkouA: cloud.a, previousSenkouA: previousCloud.a, senkouB: cloud.b, previousSenkouB: previousCloud.b,
     cloudTop, cloudBottom, cloudPosition: aboveCloud ? "above" : belowCloud ? "below" : "inside",
     rsi: currentRsi, previousRsi, rsiRising, rsiFalling, aboveCloud, belowCloud, tenkanRising, tenkanFalling,
-    bullishPullback, bearishPullback, bullishRejection, bearishRejection, tenkanCrosses, rsiMidlineCrosses, choppy,
-    callGates, putGates,
-    trigger: direction ? "completed confirmation candle: trend outside Ichimoku cloud + Tenkan slope + pullback touch + directional rejection + RSI rising/falling on matching side of 50; sideways flip veto clear" : null,
+    bullishPullback, bearishPullback, bullishTenkanTouch, bearishTenkanTouch, bullishCloudTouch, bearishCloudTouch,
+    bullishRejection, bearishRejection, tenkanCrosses, rsiMidlineCrosses, choppy, callGates, putGates,
+    trigger: direction ? "closed confirmation candle: cloud trend + Tenkan slope + specified pullback location + rejection + RSI confirmation; chop veto clear" : null,
     usesFormingCurrentCandle: false,
     notes: [
-      "Screenshot-derived reconstruction of the shared analysis; it is not verified as the presenter's exact proprietary rules.",
-      "Senkou A and B are evaluated at their visible chart position using the standard 26-bar displacement.",
-      "Pullback means the completed candle range touches Tenkan or the trend-side cloud boundary.",
-      "Rejection means a directional candle closing in the direction's half of its full high-low range.",
-      "RSI must be rising above 50 for CALL or falling below 50 for PUT.",
-      "Sideways veto means at least 3 Tenkan-side or RSI-50 flips among the latest 6 completed candles.",
-      "Entries are evaluated after candle close; the first fresh quote in the next candle is used as shadow entry price.",
-      "15s and 1m are evaluated independently; 60s and 120s outcomes remain shadow-only."
+      "Screenshot-derived reconstruction, not verified proprietary rules.",
+      "All models use the same closed candle, feed, RSI/cloud conditions, chop veto, and 60s/120s outcomes.",
+      "v8-baseline allows a touch of Tenkan or the trend-side cloud edge; Tenkan-only-v9 and cloud-edge-only-v9 isolate those pullback locations.",
+      "Senkou A/B use their visible chart positions with standard 26-bar displacement.",
+      "Rejection means a directional candle closing in the matching half of its high-low range.",
+      "RSI must rise above 50 for CALL or fall below 50 for PUT.",
+      "Chop veto means 3+ Tenkan-side or RSI-50 flips among the latest six completed candles.",
+      "Entry price is the first fresh quote after the confirmation candle closes.",
+      "15s and 1m variants are independently evaluated; shadow only."
     ]
   };
 }
@@ -6167,13 +6176,13 @@ export class TickHub extends DurableObject {
       history: []
     };
 
-    const pending = Array.isArray(state.pending)
-      ? state.pending
-      : [];
-
-    const history = Array.isArray(state.history)
-      ? state.history
-      : [];
+    const allPending = Array.isArray(state.pending) ? state.pending : [];
+    const allHistory = Array.isArray(state.history) ? state.history : [];
+    const candidateIdOf = record => String(record?.features?.candidateId || "v8-baseline");
+    const pending = allPending.filter(record => candidateIdOf(record) === "v8-baseline");
+    const history = allHistory.filter(record => candidateIdOf(record) === "v8-baseline");
+    const allRecords = [...allHistory, ...allPending];
+    const records = allRecords.filter(record => candidateIdOf(record) === "v8-baseline");
 
     const now =
       Date.now();
@@ -6242,12 +6251,6 @@ export class TickHub extends DurableObject {
           : 0
     };
 
-    const records = [
-      ...history,
-      ...pending
-    ];
-
-
     const summarizeSubset = (items, key) => {
       const terminal = [
         "WIN",
@@ -6309,6 +6312,46 @@ export class TickHub extends DurableObject {
       };
     };
 
+
+    const summarizeCandidateBucket = (items, key) => {
+      const result = summarizeSubset(items, key);
+      const clusters = new Map();
+      for (const item of items) {
+        const outcome = String(item?.[key] || "").toUpperCase();
+        if (!["WIN", "LOSS"].includes(outcome)) continue;
+        const minute = Math.floor(Number(item.entryAt) / 60000) * 60000;
+        if (!Number.isFinite(minute)) continue;
+        const current = clusters.get(minute) || { wins: 0, losses: 0 };
+        current[outcome === "WIN" ? "wins" : "losses"]++;
+        clusters.set(minute, current);
+      }
+      const scored = [...clusters.values()].filter(x => x.wins + x.losses > 0);
+      return {
+        ...result,
+        independentClusters: scored.length,
+        clusterWinRate: scored.length
+          ? scored.reduce((sum, x) => sum + x.wins / (x.wins + x.losses) * 100, 0) / scored.length
+          : null
+      };
+    };
+    const candidateComparison = {};
+    for (const model of SHORT_SHADOW_VARIANTS) {
+      const modelRecords = allRecords.filter(record => candidateIdOf(record) === model.id);
+      const byModelTimeframe = {};
+      for (const timeframe of ["15s", "1m"]) {
+        const items = modelRecords.filter(record => record?.features?.chartTimeframe === timeframe);
+        byModelTimeframe[timeframe] = {
+          pending: allPending.filter(record => candidateIdOf(record) === model.id && record?.features?.chartTimeframe === timeframe).length,
+          expiry60: summarizeCandidateBucket(items, "result60"),
+          expiry120: summarizeCandidateBucket(items, "result120")
+        };
+      }
+      candidateComparison[model.id] = {
+        label: model.label,
+        pending: allPending.filter(record => candidateIdOf(record) === model.id).length,
+        byTimeframe: byModelTimeframe
+      };
+    }
 
     const summarize = key =>
       summarizeSubset(
@@ -6941,6 +6984,7 @@ export class TickHub extends DurableObject {
       clusterAdjusted,
       clusterAdjustedBySession,
       evidence,
+      candidateComparison,
       recent:
         history.slice(
           0,
@@ -7275,36 +7319,40 @@ export class TickHub extends DurableObject {
     const quote = ticks.at(-1);
     const quoteAt = Number(quote?.r || quote?.t || 0);
     if (!quote || !Number.isFinite(quoteAt) || Date.now() - quoteAt > 10000) return { ok: false, symbol, captured: false, reason: "waiting for fresh Tiingo UTC FX quote" };
-    const variants = [{ timeframe: "15s", seconds: 15 }, { timeframe: "1m", seconds: 60 }];
+    const timeframes = [{ timeframe: "15s", seconds: 15 }, { timeframe: "1m", seconds: 60 }];
     const checked = [], captured = [];
-    for (const variant of variants) {
+    for (const variant of timeframes) {
       const bars = buildBars(ticks, variant.seconds);
-      const candidate = scorePocketOptionIchimokuRsi(bars, variant.timeframe);
-      checked.push({ timeframe: variant.timeframe, ok: candidate.ok, reason: candidate.reason || null });
-      if (!candidate.ok || !candidate.direction) continue;
-      const entryPrice = Number(quote.p), entryAt = quoteAt, signalBar = bars.at(-2);
+      const score = scorePocketOptionIchimokuRsi(bars, variant.timeframe);
+      checked.push({ timeframe: variant.timeframe, ready: Number(score.bars || 0) >= Number(score.requiredBars || 78), candidateDirections: score.candidateDirections || {}, reason: score.reason || null });
+      const signalBar = bars.at(-2);
+      const entryPrice = Number(quote.p), entryAt = quoteAt;
       if (!Number.isFinite(entryPrice) || !signalBar || !Number.isFinite(Number(signalBar.t))) continue;
-      const sourceKey = SHORT_SHADOW_ID + "|" + symbol + "|" + variant.timeframe + "|" + candidate.direction + "|" + signalBar.t;
-      const capture = await this.captureShortShadow({
-        symbol, direction: candidate.direction, entryPrice, entryAt, sourceKey,
-        features: {
-          model: SHORT_SHADOW_ID, chartTimeframe: variant.timeframe,
-          dataSource: "tiingo-utc-fx", entryMode: "closed-candle-pullback-rejection",
-          signalBarOpenAt: Number(signalBar.t), timeframeSeconds: variant.seconds,
-          primaryExpiriesSeconds: SHORT_SHADOW_EXPIRIES,
-          indicators: candidate.settings,
-          ichimoku: { tenkan: candidate.tenkan, previousTenkan: candidate.previousTenkan, senkouA: candidate.senkouA, previousSenkouA: candidate.previousSenkouA, senkouB: candidate.senkouB, previousSenkouB: candidate.previousSenkouB, cloudTop: candidate.cloudTop, cloudBottom: candidate.cloudBottom, cloudPosition: candidate.cloudPosition },
-          rsi: candidate.rsi, previousRsi: candidate.previousRsi,
-          gates: candidate.direction === "CALL" ? candidate.callGates : candidate.putGates,
-          chop: { tenkanCrosses: candidate.tenkanCrosses, rsiMidlineCrosses: candidate.rsiMidlineCrosses },
-          trigger: candidate.trigger, reconstructionNotes: candidate.notes
-        }
-      });
-      captured.push({ timeframe: variant.timeframe, direction: candidate.direction, captured: Boolean(capture?.ok && !capture?.duplicate), duplicate: Boolean(capture?.duplicate), id: capture?.id || null });
+      for (const model of SHORT_SHADOW_VARIANTS) {
+        const direction = score.candidateDirections?.[model.id];
+        if (!direction) continue;
+        const sourceKey = SHORT_SHADOW_ID + "|" + model.id + "|" + symbol + "|" + variant.timeframe + "|" + direction + "|" + signalBar.t;
+        const gates = direction === "CALL" ? score.callGates : score.putGates;
+        const capture = await this.captureShortShadow({
+          symbol, direction, entryPrice, entryAt, sourceKey,
+          features: {
+            model: SHORT_SHADOW_ID, candidateId: model.id, candidateLabel: model.label,
+            chartTimeframe: variant.timeframe,
+            dataSource: "tiingo-utc-fx", entryMode: "closed-candle-pullback-rejection",
+            signalBarOpenAt: Number(signalBar.t), timeframeSeconds: variant.seconds,
+            primaryExpiriesSeconds: SHORT_SHADOW_EXPIRIES,
+            indicators: score.settings,
+            ichimoku: { tenkan: score.tenkan, previousTenkan: score.previousTenkan, senkouA: score.senkouA, previousSenkouA: score.previousSenkouA, senkouB: score.senkouB, previousSenkouB: score.previousSenkouB, cloudTop: score.cloudTop, cloudBottom: score.cloudBottom, cloudPosition: score.cloudPosition },
+            rsi: score.rsi, previousRsi: score.previousRsi, gates,
+            chop: { tenkanCrosses: score.tenkanCrosses, rsiMidlineCrosses: score.rsiMidlineCrosses },
+            trigger: score.trigger, reconstructionNotes: score.notes
+          }
+        });
+        captured.push({ candidateId: model.id, timeframe: variant.timeframe, direction, captured: Boolean(capture?.ok && !capture?.duplicate), duplicate: Boolean(capture?.duplicate), id: capture?.id || null });
+      }
     }
-    return { ok: true, symbol, captured: captured.some(x => x.captured), variantsChecked: checked, captures: captured, entryMode: "intrabar-indicator-confirmation", dataSource: "tiingo-utc-fx" };
+    return { ok: true, symbol, captured: captured.some(x => x.captured), variantsChecked: checked, captures: captured, entryMode: "closed-candle-pullback-rejection", dataSource: "tiingo-utc-fx" };
   }
-
   async evaluateShortShadow(symbol) {
     symbol = normalizeSymbol(symbol);
 
@@ -7665,18 +7713,14 @@ export class TickHub extends DurableObject {
         const latest = ticks.at(-1);
         const checkEntry = (bars, timeframe) => {
           const score = scorePocketOptionIchimokuRsi(bars, timeframe);
-          const callGates = score.callGates || {};
-          const putGates = score.putGates || {};
           return {
             ready: Number(score.bars || 0) >= Number(score.requiredBars || 78),
             bars: Number(score.bars || Math.max(0, bars.length - 1)),
             requiredBars: Number(score.requiredBars || 78),
             qualifies: Boolean(score.ok && score.direction),
             direction: score.direction || null,
-            reason: score.reason || null,
+            candidateDirections: score.candidateDirections || {},
             rsi: Number.isFinite(Number(score.rsi)) ? Number(score.rsi) : null,
-            rsiRising: Boolean(score.rsiRising),
-            rsiFalling: Boolean(score.rsiFalling),
             cloudPosition: score.cloudPosition || "warming",
             tenkanRising: Boolean(score.tenkanRising),
             tenkanFalling: Boolean(score.tenkanFalling),
@@ -7686,9 +7730,7 @@ export class TickHub extends DurableObject {
             bearishRejection: Boolean(score.bearishRejection),
             choppy: Boolean(score.choppy),
             tenkanCrosses: Number(score.tenkanCrosses || 0),
-            rsiMidlineCrosses: Number(score.rsiMidlineCrosses || 0),
-            callGates, putGates,
-            reconstructionNotes: score.notes || []
+            rsiMidlineCrosses: Number(score.rsiMidlineCrosses || 0)
           };
         };
         const evaluation15s = checkEntry(bars15, "15s");
@@ -8451,6 +8493,18 @@ export default {
               return `${b.wins || 0}W ${b.losses || 0}L (${wr})`;
             };
 
+            const formatCandidateBucket = bucket => {
+              const b = bucket || {};
+              const wr = b.winRate == null ? "n/a" : Number(b.winRate).toFixed(1) + "%";
+              const cwr = b.clusterWinRate == null ? "n/a" : Number(b.clusterWinRate).toFixed(1) + "%";
+              return `${wr} ${b.wins || 0}W/${b.losses || 0}L, ${cwr} cl/${b.independentClusters || 0}`;
+            };
+            const candidateLines = Object.entries(st.candidateComparison || {}).map(([id, model]) => {
+              const byTf = model.byTimeframe || {};
+              const p = tf => byTf[tf] || {};
+              return `${model.label || id}: 15s 60s ${formatCandidateBucket(p("15s").expiry60)}, 120s ${formatCandidateBucket(p("15s").expiry120)} | 1m 60s ${formatCandidateBucket(p("1m").expiry60)}, 120s ${formatCandidateBucket(p("1m").expiry120)} | P:${model.pending || 0}`;
+            }).join("\n");
+
             const formatClusterBucket = bucket => {
               const b = bucket || {};
 
@@ -8606,6 +8660,9 @@ export default {
               `CHART TIMEFRAME (60s / 120s)\n` +
               `15s — ${formatBucket(st.byTimeframe?.["15s"]?.expiry60)} / ${formatBucket(st.byTimeframe?.["15s"]?.expiry120)}\n` +
               `1m — ${formatBucket(st.byTimeframe?.["1m"]?.expiry60)} / ${formatBucket(st.byTimeframe?.["1m"]?.expiry120)}\n\n` +
+
+              `PARALLEL MODELS — same Tiingo quote stream\n` +
+              `${candidateLines}\n\n` +
 
               `PENDING HEALTH\n` +
               `Total: ${pendingHealth.total || 0}\n` +
@@ -8798,17 +8855,20 @@ export default {
             const result = await hub(env, "/ichimoku-check");
             const rows = (Array.isArray(result?.rows) ? result.rows : []).map(r => {
               const fmt = (label, bars, check) => {
-                if (!check?.ready) return label + " " + bars + "/" + (check?.requiredBars || 78) + " warm";
+                if (!check?.ready) return label + " " + (check?.bars ?? bars) + "/" + (check?.requiredBars || 78) + " warm";
                 const gates = check.direction ? check.direction : "no signal";
                 const rsiSide = check.rsi == null ? "n/a" : (check.rsi > 50 ? "above50" : check.rsi < 50 ? "below50" : "at50");
+                const modelNames = { "v8-baseline": "base", "tenkan-only-v9": "T", "cloud-edge-only-v9": "cloud" };
+                const models = Object.entries(check.candidateDirections || {}).map(([id, direction]) => modelNames[id] + ":" + (direction || "—")).join("/");
                 return label + " " + gates +
                   " RSI=" + (check.rsi == null ? "n/a" : check.rsi.toFixed(1)) + "(" + rsiSide + ")" +
                   " cloud=" + (check.cloudPosition || "n/a") +
                   " Tenkan=" + (check.tenkanRising ? "rising" : check.tenkanFalling ? "falling" : "flat") +
                   " pullback=" + (check.bullishPullback || check.bearishPullback ? "yes" : "no") +
                   " rejection=" + (check.bullishRejection || check.bearishRejection ? "yes" : "no") +
-                  " chop=" + (check.choppy ? "veto" : "clear");
-              };
+                  " chop=" + (check.choppy ? "veto" : "clear") +
+                  " models=" + models;
+              };;
               return r.symbol + " — " + fmt("15s", r.bars15, r.evaluation15s) +
                 " | " + fmt("1m", r.bars1m, r.evaluation1m) +
                 " | quote " + (r.quoteAgeSeconds == null ? "n/a" : r.quoteAgeSeconds.toFixed(1) + "s");
