@@ -1,7 +1,7 @@
 // V13.11.0 — UTC Ichimoku/RSI shadow from the supplied video transcript
 import { DurableObject } from "cloudflare:workers";
 
-export const VERSION = "13.11.9-utc-ichimoku-fresh-cross-shadow";
+export const VERSION = "13.12.0-utc-ichimoku-pullback-rejection-shadow";
 export const DEFAULT_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF";
 export const FIXED_UNIVERSE = DEFAULT_SYMBOLS.split(",");
 export const SHORT_SHADOW_UNIVERSE = Object.freeze([
@@ -16,7 +16,7 @@ export const SHORT_SHADOW_UNIVERSE = Object.freeze([
 ]);
 export const OTC_SHADOW_UNIVERSE = Object.freeze(["EUR/USD","GBP/USD","USD/JPY","AUD/USD","USD/CAD"]);
 export const OTC_SHADOW_VENDOR_SYMBOLS = Object.freeze({"EUR/USD":"EURUSD_otc","GBP/USD":"GBPUSD_otc","USD/JPY":"USDJPY_otc","AUD/USD":"AUDUSD_otc","USD/CAD":"USDCAD_otc"});
-export const SHORT_SHADOW_ID = "utc-15s-1m-ichimoku9-26-52-rsi14-engulf-fresh-cross-shadow-v7";
+export const SHORT_SHADOW_ID = "utc-15s-1m-ichimoku9-26-52-rsi14-cloud-pullback-rsi14-shadow-v8";
 export const SHORT_SHADOW_EXPIRIES = Object.freeze([60, 120]);
 export const VIDEO_SUPERTREND_ATR_PERIOD = 10;
 export const VIDEO_SUPERTREND_MULTIPLIER = 2;
@@ -1063,53 +1063,93 @@ function midpointRange(bars, end, period) {
   for (let i = start; i <= end; i++) { hi = Math.max(hi, Number(bars[i]?.h)); lo = Math.min(lo, Number(bars[i]?.l)); }
   return Number.isFinite(hi) && Number.isFinite(lo) ? (hi + lo) / 2 : NaN;
 }
-function scorePocketOptionIchimokuRsi(bars, timeframe) {
-  const required = VIDEO_ICHIMOKU_SENKOU_B + 1;
-  if (!Array.isArray(bars) || bars.length < required) return { ok: false, reason: "Ichimoku visible Senkou A history is warming up", timeframe, bars: bars?.length || 0, requiredBars: required };
-  const i = bars.length - 1, closes = bars.map(b => Number(b?.c));
-  if (!closes.every(Number.isFinite)) return { ok: false, reason: "invalid candle close", timeframe };
-  const rsi = rsiWilderSeries(closes), currentRsi = rsi[i];
+function scorePocketOptionIchimokuRsi(inputBars, timeframe) {
+  const seconds = timeframe === "15s" ? 15 : 60;
+  // The video-derived model enters after a confirmation candle has closed.
+  // buildBars includes the currently forming candle, so score only prior bars.
+  const bars = Array.isArray(inputBars) ? inputBars.slice(0, -1) : [];
+  const required = VIDEO_ICHIMOKU_KIJUN + VIDEO_ICHIMOKU_SENKOU_B;
+  if (bars.length < required) return { ok: false, reason: "Ichimoku cloud context is warming up", timeframe, bars: bars.length, requiredBars: required, timeframeSeconds: seconds };
+  const i = bars.length - 1;
+  const closes = bars.map(b => Number(b?.c));
+  if (!closes.every(Number.isFinite)) return { ok: false, reason: "invalid candle close", timeframe, bars: bars.length, requiredBars: required, timeframeSeconds: seconds };
+  const rsi = rsiWilderSeries(closes);
+  const currentRsi = rsi[i], previousRsi = rsi[i - 1];
   const tenkan = midpointRange(bars, i, VIDEO_ICHIMOKU_TENKAN);
   const previousTenkan = midpointRange(bars, i - 1, VIDEO_ICHIMOKU_TENKAN);
-  const sourceIndex = i - VIDEO_ICHIMOKU_KIJUN;
-  const senkouA = (midpointRange(bars, sourceIndex, VIDEO_ICHIMOKU_TENKAN) + midpointRange(bars, sourceIndex, VIDEO_ICHIMOKU_KIJUN)) / 2;
-  const previousSenkouA = (midpointRange(bars, sourceIndex - 1, VIDEO_ICHIMOKU_TENKAN) + midpointRange(bars, sourceIndex - 1, VIDEO_ICHIMOKU_KIJUN)) / 2;
-  if (![tenkan, previousTenkan, senkouA, previousSenkouA, currentRsi].every(Number.isFinite)) return { ok: false, reason: "indicator values are warming up", timeframe };
-  const isDirectional = (bar, dir) => {
-    const o = Number(bar?.o), c = Number(bar?.c);
-    return Number.isFinite(o) && Number.isFinite(c) && (dir === "CALL" ? c > o : c < o);
+  const cloudAt = j => {
+    const source = j - VIDEO_ICHIMOKU_KIJUN;
+    if (source < 0) return { a: NaN, b: NaN };
+    return {
+      a: (midpointRange(bars, source, VIDEO_ICHIMOKU_TENKAN) + midpointRange(bars, source, VIDEO_ICHIMOKU_KIJUN)) / 2,
+      b: midpointRange(bars, source, VIDEO_ICHIMOKU_SENKOU_B)
+    };
   };
-  const bodyEngulfs = (a, b) => {
-    const ao = Number(a?.o), ac = Number(a?.c), bo = Number(b?.o), bc = Number(b?.c);
-    return [ao, ac, bo, bc].every(Number.isFinite) &&
-      Math.min(ao, ac) <= Math.min(bo, bc) &&
-      Math.max(ao, ac) >= Math.max(bo, bc);
-  };
-  // The video first identifies a directional engulfing formation, then waits
-  // for the Ichimoku/RSI confirmation. Keep that formation active while the
-  // subsequent candles remain directional; a doji or opposite candle resets it.
-  const directionalEngulfRun = dir => {
-    let runBars = 0;
-    for (let j = i; j >= 0 && isDirectional(bars[j], dir); j--) runBars++;
-    let hasEngulfingPair = false;
-    for (let j = i; j > i - runBars + 1; j--) {
-      if (bodyEngulfs(bars[j], bars[j - 1])) {
-        hasEngulfingPair = true;
-        break;
-      }
+  const cloud = cloudAt(i), previousCloud = cloudAt(i - 1);
+  const current = bars[i];
+  const open = Number(current?.o), high = Number(current?.h), low = Number(current?.l), close = Number(current?.c);
+  if (![tenkan, previousTenkan, cloud.a, cloud.b, previousCloud.a, previousCloud.b, currentRsi, previousRsi, open, high, low, close].every(Number.isFinite) || high < low) {
+    return { ok: false, reason: "indicator or candle values are warming up", timeframe, bars: bars.length, requiredBars: required, timeframeSeconds: seconds };
+  }
+  const cloudTop = Math.max(cloud.a, cloud.b), cloudBottom = Math.min(cloud.a, cloud.b);
+  const aboveCloud = close > cloudTop, belowCloud = close < cloudBottom;
+  const tenkanRising = tenkan > previousTenkan, tenkanFalling = tenkan < previousTenkan;
+  const candleRange = high - low;
+  const bullishRejection = candleRange > 0 && close > open && close >= low + candleRange * 0.5;
+  const bearishRejection = candleRange > 0 && close < open && close <= low + candleRange * 0.5;
+  const touches = (level) => Number.isFinite(level) && low <= level && high >= level;
+  const bullishPullback = touches(tenkan) || touches(cloudTop);
+  const bearishPullback = touches(tenkan) || touches(cloudBottom);
+
+  // Operational sideways-market veto: reject three or more flips across Tenkan
+  // or RSI 50 during the latest six completed candles. This is a measurable
+  // reconstruction of the video's "avoid bracket/choppy movement" guidance.
+  const countFlips = values => {
+    let flips = 0, prior = 0;
+    for (const value of values) {
+      const side = value > 0 ? 1 : value < 0 ? -1 : 0;
+      if (side && prior && side !== prior) flips++;
+      if (side) prior = side;
     }
-    return { runBars, qualifies: runBars >= 2 && hasEngulfingPair };
+    return flips;
   };
-  const bullishRun = directionalEngulfRun("CALL");
-  const bearishRun = directionalEngulfRun("PUT");
-  const bullishCandles = bullishRun.qualifies;
-  const bearishCandles = bearishRun.qualifies;
-  const crossUp = previousTenkan <= previousSenkouA && tenkan > senkouA;
-  const crossDown = previousTenkan >= previousSenkouA && tenkan < senkouA;
-  const bullishLineAlignment = tenkan > senkouA;
-  const bearishLineAlignment = tenkan < senkouA;
-  const direction = crossUp && currentRsi > 50 && bullishCandles ? "CALL" : crossDown && currentRsi < 50 && bearishCandles ? "PUT" : null;
-  return { ok: Boolean(direction), direction, timeframe, bars: bars.length, requiredBars: required, settings: { tenkan: 9, kijun: 26, senkouB: 52, rsi: 14, rsiLevels: [30,50,70] }, tenkan, previousTenkan, senkouA, previousSenkouA, rsi: currentRsi, crossUp, crossDown, bullishCandles, bearishCandles, bullishRunBars: bullishRun.runBars, bearishRunBars: bearishRun.runBars, trigger: direction ? "fresh Ichimoku Tenkan/Senkou-A crossover + RSI(14) 50-side confirmation + active directional run containing an engulfing pair" : null, usesFormingCurrentCandle: true, notes: ["15s and 1m are evaluated as separate variants; transcript does not require confluence", "the engulfing pair remains active only while subsequent candles stay directional; a doji or opposite candle resets it", "RSI 30/70 levels are displayed but do not gate entry", "the Tenkan/Senkou-A crossover must occur on the evaluated candle; RSI 50-side and engulfing-run conditions must also qualify on that evaluation"] };
+  const start = Math.max(0, i - 5);
+  const recentTenkanSides = [], recentRsiSides = [];
+  for (let j = start; j <= i; j++) {
+    const t = midpointRange(bars, j, VIDEO_ICHIMOKU_TENKAN);
+    if (Number.isFinite(t)) recentTenkanSides.push(Number(bars[j].c) - t);
+    if (Number.isFinite(rsi[j])) recentRsiSides.push(rsi[j] - 50);
+  }
+  const tenkanCrosses = countFlips(recentTenkanSides);
+  const rsiMidlineCrosses = countFlips(recentRsiSides);
+  const choppy = tenkanCrosses >= 3 || rsiMidlineCrosses >= 3;
+  const rsiRising = currentRsi > previousRsi && currentRsi > 50;
+  const rsiFalling = currentRsi < previousRsi && currentRsi < 50;
+  const callGates = { priceAboveCloud: aboveCloud, tenkanRising, pullbackToTenkanOrCloud: bullishPullback, bullishRejection, rsiRisingAbove50: rsiRising, chopVeto: choppy };
+  const putGates = { priceBelowCloud: belowCloud, tenkanFalling, pullbackToTenkanOrCloud: bearishPullback, bearishRejection, rsiFallingBelow50: rsiFalling, chopVeto: choppy };
+  const direction = !choppy && aboveCloud && tenkanRising && bullishPullback && bullishRejection && rsiRising ? "CALL"
+    : !choppy && belowCloud && tenkanFalling && bearishPullback && bearishRejection && rsiFalling ? "PUT" : null;
+  return {
+    ok: Boolean(direction), direction, timeframe, bars: bars.length, requiredBars: required, timeframeSeconds: seconds,
+    settings: { tenkan: 9, kijun: 26, senkouA: 26, senkouB: 52, rsi: 14, rsiLevels: [30,50,70] },
+    tenkan, previousTenkan, senkouA: cloud.a, previousSenkouA: previousCloud.a, senkouB: cloud.b, previousSenkouB: previousCloud.b,
+    cloudTop, cloudBottom, cloudPosition: aboveCloud ? "above" : belowCloud ? "below" : "inside",
+    rsi: currentRsi, previousRsi, rsiRising, rsiFalling, aboveCloud, belowCloud, tenkanRising, tenkanFalling,
+    bullishPullback, bearishPullback, bullishRejection, bearishRejection, tenkanCrosses, rsiMidlineCrosses, choppy,
+    callGates, putGates,
+    trigger: direction ? "completed confirmation candle: trend outside Ichimoku cloud + Tenkan slope + pullback touch + directional rejection + RSI rising/falling on matching side of 50; sideways flip veto clear" : null,
+    usesFormingCurrentCandle: false,
+    notes: [
+      "Screenshot-derived reconstruction of the shared analysis; it is not verified as the presenter's exact proprietary rules.",
+      "Senkou A and B are evaluated at their visible chart position using the standard 26-bar displacement.",
+      "Pullback means the completed candle range touches Tenkan or the trend-side cloud boundary.",
+      "Rejection means a directional candle closing in the direction's half of its full high-low range.",
+      "RSI must be rising above 50 for CALL or falling below 50 for PUT.",
+      "Sideways veto means at least 3 Tenkan-side or RSI-50 flips among the latest 6 completed candles.",
+      "Entries are evaluated after candle close; the first fresh quote in the next candle is used as shadow entry price.",
+      "15s and 1m are evaluated independently; 60s and 120s outcomes remain shadow-only."
+    ]
+  };
 }
 
 export function scorePocketOption30sSuperTrendMacd(bars30, previousLiveMacd = null) {
@@ -7249,12 +7289,14 @@ export class TickHub extends DurableObject {
         symbol, direction: candidate.direction, entryPrice, entryAt, sourceKey,
         features: {
           model: SHORT_SHADOW_ID, chartTimeframe: variant.timeframe,
-          dataSource: "tiingo-utc-fx", entryMode: "intrabar-indicator-confirmation",
+          dataSource: "tiingo-utc-fx", entryMode: "closed-candle-pullback-rejection",
           signalBarOpenAt: Number(signalBar.t), timeframeSeconds: variant.seconds,
           primaryExpiriesSeconds: SHORT_SHADOW_EXPIRIES,
           indicators: candidate.settings,
-          ichimoku: { tenkan: candidate.tenkan, previousTenkan: candidate.previousTenkan, senkouA: candidate.senkouA, previousSenkouA: candidate.previousSenkouA },
-          rsi: candidate.rsi, bullishCandles: candidate.bullishCandles, bearishCandles: candidate.bearishCandles, bullishRunBars: candidate.bullishRunBars, bearishRunBars: candidate.bearishRunBars,
+          ichimoku: { tenkan: candidate.tenkan, previousTenkan: candidate.previousTenkan, senkouA: candidate.senkouA, previousSenkouA: candidate.previousSenkouA, senkouB: candidate.senkouB, previousSenkouB: candidate.previousSenkouB, cloudTop: candidate.cloudTop, cloudBottom: candidate.cloudBottom, cloudPosition: candidate.cloudPosition },
+          rsi: candidate.rsi, previousRsi: candidate.previousRsi,
+          gates: candidate.direction === "CALL" ? candidate.callGates : candidate.putGates,
+          chop: { tenkanCrosses: candidate.tenkanCrosses, rsiMidlineCrosses: candidate.rsiMidlineCrosses },
           trigger: candidate.trigger, reconstructionNotes: candidate.notes
         }
       });
@@ -8792,22 +8834,16 @@ export default {
             const result = await hub(env, "/ichimoku-check");
             const rows = (Array.isArray(result?.rows) ? result.rows : []).map(r => {
               const fmt = (label, bars, check) => {
-                if (!check?.ready) return label + " " + bars + "/53 warm";
+                if (!check?.ready) return label + " " + bars + "/" + (check?.requiredBars || 78) + " warm";
                 const gates = check.direction ? check.direction : "no signal";
-                const lines = check.lineValues
-                  ? " T=" + check.lineValues.tenkan.toPrecision(7) + " SA=" + check.lineValues.senkouA.toPrecision(7)
-                  : "";
-                return label + " " + gates + " RSI=" + (check.rsi == null ? "n/a" : check.rsi.toFixed(1)) +
-                  "(" + (check.rsiSide || "unknown") + ")" +
-                  " X=" + (check.cross || "none") +
-                  " calcX=" + (check.calculatedCross || "unknown") +
-                  " (" + (check.lineRelation || "line relation unavailable") + ")" + lines +
-                  " scorerLines=" + (check.scoreLinesAvailable ? "yes" : "no") +
-                  " C=" + (check.callGates?.engulfSequence
-                    ? "CALL/run" + check.callGates.directionalRunBars
-                    : check.putGates?.engulfSequence
-                      ? "PUT/run" + check.putGates.directionalRunBars
-                      : "none");
+                const rsiSide = check.rsi == null ? "n/a" : (check.rsi > 50 ? "above50" : check.rsi < 50 ? "below50" : "at50");
+                return label + " " + gates +
+                  " RSI=" + (check.rsi == null ? "n/a" : check.rsi.toFixed(1)) + "(" + rsiSide + ")" +
+                  " cloud=" + (check.cloudPosition || "n/a") +
+                  " Tenkan=" + (check.tenkanRising ? "rising" : check.tenkanFalling ? "falling" : "flat") +
+                  " pullback=" + (check.bullishPullback || check.bearishPullback ? "yes" : "no") +
+                  " rejection=" + (check.bullishRejection || check.bearishRejection ? "yes" : "no") +
+                  " chop=" + (check.choppy ? "veto" : "clear");
               };
               return r.symbol + " — " + fmt("15s", r.bars15, r.evaluation15s) +
                 " | " + fmt("1m", r.bars1m, r.evaluation1m) +
