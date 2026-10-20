@@ -24,3 +24,12 @@ class_name = "AutoScheduler"
 type = "durable-object"
 state = "created"
 storage = "sqlite"
+
+[[durable_objects.bindings]]
+name = "POCKET_S30_SHADOW"
+class_name = "PocketS30DemarkerShadow"
+
+[exports.PocketS30DemarkerShadow]
+type = "durable-object"
+state = "created"
+storage = "sqlite"
