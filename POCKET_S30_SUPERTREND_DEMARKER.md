@@ -20,7 +20,7 @@ The supplied strategy description did not specify the SuperTrend ATR period or m
 
 ## Source and integrity limits
 
-The data source is OTCharts' stream requested with `venue=otc` and the five supported OTC symbols. It is a third-party OTC market-data stream, not Pocket Option's own settlement feed or a broker execution API. The entry and settlement prices are both taken from this exact stream identity (`otcharts-pocket-option-otc`). Tiingo regular FX prices are rejected. If OTCharts is unavailable, keyless, stale, or does not provide a timely quote, collection will show diagnostics/rejections or VOID records; it must not substitute regular FX prices.
+The data source is OTCharts' stream requested with `venue=otc` and the five supported OTC symbols. It is a third-party OTC market-data stream, not Pocket Option's own settlement feed or a broker execution API. OTCharts currently documents that its free tier has no live streaming; an eligible plan and a configured `OTCHARTS_API_KEY` are required for forward collection. The entry and settlement prices are both taken from this exact stream identity (`otcharts-pocket-option-otc`). Tiingo regular FX prices are rejected. If OTCharts is unavailable, keyless, stale, or does not provide a timely quote, collection will show diagnostics/rejections or VOID records; it must not substitute regular FX prices.
 
 Candles are built from quote events, not broker-supplied S30 bars. To avoid inventing complete candles, an initial partial bucket after startup/restart is skipped, and bars lacking adequate edge coverage, multiple observations, or continuous timely quotes are rejected as data-quality failures. A gap also resets the contiguous indicator warm-up.
 
