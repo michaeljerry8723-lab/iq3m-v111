@@ -420,6 +420,7 @@ export function capturePocketS30Entry(state, input, now = Date.now()) {
     entryPrice: quote.price,
     entryAt: quote.providerAt,
     entryReceivedAt: quote.receivedAt,
+    entryStreamSession: quote.streamSession,
     expirySeconds: 120,
     expiryAt: quote.providerAt + 120000,
     result: null,
