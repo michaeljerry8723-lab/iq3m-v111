@@ -37,8 +37,9 @@ All paths are on the Worker origin:
 ## Isolated Cloudflare Preview
 
 - Cloudflare Preview Builds must use `npx wrangler preview --env pocket_s30_shadow_preview`. This selects the separately named `pocket-s30-demarker-shadow` Worker environment; the production deploy command remains unchanged.
+- Set this command in the **branch Preview's own Settings → Builds → Preview command** field. The Preview Base default is separate and does not override an existing branch Preview's build configuration.
 - The Wrangler environment declares its own UTC 12-pair subscription and Durable Object bindings. Each branch Preview gets its own Durable Object storage namespace.
-- Preview environments do not inherit production secrets. Configure `TIINGO_API_TOKEN` and `TELEGRAM_WEBHOOK_SECRET` in Cloudflare's Preview Base secrets before using the feed or authenticated start endpoint. Never commit these secret values.
+- Preview environments do not inherit production secrets. Configure `TIINGO_API_TOKEN` and `TELEGRAM_WEBHOOK_SECRET` in the branch Preview's runtime secrets before using the feed or authenticated start endpoint. Never commit these secret values.
 - Verify the latest build details show the deploy command above and the build log reports the `pocket-s30-shadow` environment. A Retry action reuses the command captured by the old build; create a new branch commit after changing Cloudflare's Preview build command.
 - Collection starts only after the branch Preview is deployed and the authenticated start endpoint is called. A code commit does not start collection.
 
