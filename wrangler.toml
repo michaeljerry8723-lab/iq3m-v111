@@ -1,4 +1,4 @@
-name = "iq3m-predictor"
+name = "forex-daytrader"
 main = "worker.js"
 compatibility_date = "2026-09-24"
 
