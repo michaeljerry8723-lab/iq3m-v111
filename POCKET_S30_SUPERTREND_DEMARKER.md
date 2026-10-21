@@ -34,4 +34,11 @@ All paths are on the Worker origin:
 - `GET /pocket-s30-demarker/diagnostics` — feed state, config, per-symbol S30 warm-up, latest quote age, current score/rejection reason, and collection status.
 - `GET /pocket-s30-demarker/stats` — total/pending/settled entries, outcomes and W/L win rate excluding draws, by symbol/direction, entry observation dates, and rejection counts.
 
-A code commit does not itself start collection. Collection begins after this branch is deployed to the intended non-production Worker with the `POCKET_S30_SHADOW` binding, `TICK_HUB` binding, and existing `TIINGO_API_TOKEN` configured, then the authenticated start endpoint is called. No production deployment is part of this change.
+## Isolated Cloudflare Preview
+
+- Cloudflare Preview Builds must use `npx wrangler preview --env pocket_s30_shadow_preview`. This selects the separately named `pocket-s30-demarker-shadow` Worker environment; the production deploy command remains unchanged.
+- The Wrangler environment declares its own UTC 12-pair subscription and Durable Object bindings. Each branch Preview gets its own Durable Object storage namespace.
+- Preview environments do not inherit production secrets. Configure `TIINGO_API_TOKEN` and `TELEGRAM_WEBHOOK_SECRET` in Cloudflare's Preview Base secrets before using the feed or authenticated start endpoint. Never commit these secret values.
+- Collection starts only after the branch Preview is deployed and the authenticated start endpoint is called. A code commit does not start collection.
+
+No production deployment or trade execution is part of this change.
