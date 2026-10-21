@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import {
-  POCKET_S30_STRATEGY_ID, POCKET_S30_SOURCE_FEED, POCKET_S30_DEFAULT_CONFIG,
+  POCKET_S30_STRATEGY_ID, POCKET_S30_SOURCE_FEED, POCKET_S30_SYMBOLS, POCKET_S30_DEFAULT_CONFIG,
   pocketS30ConfigFromEnv, computeDeMarker, computeSuperTrend, scorePocketS30,
   validatePocketS30Quote, createPocketS30State, restorePocketS30State,
   capturePocketS30Entry, ingestPocketS30Quote, expirePocketS30Pending,
@@ -121,11 +121,11 @@ test("invalid and gapped candle data are rejected or require a fresh contiguous 
   assert.equal(afterGap.ok, true);
 });
 
-test("fresh OTC quotes require exact source, supported symbol, and valid timing/price", () => {
+test("fresh UTC FX quotes require exact source, supported pair, and valid timing/price", () => {
   const now = base + 1000, q = quote("EUR/USD", base, 1.1);
   assert.equal(validatePocketS30Quote(q, now).ok, true);
-  assert.equal(validatePocketS30Quote({ ...q, sourceFeed: "tiingo-utc-fx" }, now).reason, "source_feed_mismatch");
-  assert.equal(validatePocketS30Quote({ ...q, symbol: "EUR/USD-OTC" }, now).reason, "unsupported_otc_symbol");
+  assert.equal(validatePocketS30Quote({ ...q, sourceFeed: "otcharts-pocket-option-otc" }, now).reason, "source_feed_mismatch");
+  assert.equal(validatePocketS30Quote({ ...q, symbol: "EUR/USD-OTC" }, now).reason, "unsupported_utc_fx_symbol");
   assert.equal(validatePocketS30Quote({ ...q, price: 0 }, now).reason, "invalid_source_quote");
   assert.equal(validatePocketS30Quote({ ...q, receivedAt: now - 20000 }, now).reason, "stale_source_quote");
 });
@@ -243,9 +243,12 @@ test("statistics isolate counts, directions, symbols, dates, and rejection reaso
   assert.equal(stats.rejectionReasons.test_rejection.count, 1);
 });
 
-test("feed identity never converts ordinary FX prices into Pocket Option OTC prices", () => {
+test("feed identity accepts Tiingo UTC FX and rejects OTC prices", () => {
   const q = quote("EUR/USD", base, 1.1, "regular", "tiingo-utc-fx");
-  assert.equal(validatePocketS30Quote(q, base + 1000).reason, "source_feed_mismatch");
+  assert.equal(validatePocketS30Quote(q, base + 1000).ok, true);
+  const otc = quote("EUR/USD", base, 1.1, "otc-session", "otcharts-pocket-option-otc");
+  assert.equal(validatePocketS30Quote(otc, base + 1000).reason, "source_feed_mismatch");
+  assert.equal(POCKET_S30_SYMBOLS.length, 12);
   assert.equal(POCKET_S30_STRATEGY_ID, "pocket-s30-supertrend-demarker7-exp120-shadow-v1");
 });
 
