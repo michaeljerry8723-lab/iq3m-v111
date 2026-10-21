@@ -269,6 +269,7 @@ function mockContext(storageMap, alarms = []) {
 await testAsync("Durable Object starts shadow-only, records S30 signals, persists and restores after restart", async () => {
   const storageMap = new Map(), alarms = [];
   let now = base + 1_000;
+  const hubRequests = [];
   const originalNow = Date.now;
   Date.now = () => now;
   try {
@@ -278,7 +279,7 @@ await testAsync("Durable Object starts shadow-only, records S30 signals, persist
       POCKET_S30_SUPERTREND_MULTIPLIER: "2",
       TICK_HUB: {
         idFromName: name => name,
-        get: () => ({ fetch: async () => new Response(JSON.stringify({ ok: true, status: "connected" })) })
+        get: () => ({ fetch: async url => { hubRequests.push(String(url)); return new Response(JSON.stringify({ ok: true, status: "connected" })); } })
       }
     };
     const ctx = mockContext(storageMap, alarms);
@@ -291,6 +292,7 @@ await testAsync("Durable Object starts shadow-only, records S30 signals, persist
     assert.equal(object.state.enabled, true);
     assert.equal(object.state.history.length, 0);
     assert.equal(object.state.config.expirySeconds, 120);
+    assert.deepEqual(hubRequests, ["https://tick-hub/utc-s30-feed/start"]);
 
     const bars = trendBars(1);
     const offsets = [1000, 7000, 15000, 23000];
@@ -308,7 +310,7 @@ await testAsync("Durable Object starts shadow-only, records S30 signals, persist
     assert.equal(confirmation.entry.direction, "CALL");
     assert.equal(object.state.pending.length, 1);
     assert.equal(object.state.pending[0].expiryAt, confirmAt + 120000);
-    assert.equal(storageMap.get("pocketS30SuperTrendDeMarkerShadowV1").pending.length, 1);
+    assert.equal(storageMap.get("utcS30SuperTrendDeMarkerShadowV1").pending.length, 1);
 
     const restarted = new PocketS30DemarkerShadow(mockContext(storageMap, alarms), env);
     await restarted.ready;
