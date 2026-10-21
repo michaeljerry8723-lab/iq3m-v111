@@ -3512,6 +3512,7 @@ export class TickHub extends DurableObject {
     this.otcConnecting = false; this.otcStreamActive = false; this.otcAbortController = null; this.otcStreamStatus = "not_started";
     this.otcReconnectCount = 0; this.otcLastEventAt = 0; this.otcLastQuoteAt = 0;
     this.pocketS30ForwardEnabled = false; this.otcStreamSessionId = null;
+    this.utcS30ForwardEnabled = false; this.utcS30ForwardStatus = "not_started";
 
     this.shortShadowState = {
       strategyId: SHORT_SHADOW_ID,
@@ -3532,6 +3533,8 @@ export class TickHub extends DurableObject {
 
     this.ctx.blockConcurrencyWhile(async () => {
       this.pocketS30ForwardEnabled = Boolean(await this.ctx.storage.get("pocketS30ForwardEnabled"));
+      this.utcS30ForwardEnabled = Boolean(await this.ctx.storage.get("utcS30ForwardEnabled"));
+      this.utcS30ForwardStatus = this.utcS30ForwardEnabled ? "awaiting_tiingo_utc_fx_quotes" : "not_started";
 
       // Keep short-expiry collections independent from blocker-stat schema.
       // A strategy-ID change archives the prior collection and starts a fresh one.
@@ -4518,6 +4521,21 @@ export class TickHub extends DurableObject {
     }
   }
 
+  async forwardUtcS30Quote(quote) {
+    if (!this.utcS30ForwardEnabled || !this.env.POCKET_S30_SHADOW) return;
+    try {
+      const id = this.env.POCKET_S30_SHADOW.idFromName("utc-s30-supertrend-demarker-shadow-v1");
+      const response = await this.env.POCKET_S30_SHADOW.get(id).fetch("https://utc-s30-shadow/quote", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(quote)
+      });
+      this.utcS30ForwardStatus = response.ok ? "forwarding_tiingo_utc_fx" : "strategy_forward_http_" + response.status;
+    } catch (error) {
+      this.utcS30ForwardStatus = "strategy_forward_error:" + String(error?.message || error).slice(0, 140);
+    }
+  }
+
   pushTick(symbol, t, p, bid = null, ask = null) {
     const r = Date.now();
     if (!symbol || !Number.isFinite(p) || !Number.isFinite(t) || !this.symbols.has(symbol)) return;
@@ -4561,6 +4579,16 @@ export class TickHub extends DurableObject {
       this.lastStatus = "ok";
       this.pushTick(symbol, t, p, bid, ask);
       this.updateTiingo30SecondCandle(symbol, t, p);
+      if (this.utcS30ForwardEnabled) {
+        this.ctx.waitUntil(this.forwardUtcS30Quote({
+          sourceFeed: "tiingo-utc-fx",
+          symbol,
+          providerAt: t,
+          receivedAt: Date.now(),
+          price: p,
+          streamSession: String(this.lastConnectAt || "tiingo-fx")
+        }));
+      }
       // Both chart variants are evaluated on each live UTC quote, including
       // while their current candles are still forming.
       this.ctx.waitUntil(
@@ -7574,6 +7602,46 @@ export class TickHub extends DurableObject {
   async fetch(req) {
     const u = new URL(req.url), symbol = normalizeSymbol(u.searchParams.get("symbol") || "");
 
+    if (u.pathname === "/utc-s30-feed/start" && req.method === "POST") {
+      const secret = String(this.env.TELEGRAM_WEBHOOK_SECRET || "").trim();
+      if (!secret || req.headers.get("X-IQ3M-Cron-Secret") !== secret) return json({ ok: false, error: "unauthorized" }, 401);
+      if (!this.env.POCKET_S30_SHADOW) return json({ ok: false, error: "POCKET_S30_SHADOW binding missing" }, 503);
+      this.utcS30ForwardEnabled = true;
+      await this.ctx.storage.put("utcS30ForwardEnabled", true);
+      let changed = false;
+      for (const pair of SHORT_SHADOW_UNIVERSE) {
+        if (!this.symbols.has(pair)) { this.symbols.add(pair); changed = true; }
+      }
+      if (changed) {
+        await this.ctx.storage.put("symbols", [...this.symbols]);
+        await this.forceReconnect("UTC S30 DeMarker shadow enabled");
+      } else {
+        await this.ensureSocket();
+      }
+      const tokenConfigured = Boolean(String(this.env.TIINGO_API_TOKEN || "").trim());
+      const status = !tokenConfigured ? "missing TIINGO_API_TOKEN"
+        : this.ws?.readyState === 1 ? "connected" : "connecting";
+      this.utcS30ForwardStatus = status === "connected" ? "forwarding_tiingo_utc_fx" : status;
+      const id = this.env.POCKET_S30_SHADOW.idFromName("utc-s30-supertrend-demarker-shadow-v1");
+      await this.env.POCKET_S30_SHADOW.get(id).fetch("https://utc-s30-shadow/feed-status", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sourceFeed: "tiingo-utc-fx",
+          status: this.utcS30ForwardStatus,
+          streamSession: String(this.lastConnectAt || "tiingo-fx"),
+          subscribedSymbols: SHORT_SHADOW_UNIVERSE
+        })
+      });
+      return json({
+        ok: tokenConfigured,
+        status: this.utcS30ForwardStatus,
+        forwardEnabled: true,
+        source: "tiingo-utc-fx",
+        symbols: SHORT_SHADOW_UNIVERSE
+      });
+    }
+
     if (u.pathname === "/pocket-s30-feed/start" && req.method === "POST") {
       const secret = String(this.env.TELEGRAM_WEBHOOK_SECRET || "").trim();
       if (!secret || req.headers.get("X-IQ3M-Cron-Secret") !== secret) return json({ ok: false, error: "unauthorized" }, 401);
@@ -8344,7 +8412,7 @@ export default {
       const secret = String(env.TELEGRAM_WEBHOOK_SECRET || "").trim();
       if (u.pathname.endsWith("/start") && (!secret || request.headers.get("X-IQ3M-Cron-Secret") !== secret)) return json({ ok: false, error: "unauthorized" }, 401);
       if (!env.POCKET_S30_SHADOW) return json({ ok: false, error: "POCKET_S30_SHADOW binding missing" }, 503);
-      const id = env.POCKET_S30_SHADOW.idFromName("pocket-s30-supertrend-demarker-shadow-v1");
+      const id = env.POCKET_S30_SHADOW.idFromName("utc-s30-supertrend-demarker-shadow-v1");
       const path = u.pathname.endsWith("/start") ? "/start" : u.pathname.endsWith("/stats") ? "/stats" : "/diagnostics";
       return env.POCKET_S30_SHADOW.get(id).fetch("https://pocket-s30-shadow" + path, {
         method: path === "/start" ? "POST" : "GET",
