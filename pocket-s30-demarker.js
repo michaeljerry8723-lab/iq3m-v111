@@ -1,5 +1,5 @@
 /**
- * Pocket Option OTC S30 SuperTrend + DeMarker shadow strategy.
+ * UTC FX S30 SuperTrend + DeMarker shadow strategy.
  * ATR(10) and multiplier(2) are provisional defaults; see
  * POCKET_S30_SUPERTREND_DEMARKER.md for the source and assumption note.
  */
@@ -11,10 +11,10 @@ function json(value, status = 200) {
 }
 
 export const POCKET_S30_STRATEGY_ID = "pocket-s30-supertrend-demarker7-exp120-shadow-v1";
-export const POCKET_S30_SOURCE_FEED = "otcharts-pocket-option-otc";
-export const POCKET_S30_BAR_SOURCE = "otcharts-pocket-option-otc-s30";
+export const POCKET_S30_SOURCE_FEED = "tiingo-utc-fx";
+export const POCKET_S30_BAR_SOURCE = "tiingo-utc-fx-s30";
 export const POCKET_S30_SYMBOLS = Object.freeze([
-  "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD"
+  "EUR/USD", "USD/JPY", "GBP/USD", "USD/CAD", "AUD/USD", "USD/CHF", "NZD/USD", "EUR/JPY", "GBP/JPY", "EUR/GBP", "AUD/JPY", "CAD/JPY"
 ]);
 export const POCKET_S30_DEFAULT_CONFIG = Object.freeze({
   timeframeSeconds: 30,
@@ -23,7 +23,7 @@ export const POCKET_S30_DEFAULT_CONFIG = Object.freeze({
   atrMultiplier: 2,
   atrSettingsVerified: false,
   expirySeconds: 120,
-  entryMode: "completed-s30-confirmation-next-valid-otc-quote",
+  entryMode: "completed-s30-confirmation-next-valid-utc-fx-quote",
   sourceFeed: POCKET_S30_SOURCE_FEED
 });
 export const POCKET_S30_STATE_KEY = "pocketS30SuperTrendDeMarkerShadowV1";
@@ -266,7 +266,7 @@ export function validatePocketS30Quote(input, now = Date.now()) {
   const receivedAt = Number(input?.receivedAt);
   const price = Number(input?.price);
   if (sourceFeed !== POCKET_S30_SOURCE_FEED) return { ok: false, reason: "source_feed_mismatch" };
-  if (!POCKET_S30_SYMBOLS.includes(symbol)) return { ok: false, reason: "unsupported_otc_symbol" };
+  if (!POCKET_S30_SYMBOLS.includes(symbol)) return { ok: false, reason: "unsupported_utc_fx_symbol" };
   if (![providerAt, receivedAt, price, Number(now)].every(Number.isFinite) || providerAt <= 0 || receivedAt <= 0 || price <= 0) {
     return { ok: false, reason: "invalid_source_quote" };
   }
@@ -497,7 +497,7 @@ export function ingestPocketS30Quote(state, input, now = Date.now()) {
     if (quote.providerAt >= expiryAt) {
       if (quote.providerAt > expiryAt + POCKET_S30_SETTLEMENT_GRACE_MS) {
         record.result = "VOID";
-        record.voidReason = "no valid source quote within 15 seconds after expiry";
+        record.voidReason = "no valid UTC FX quote within 15 seconds after expiry";
         countPocketS30Rejection(state, "settlement_quote_outside_grace", record.symbol, now);
       } else {
         record.exitPrice = quote.price;
@@ -520,7 +520,7 @@ export function expirePocketS30Pending(state, now = Date.now()) {
   for (const record of state.pending) {
     if (!record.result && Number(now) >= Number(record.expiryAt) + POCKET_S30_SETTLEMENT_GRACE_MS) {
       record.result = "VOID";
-      record.voidReason = "no valid source quote within 15 seconds after expiry";
+      record.voidReason = "no valid UTC FX quote within 15 seconds after expiry";
       record.exitPrice = null;
       record.exitAt = null;
       record.exitReceivedAt = null;
@@ -609,7 +609,7 @@ export class PocketS30DemarkerShadow extends DurableObject {
       const stored = await ctx.storage.get(POCKET_S30_STATE_KEY);
       this.state = restorePocketS30State(stored, Date.now(), pocketS30ConfigFromEnv(env));
       this.skipFirstBucket = new Set(POCKET_S30_SYMBOLS);
-      this.runtime.streamStatus = this.state.enabled ? "awaiting_shared_otc_stream" : "not_started";
+      this.runtime.streamStatus = this.state.enabled ? "awaiting_shared_utc_stream" : "not_started";
       if (this.state.enabled) await this.scheduleNextAlarm();
     });
   }
@@ -624,7 +624,7 @@ export class PocketS30DemarkerShadow extends DurableObject {
     if (!hub) return { ok: false, reason: "tick_hub_binding_missing" };
     try {
       const id = hub.idFromName("global-market-feed");
-      const response = await hub.get(id).fetch("https://tick-hub/pocket-s30-feed/start", {
+      const response = await hub.get(id).fetch("https://tick-hub/utc-s30-feed/start", {
         method: "POST",
         headers: { "X-IQ3M-Cron-Secret": String(this.env.TELEGRAM_WEBHOOK_SECRET || "") }
       });
@@ -703,7 +703,7 @@ export class PocketS30DemarkerShadow extends DurableObject {
       version: "pocket-s30-supertrend-demarker-shadow-v1",
       enabled: this.state.enabled,
       mode: "shadow_only",
-      source: { identity: POCKET_S30_SOURCE_FEED, venue: "Pocket Option OTC via OTCharts", sameSourceForEntryAndSettlement: true },
+      source: { identity: POCKET_S30_SOURCE_FEED, venue: "Tiingo UTC FX", sameSourceForEntryAndSettlement: true },
       streamStatus: this.runtime.streamStatus,
       streamSession: this.runtime.streamSession,
       config: this.state.config,
