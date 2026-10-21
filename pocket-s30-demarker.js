@@ -26,7 +26,7 @@ export const POCKET_S30_DEFAULT_CONFIG = Object.freeze({
   entryMode: "completed-s30-confirmation-next-valid-utc-fx-quote",
   sourceFeed: POCKET_S30_SOURCE_FEED
 });
-export const POCKET_S30_STATE_KEY = "pocketS30SuperTrendDeMarkerShadowV1";
+export const POCKET_S30_STATE_KEY = "utcS30SuperTrendDeMarkerShadowV1";
 export const POCKET_S30_MAX_PENDING = 1000;
 export const POCKET_S30_MAX_HISTORY = 5000;
 export const POCKET_S30_MAX_SOURCE_AGE_MS = 15000;
