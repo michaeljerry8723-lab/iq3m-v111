@@ -9,7 +9,8 @@
     "backtest:fetch": "node backtest/fetch-tiingo.js",
     "backtest": "node backtest/backtest.js",
     "research:v13.2": "node backtest/research-v13.2.js",
-    "validate:v13.3": "node backtest/validate-v13.3.js"
+    "validate:v13.3": "node backtest/validate-v13.3.js",
+    "test": "node --experimental-loader ./test/loader.js ./test/test-harness.js && node --experimental-loader ./test/loader.js ./test/pocket-s30-demarker.test.js"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

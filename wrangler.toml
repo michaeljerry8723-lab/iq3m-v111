@@ -1,11 +1,10 @@
-name = "iq3m-predictor"
+name = "forex-daytrader"
 main = "worker.js"
 compatibility_date = "2026-09-24"
 
 [vars]
 BOT_COMPACT_MODE = "1"
 WS_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF"
-
 
 [[durable_objects.bindings]]
 name = "TICK_HUB"
@@ -24,3 +23,47 @@ class_name = "AutoScheduler"
 type = "durable-object"
 state = "created"
 storage = "sqlite"
+
+[[durable_objects.bindings]]
+name = "POCKET_S30_SHADOW"
+class_name = "PocketS30DemarkerShadow"
+
+[exports.PocketS30DemarkerShadow]
+type = "durable-object"
+state = "created"
+storage = "sqlite"
+
+[env.pocket_s30_shadow_preview]
+name = "pocket-s30-demarker-shadow"
+
+[env.pocket_s30_shadow_preview.vars]
+BOT_COMPACT_MODE = "1"
+WS_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF,NZD/USD,EUR/JPY,GBP/JPY,EUR/GBP,AUD/JPY,CAD/JPY"
+
+[[env.pocket_s30_shadow_preview.durable_objects.bindings]]
+name = "TICK_HUB"
+class_name = "TickHub"
+
+[[env.pocket_s30_shadow_preview.durable_objects.bindings]]
+name = "AUTO_SCHEDULER"
+class_name = "AutoScheduler"
+
+[[env.pocket_s30_shadow_preview.durable_objects.bindings]]
+name = "POCKET_S30_SHADOW"
+class_name = "PocketS30DemarkerShadow"
+
+[env.pocket_s30_shadow_preview.previews.vars]
+BOT_COMPACT_MODE = "1"
+WS_SYMBOLS = "EUR/USD,USD/JPY,GBP/USD,USD/CAD,AUD/USD,USD/CHF,NZD/USD,EUR/JPY,GBP/JPY,EUR/GBP,AUD/JPY,CAD/JPY"
+
+[[env.pocket_s30_shadow_preview.previews.durable_objects.bindings]]
+name = "TICK_HUB"
+class_name = "TickHub"
+
+[[env.pocket_s30_shadow_preview.previews.durable_objects.bindings]]
+name = "AUTO_SCHEDULER"
+class_name = "AutoScheduler"
+
+[[env.pocket_s30_shadow_preview.previews.durable_objects.bindings]]
+name = "POCKET_S30_SHADOW"
+class_name = "PocketS30DemarkerShadow"
